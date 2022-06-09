@@ -3242,6 +3242,12 @@ static struct wallet_payment *wallet_stmt2payment(const tal_t *ctx,
 	} else
 		payment->local_offer_id = NULL;
 
+	if (!db_col_is_null(stmt, "completed_at")) {
+		payment->completed_at = tal(payment, u32);
+		*payment->completed_at = db_col_int(stmt, "completed_at");
+	} else
+		payment->completed_at = NULL;
+
 	payment->groupid = db_col_u64(stmt, "groupid");
 
 	return payment;
@@ -3280,6 +3286,7 @@ wallet_payment_by_hash(const tal_t *ctx, struct wallet *wallet,
 					     ", partid"
 					     ", local_offer_id"
 					     ", groupid"
+					     ", completed_at"
 					     " FROM payments"
 					     " WHERE payment_hash = ?"
 					     " AND partid = ? AND groupid=?"));
@@ -3517,6 +3524,7 @@ wallet_payment_list(const tal_t *ctx,
 				      ", partid"
 				      ", local_offer_id"
 				      ", groupid"
+				      ", completed_at"
 				      " FROM payments"
 				      " WHERE"
 				      "  (payment_hash = ? OR 1=?) AND"
@@ -3584,6 +3592,7 @@ wallet_payments_by_offer(const tal_t *ctx,
 					     ", partid"
 					     ", local_offer_id"
 					     ", groupid"
+					     ", completed_at"
 					     " FROM payments"
 					     " WHERE local_offer_id = ?;"));
 	db_bind_sha256(stmt, 0, local_offer_id);

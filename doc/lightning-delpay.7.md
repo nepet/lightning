@@ -45,6 +45,7 @@ On success, an object containing **payments** is returned.  It is an array of ob
 - **partid** (u64, optional): unique ID within this (multi-part) payment
 - **destination** (pubkey, optional): the final destination of the payment if known
 - **amount_msat** (msat, optional): the amount the destination received, if known
+- **completed_at** (u64, optional): the UNIX timestamp showing when this payment was completed
 - **groupid** (u64, optional): Grouping key to disambiguate multiple attempts to pay an invoice or the same payment_hash
 - **payment_preimage** (hex, optional): proof of payment (always 64 characters)
 - **label** (string, optional): the label, if given to sendpay
@@ -101,4 +102,4 @@ RESOURCES
 ---------
 
 Main web site: <https://github.com/ElementsProject/lightning>
-[comment]: # ( SHA256STAMP:af8299cd87efe8254969069851d99bffffa033013f4a8b9fc94cdab6cfa0ff78)
+[comment]: # ( SHA256STAMP:45486761085b32cfa8b307cf9badf352da5cd89491f60c5cc6e620c527cb6dcf)
