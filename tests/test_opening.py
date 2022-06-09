@@ -1391,3 +1391,97 @@ def test_zeroconf_forward(node_factory, bitcoind):
     wait_for(lambda: len(l3.rpc.listchannels()['channels']) == 4)
     inv = l1.rpc.invoice(42, 'back1', 'desc')['bolt11']
     l3.rpc.pay(inv)
+
+
+@pytest.mark.openchannel('v1')
+def test_buy_liquidity_ad_no_v2(node_factory, bitcoind):
+    """ Test that you can't actually request amt for a
+    node that doesn' support v2 opens """
+
+    l1, l2, = node_factory.get_nodes(2)
+    amount = 500000
+    feerate = 2000
+
+    l1.fundwallet(amount * 100)
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+
+    # l1 leases a channel from l2
+    with pytest.raises(RpcError, match=r"Tried to buy a liquidity ad but we[(][?][)] don't have experimental-dual-fund enabled"):
+        l1.rpc.fundchannel(l2.info['id'], amount, request_amt=amount,
+                           feerate='{}perkw'.format(feerate),
+                           compact_lease='029a002d000000004b2003e8')
+
+
+def test_zeroreserve(node_factory, bitcoind):
+    """Ensure we can set the reserves.
+
+    3 nodes:
+     - l1 enforces zeroreserve
+     - l2 enforces default reserve
+     - l3 enforces sub-dust reserves
+    """
+    ZEROCONF = True
+    plugin_path = Path(__file__).parent / "plugins" / "zeroreserve.py"
+    opts = [
+        {
+            'plugin': str(plugin_path),
+            'reserve': '0sat',
+        },
+        {},
+        {
+            'plugin': str(plugin_path),
+            'reserve': '123sat'
+        }
+    ]
+    l1, l2, l3 = node_factory.get_nodes(3, opts=opts)
+
+    l1.fundwallet(10**7)
+    l2.fundwallet(10**7)
+    l3.fundwallet(10**7)
+
+    l1.connect(l2)
+    l2.connect(l3)
+    l3.connect(l1)
+
+    l1.rpc.fundchannel(l2.info['id'], 10**6, reserve='0sat')
+    l2.rpc.fundchannel(l3.info['id'], 10**6)
+    l3.rpc.fundchannel(l1.info['id'], 10**6, reserve='321sat')
+    bitcoind.generate_block(1, wait_for_mempool=3)
+    wait_for(lambda: l1.channel_state(l2) == 'CHANNELD_NORMAL')
+    wait_for(lambda: l2.channel_state(l3) == 'CHANNELD_NORMAL')
+    wait_for(lambda: l3.channel_state(l1) == 'CHANNELD_NORMAL')
+
+    # Now make sure we all agree on each others reserves
+    l1c1 = l1.rpc.listpeers(l2.info['id'])['peers'][0]['channels'][0]
+    l2c1 = l2.rpc.listpeers(l1.info['id'])['peers'][0]['channels'][0]
+    l2c2 = l2.rpc.listpeers(l3.info['id'])['peers'][0]['channels'][0]
+    l3c2 = l3.rpc.listpeers(l2.info['id'])['peers'][0]['channels'][0]
+    l3c3 = l3.rpc.listpeers(l1.info['id'])['peers'][0]['channels'][0]
+    l1c3 = l1.rpc.listpeers(l3.info['id'])['peers'][0]['channels'][0]
+
+    # l1 imposed a 0sat reserve on l2, while l2 imposed the default 1% reserve on l1
+    assert l1c1['their_channel_reserve_satoshis'] == l2c1['our_channel_reserve_satoshis'] == (0 if ZEROCONF else 546)
+    assert l1c1['our_channel_reserve_satoshis'] == l2c1['their_channel_reserve_satoshis'] == 10000
+
+    # l2 imposed the default 1% on l3, while l3 imposed a custom 123sat fee on l2
+    assert l2c2['their_channel_reserve_satoshis'] == l3c2['our_channel_reserve_satoshis'] == 10000
+    assert l2c2['our_channel_reserve_satoshis'] == l3c2['their_channel_reserve_satoshis'] == (123 if ZEROCONF else 546)
+
+    # l3 imposed a custom 321sat fee on l1, while l1 imposed a custom 0sat fee on l3
+    assert l3c3['their_channel_reserve_satoshis'] == l1c3['our_channel_reserve_satoshis'] == (321 if ZEROCONF else 546)
+    assert l3c3['our_channel_reserve_satoshis'] == l1c3['their_channel_reserve_satoshis'] == (0 if ZEROCONF else 546)
+
+    # Now do some drain tests on c1, as that should be drainable
+    # completely by l2 being the fundee
+    l1.rpc.keysend(l2.info['id'], 10 * 7)  # Something above dust for sure
+    l2.drain(l1)
+
+    # Remember that this is the reserve l1 imposed on l2, so l2 can drain completely
+    l2c1 = l2.rpc.listpeers(l1.info['id'])['peers'][0]['channels'][0]
+
+    # And despite us briefly being above dust (with a to_us output),
+    # closing should result in the output being trimmed again since we
+    # dropped below dust again.
+    c = l2.rpc.close(l1.info['id'])
+    decoded = bitcoind.rpc.decoderawtransaction(c['tx'])
+    assert len(decoded['vout']) == 1
