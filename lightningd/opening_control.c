@@ -1223,15 +1223,16 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 
 	temporary_channel_id(&tmp_channel_id);
 
-	fc->open_msg
-		= towire_openingd_funder_start(fc,
-					  *amount,
-					  fc->push,
-					  fc->our_upfront_shutdown_script,
-					  upfront_shutdown_script_wallet_index,
-					  *feerate_per_kw,
-					  &tmp_channel_id,
-					  fc->channel_flags);
+	fc->open_msg = towire_openingd_funder_start(
+			fc,
+			*amount,
+			fc->push,
+			fc->our_upfront_shutdown_script,
+			upfront_shutdown_script_wallet_index,
+			*feerate_per_kw,
+			&tmp_channel_id,
+			fc->channel_flags,
+			fc->uc->reserve);
 
 	/* Tell connectd to make this active; when it does, we can continue */
 	subd_send_msg(peer->ld->connectd,

@@ -99,6 +99,8 @@ struct state {
 	struct channel_type *channel_type;
 
 	struct feature_set *our_features;
+
+	struct amount_sat *reserve;
 };
 
 /*~ If we can't agree on parameters, we fail to open the channel.
@@ -138,23 +140,39 @@ static void NORETURN negotiation_failed(struct state *state,
 	negotiation_aborted(state, errmsg);
 }
 
+static void set_reserve_absolute(struct state * state, const struct amount_sat dust_limit, struct amount_sat reserve_sat)
+{
+	status_debug("Setting their reserve to %s",
+		     type_to_string(tmpctx, struct amount_sat, &reserve_sat));
+	if (state->allowdustreserve) {
+		state->localconf.channel_reserve = reserve_sat;
+	} else {
+		/* BOLT #2:
+		 *
+		 * The sending node:
+		 *...
+		 * - MUST set `channel_reserve_satoshis` greater than or equal
+		 *to `dust_limit_satoshis` from the `open_channel` message.
+		 */
+		if (amount_sat_greater(dust_limit, reserve_sat)) {
+			status_debug("Their reserve is too small, bumping to "
+				     "dust_limit: %s < %s",
+				     type_to_string(tmpctx, struct amount_sat,
+						    &reserve_sat),
+				     type_to_string(tmpctx, struct amount_sat,
+						    &dust_limit));
+			state->localconf.channel_reserve = dust_limit;
+		} else {
+			state->localconf.channel_reserve = reserve_sat;
+		}
+	}
+}
+
 /* We always set channel_reserve_satoshis to 1%, rounded down. */
 static void set_reserve(struct state *state, const struct amount_sat dust_limit)
 {
-	state->localconf.channel_reserve
-		= amount_sat_div(state->funding_sats, 100);
-
-	/* BOLT #2:
-	 *
-	 * The sending node:
-	 *...
-	 * - MUST set `channel_reserve_satoshis` greater than or equal to
-         *   `dust_limit_satoshis` from the `open_channel` message.
-	 */
-	if (amount_sat_greater(dust_limit,
-			       state->localconf.channel_reserve))
-		state->localconf.channel_reserve
-			= dust_limit;
+	set_reserve_absolute(state, dust_limit,
+			     amount_sat_div(state->funding_sats, 100));
 }
 
 /*~ Handle random messages we might get during opening negotiation, (eg. gossip)
@@ -234,10 +252,6 @@ static u8 *opening_negotiate_msg(const tal_t *ctx, struct state *state,
 
 static bool setup_channel_funder(struct state *state)
 {
-	/*~ For symmetry, we calculate our own reserve even though lightningd
-	 * could do it for the we-are-funding case. */
-	set_reserve(state, state->localconf.dust_limit);
-
 #if DEVELOPER
 	/* --dev-force-tmp-channel-id specified */
 	if (dev_force_tmp_channel_id)
@@ -317,6 +331,15 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags)
 	status_debug("funder_channel_start");
 	if (!setup_channel_funder(state))
 		return NULL;
+
+	/* If we have a reserve override we use that, otherwise we'll
+	 * use our default of 1% of the funding value. */
+	if (state->reserve != NULL) {
+		set_reserve_absolute(state, state->localconf.dust_limit,
+				     *state->reserve);
+	} else {
+		set_reserve(state, state->localconf.dust_limit);
+	}
 
 	if (!state->upfront_shutdown_script[LOCAL])
 		state->upfront_shutdown_script[LOCAL]
@@ -1341,7 +1364,8 @@ static u8 *handle_master_in(struct state *state)
 						    &state->local_upfront_shutdown_wallet_index,
 						    &state->feerate_per_kw,
 						    &state->channel_id,
-						    &channel_flags))
+						    &channel_flags,
+						    &state->reserve))
 			master_badmsg(WIRE_OPENINGD_FUNDER_START, msg);
 		msg = funder_channel_start(state, channel_flags);
 
