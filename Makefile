@@ -231,9 +231,24 @@ ALL_C_HEADERS := header_versions_gen.h version_gen.h
 # Extra (non C) targets that should be built by default.
 DEFAULT_TARGETS :=
 
+# M1 macos machines with homebrew will install the native libraries in
+# /opt/homebrew instead of /usr/local, most likely because they
+# emulate x86_64 compatibility via Rosetta, and wanting to keep the
+# libraries separate. This however means we also need to switch out
+# the paths accordingly when we detect we're on an M1 macos machine.
+ifeq ("$(OS)-$(ARCH)", "Darwin-arm64")
+CPATH := /opt/homebrew/include
+LIBRARY_PATH := /opt/homebrew/lib
+else
+CPATH := /usr/local/include
+LIBRARY_PATH := /usr/local/lib
+endif
+
 CPPFLAGS += -DBINTOPKGLIBEXECDIR="\"$(shell sh tools/rel.sh $(bindir) $(pkglibexecdir))\""
 CFLAGS = $(CPPFLAGS) $(CWARNFLAGS) $(CDEBUGFLAGS) $(COPTFLAGS) -I $(CCANDIR) $(EXTERNAL_INCLUDE_FLAGS) -I . -I/usr/local/include $(SQLITE3_CFLAGS) $(POSTGRES_INCLUDE) $(FEATURES) $(COVFLAGS) $(DEV_CFLAGS) -DSHACHAIN_BITS=48 -DJSMN_PARENT_LINKS $(PIE_CFLAGS) $(COMPAT_CFLAGS) -DBUILD_ELEMENTS=1
 CFLAGS += -DGOSSMAP_PERMISSIVE=1
+
+CFLAGS += -DZERORESERVE=1
 
 # If CFLAGS is already set in the environment of make (to whatever value, it
 # does not matter) then it would export it to subprocesses with the above value

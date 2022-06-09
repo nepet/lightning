@@ -181,6 +181,7 @@ bool check_config_bounds(const tal_t *ctx,
 		return false;
 	}
 
+#ifndef ZERORESERVE
 	/* BOLT #2:
 	 *
 	 * The receiving node MUST fail the channel if:
@@ -198,6 +199,7 @@ bool check_config_bounds(const tal_t *ctx,
 						     &remoteconf->channel_reserve));
 		return false;
 	}
+#endif
 
 	return true;
 }

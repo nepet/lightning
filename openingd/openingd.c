@@ -144,7 +144,24 @@ static void set_reserve_absolute(struct state * state, const struct amount_sat d
 {
 	status_debug("Setting their reserve to %s",
 		     type_to_string(tmpctx, struct amount_sat, &reserve_sat));
-	if (state->allowdustreserve) {
+#ifdef ZERORESERVE
+	state->localconf.channel_reserve = reserve_sat;
+#else
+	/* BOLT #2:
+	 *
+	 * The sending node:
+	 *...
+	 * - MUST set `channel_reserve_satoshis` greater than or equal to
+         *   `dust_limit_satoshis` from the `open_channel` message.
+	 */
+	if (amount_sat_greater(dust_limit, reserve_sat)) {
+		status_debug(
+		    "Their reserve is too small, bumping to dust_limit: %s < %s",
+		    type_to_string(tmpctx, struct amount_sat, &reserve_sat),
+		    type_to_string(tmpctx, struct amount_sat, &dust_limit));
+		state->localconf.channel_reserve
+			= dust_limit;
+	} else {
 		state->localconf.channel_reserve = reserve_sat;
 	} else {
 		/* BOLT #2:
@@ -166,6 +183,7 @@ static void set_reserve_absolute(struct state * state, const struct amount_sat d
 			state->localconf.channel_reserve = reserve_sat;
 		}
 	}
+#endif
 }
 
 /* We always set channel_reserve_satoshis to 1%, rounded down. */
@@ -463,6 +481,7 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags)
 				type_to_string(msg, struct channel_id,
 					       &state->channel_id));
 
+#ifndef ZERORESERVE
 	if (amount_sat_greater(state->remoteconf.dust_limit,
 			       state->localconf.channel_reserve)) {
 		negotiation_failed(state,
@@ -474,6 +493,7 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags)
 						  &state->localconf.channel_reserve));
 		return NULL;
 	}
+#endif
 
 	if (!check_config_bounds(tmpctx, state->funding_sats,
 				 state->feerate_per_kw,
@@ -959,6 +979,8 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	/* This reserves 1% of the channel (rounded up) */
 	set_reserve(state, state->remoteconf.dust_limit);
 
+#ifndef ZERORESERVE
+	/* Pending proposal to remove these limits. */
 	/* BOLT #2:
 	 *
 	 * The sender:
@@ -990,6 +1012,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 						  &state->remoteconf.channel_reserve));
 		return NULL;
 	}
+#endif
 
 	/* These checks are the same whether we're opener or accepter... */
 	if (!check_config_bounds(tmpctx, state->funding_sats,
