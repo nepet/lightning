@@ -852,6 +852,7 @@ send_payment_core(struct lightningd *ld,
 		  u64 partid,
 		  u64 group,
 		  const struct route_hop *first_hop,
+		  const bool strict_first,
 		  struct amount_msat msat,
 		  struct amount_msat total_msat,
 		  const char *label TAKES,
@@ -1032,7 +1033,20 @@ send_payment_core(struct lightningd *ld,
 	if (offer_err)
 		return offer_err;
 
-	channel = find_channel_for_htlc_add(ld, &first_hop->node_id);
+	/* We want to use the channel with the given scid in the routes first hop
+	 * if strict_first is set. Use no-strict channel selection otherwise.
+	 */
+	if (strict_first) {
+		struct peer *peer = peer_by_id(ld, &first_hop->node_id);
+		if (!peer)
+			channel = NULL;
+		
+		channel = find_channel_by_scid(peer, &first_hop->scid);
+		if (!channel_can_add_htlc(channel))
+			channel = NULL;
+	} else
+		channel = find_channel_for_htlc_add(ld, &first_hop->node_id);
+	
 	if (!channel) {
 		struct json_stream *data
 			= json_stream_fail(cmd, PAY_TRY_OTHER_ROUTE,
@@ -1128,7 +1142,8 @@ send_payment(struct lightningd *ld,
 	     const char *description TAKES,
 	     const struct sha256 *local_offer_id,
 	     const struct secret *payment_secret,
-	     const u8 *payment_metadata)
+	     const u8 *payment_metadata,
+		 const bool strict_first)
 {
 	unsigned int base_expiry;
 	struct onionpacket *packet;
@@ -1198,6 +1213,7 @@ send_payment(struct lightningd *ld,
 		 n_hops, type_to_string(tmpctx, struct amount_msat, &msat));
 	packet = create_onionpacket(tmpctx, path, ROUTING_INFO_SIZE, &path_secrets);
 	return send_payment_core(ld, cmd, rhash, partid, group, &route[0],
+				 strict_first,
 				 msat, total_msat,
 				 label, invstring, description,
 				 packet, &ids[n_hops - 1], ids,
@@ -1276,6 +1292,7 @@ static struct command_result *json_sendonion(struct command *cmd,
 	struct amount_msat *msat;
 	u64 *partid, *group;
 	struct sha256 *local_offer_id = NULL;
+	bool *strict_first;
 
 	if (!param(cmd, buffer, params,
 		   p_req("onion", param_bin_from_hex, &onion),
@@ -1291,6 +1308,7 @@ static struct command_result *json_sendonion(struct command *cmd,
 		   p_opt("localofferid", param_sha256, &local_offer_id),
 		   p_opt("groupid", param_u64, &group),
 		   p_opt("description", param_string, &description),
+		   p_opt_def("strict_first", param_bool, &strict_first, false),
 		   NULL))
 		return command_param_failed();
 
@@ -1311,7 +1329,8 @@ static struct command_result *json_sendonion(struct command *cmd,
 				    failcode);
 
 	return send_payment_core(ld, cmd, payment_hash, *partid, *group,
-				 first_hop, *msat, AMOUNT_MSAT(0),
+				 first_hop, strict_first,
+				 *msat, AMOUNT_MSAT(0),
 				 label, invstring, description,
 				 packet, destination, NULL, NULL,
 				 path_secrets, local_offer_id);
@@ -1409,6 +1428,7 @@ static struct command_result *json_sendpay(struct command *cmd,
 	struct secret *payment_secret;
 	struct sha256 *local_offer_id;
 	u8 *payment_metadata;
+	bool *strict_first;
 
 	/* For generating help, give new-style. */
 	if (!param(cmd, buffer, params,
@@ -1424,6 +1444,7 @@ static struct command_result *json_sendpay(struct command *cmd,
 		   p_opt("groupid", param_u64, &group),
 		   p_opt("payment_metadata", param_bin_from_hex, &payment_metadata),
 		   p_opt("description", param_string, &description),
+		   p_opt_def("strict_first", param_bool, &strict_first, false),
 		   NULL))
 		return command_param_failed();
 
@@ -1474,7 +1495,7 @@ static struct command_result *json_sendpay(struct command *cmd,
 			    final_amount,
 			    msat ? *msat : final_amount,
 			    label, invstring, description, local_offer_id,
-			    payment_secret, payment_metadata);
+			    payment_secret, payment_metadata, strict_first);
 }
 
 static const struct json_command sendpay_command = {
