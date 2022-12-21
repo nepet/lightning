@@ -595,20 +595,6 @@ static enum channel_add_err add_htlc(struct channel *channel,
 		return CHANNEL_ERR_HTLC_BELOW_MINIMUM;
 	}
 
-	/* FIXME: There used to be a requirement that we not send more than
-	 * 2^32 msat, *but* only electrum enforced it.  Remove in next version:
-	 *
-	 * A sending node:
-	 *...
-	 * - for channels with `chain_hash` identifying the Bitcoin blockchain:
-	 *    - MUST set the four most significant bytes of `amount_msat` to 0.
-	 */
-	if (sender == LOCAL
-	    && amount_msat_greater(htlc->amount, chainparams->max_payment)
-	    && !channel->option_wumbo) {
-		return CHANNEL_ERR_MAX_HTLC_VALUE_EXCEEDED;
-	}
-
 	/* Figure out what receiver will already be committed to. */
 	htlc_count = gather_htlcs(tmpctx, channel, recipient, &committed, &removing, &adding);
 	htlc_arr_append(&adding, htlc);
