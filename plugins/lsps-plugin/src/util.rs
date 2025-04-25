@@ -19,6 +19,21 @@ pub fn is_feature_bit_set(bitmap: &[u8], feature_bit: usize) -> bool {
     }
 }
 
+/// Returns a single feature_bit in hex representation, least-significant bit
+/// first.
+///
+/// # Arguments
+///
+/// * `feature_bit`: The 0-based index of the bit to check across the bitmap.
+///
+pub fn feature_bit_to_hex(feature_bit: usize) -> String {
+    let byte_index = feature_bit >> 3; // Equivalent to feature_bit / 8
+    let mask = 1 << (feature_bit & 7); // Equivalent to feature_bit % 8
+    let mut map = vec![0u8; byte_index + 1];
+    map[0] |= mask; // least-significant bit first ordering.
+    hex::encode(&map)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,5 +80,38 @@ mod tests {
         let bitmap: &[u8] = &[];
         assert_eq!(is_feature_bit_set(bitmap, 0), false);
         assert_eq!(is_feature_bit_set(bitmap, 8), false);
+    }
+
+    #[test]
+    fn test_feature_to_hex_bit_0_be() {
+        // Bit 0 is in Byte 0 (LE index). num_bytes=1. BE index = 1-1-0=0.
+        // Expected map: [0x01]
+        let feature_hex = feature_bit_to_hex(0);
+        assert_eq!(feature_hex, "01");
+        assert!(is_feature_bit_set(&hex::decode(feature_hex).unwrap(), 0));
+    }
+
+    #[test]
+    fn test_feature_to_hex_bit_8_be() {
+        // Bit 8 is in Byte 1 (LE index). num_bytes=2. BE index = 2-1-1=0.
+        // Mask is 0x01 for bit 0 within its byte.
+        // Expected map: [0x01, 0x00] (Byte for 8-15 first, then 0-7)
+        let feature_hex = feature_bit_to_hex(8);
+        let mut decoded = hex::decode(&feature_hex).unwrap();
+        decoded.reverse();
+        assert_eq!(feature_hex, "0100");
+        assert!(is_feature_bit_set(&decoded, 8));
+    }
+
+    #[test]
+    fn test_feature_to_hex_bit_27_be() {
+        // Bit 27 is in Byte 3 (LE index). num_bytes=4. BE index = 4-1-3=0.
+        // Mask is 0x08 for bit 3 within its byte.
+        // Expected map: [0x08, 0x00, 0x00, 0x00] (Byte for 24-31 first)
+        let feature_hex = feature_bit_to_hex(27);
+        let mut decoded = hex::decode(&feature_hex).unwrap();
+        decoded.reverse();
+        assert_eq!(feature_hex, "08000000");
+        assert!(is_feature_bit_set(&decoded, 27));
     }
 }
