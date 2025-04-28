@@ -25,3 +25,12 @@ def test_lsps0_listprotocols(node_factory):
 
     res = l1.rpc.lsps_listprotocols(peer=l2.info['id'])
     assert res
+
+
+def test_lsps2_getinfo(node_factory):
+    l1, l2 = node_factory.get_nodes(2)
+    # We don't need a channel to query for lsps services
+    node_factory.join_nodes([l1, l2], fundchannel=False)
+
+    res = l1.rpc.lsps_lsps2_getinfo(lsp_id=l2.info['id'])
+    assert res
