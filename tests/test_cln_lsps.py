@@ -28,7 +28,10 @@ def test_lsps0_listprotocols(node_factory):
 
 
 def test_lsps2_getinfo(node_factory):
-    l1, l2 = node_factory.get_nodes(2)
+    l1, l2 = node_factory.get_nodes(2, opts=[
+        {}, {"lsps-service": True}
+    ])
+
     # We don't need a channel to query for lsps services
     node_factory.join_nodes([l1, l2], fundchannel=False)
 
