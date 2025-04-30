@@ -16,7 +16,6 @@ use cln_plugin::options::ConfigOption;
 use cln_plugin::{options, Plugin};
 use cln_rpc::notifications::CustomMsgNotification;
 use cln_rpc::primitives::PublicKey;
-use cln_rpc::primitives::ShortChannelId;
 use log::{debug, info, warn};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
