@@ -419,6 +419,18 @@ fn gen_label(label: Option<&str>) -> String {
     format!("{}_{}", l, millis)
 }
 
+/// Checks if the accepted htlc is associated with a lsps request we issued.
+async fn on_htlc_accepted(
+    p: cln_plugin::Plugin<State>,
+    v: serde_json::Value,
+) -> Result<serde_json::Value, anyhow::Error> {
+    // todo: 1. deserialize value
+    // todo: 2. check if the htlc is associated with a lsps htlc
+    // todo:  2. a) if not: return
+    // todo:  2. b) if soL accept
+    todo!();
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClnRpcLsps2GetinfoRequest {
     lsp_id: String,
