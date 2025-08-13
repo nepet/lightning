@@ -421,8 +421,8 @@ fn gen_label(label: Option<&str>) -> String {
 
 /// Checks if the accepted htlc is associated with a lsps request we issued.
 async fn on_htlc_accepted(
-    p: cln_plugin::Plugin<State>,
-    v: serde_json::Value,
+    _p: cln_plugin::Plugin<State>,
+    _v: serde_json::Value,
 ) -> Result<serde_json::Value, anyhow::Error> {
     // todo: 1. deserialize value
     // todo: 2. check if the htlc is associated with a lsps htlc
