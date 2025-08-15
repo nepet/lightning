@@ -1,6 +1,7 @@
-use core::fmt;
-
 use cln_rpc::primitives::PublicKey;
+use core::fmt;
+use serde_json::Value;
+use std::str::FromStr;
 
 /// Checks if the feature bit is set in the provided bitmap.
 /// Returns true if the `feature_bit` is set in the `bitmap`. Returns false if
@@ -41,27 +42,20 @@ pub fn feature_bit_to_hex(feature_bit: usize) -> String {
 /// Errors that can occur when unwrapping payload data
 #[derive(Debug, Clone, PartialEq)]
 pub enum UnwrapError {
-    /// Buffer is too small to contain valid wrapped data
-    BufferTooSmall { expected_min: usize, actual: usize },
     /// The public key bytes are invalid
     InvalidPublicKey(String),
+    /// Failed to deserialize json value,
+    SerdeFailure(String),
 }
 
 impl fmt::Display for UnwrapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            UnwrapError::BufferTooSmall {
-                expected_min,
-                actual,
-            } => {
-                write!(
-                    f,
-                    "Buffer too small: expected at least {} bytes, got {}",
-                    expected_min, actual
-                )
-            }
             UnwrapError::InvalidPublicKey(e) => {
                 write!(f, "Invalid public key: {}", e)
+            }
+            UnwrapError::SerdeFailure(e) => {
+                write!(f, "Failed to serialize or deserialize json value: {}", e)
             }
         }
     }
@@ -77,41 +71,47 @@ impl std::error::Error for UnwrapError {
 
 /// Wraps a payload with a peer ID for internal LSPS message transmission.
 pub fn wrap_payload_with_peer_id(payload: &[u8], peer_id: PublicKey) -> Vec<u8> {
-    let pubkey_bytes = peer_id.serialize();
-
-    let mut result = Vec::with_capacity(33 + payload.len());
-    result.extend_from_slice(&pubkey_bytes);
-    result.extend_from_slice(payload);
+    let pubkey_hex = peer_id.to_string();
+    let mut result = Vec::with_capacity(pubkey_hex.len() + payload.len() + 13);
+    result.extend_from_slice(&payload[..payload.len() - 1]);
+    result.extend_from_slice(b",\"peer_id\":\"");
+    result.extend_from_slice(pubkey_hex.as_bytes());
+    result.extend_from_slice(b"\"}");
     result
 }
 
 /// Safely unwraps payload data and a peer ID
-pub fn try_unwrap_payload_with_peer_id(data: &[u8]) -> Result<(&[u8], PublicKey), UnwrapError> {
-    const MIN_SIZE: usize = 33;
+pub fn try_unwrap_payload_with_peer_id(data: &[u8]) -> Result<(Vec<u8>, PublicKey), UnwrapError> {
+    let mut json: Value =
+        serde_json::from_slice(data).map_err(|e| UnwrapError::SerdeFailure(e.to_string()))?;
 
-    if data.len() < MIN_SIZE {
-        return Err(UnwrapError::BufferTooSmall {
-            expected_min: MIN_SIZE,
-            actual: data.len(),
-        });
+    if let Value::Object(ref mut map) = json {
+        if let Some(Value::String(peer_id)) = map.remove("peer_id") {
+            let modified_json = serde_json::to_string(&json)
+                .map_err(|e| UnwrapError::SerdeFailure(e.to_string()))?;
+            return Ok((
+                modified_json.into_bytes(),
+                PublicKey::from_str(&peer_id)
+                    .map_err(|e| UnwrapError::InvalidPublicKey(e.to_string()))?,
+            ));
+        }
     }
-
-    let pubkey = PublicKey::from_slice(&data[0..33])
-        .map_err(|e| UnwrapError::InvalidPublicKey(e.to_string()))?;
-
-    let payload = &data[33..];
-    Ok((payload, pubkey))
+    Err(UnwrapError::InvalidPublicKey(String::from(
+        "public key missing",
+    )))
 }
 
 /// Unwraps payload data and peer ID, panicking on error
 ///
 /// This is a convenience function for cases where one knows the data is valid.
-pub fn unwrap_payload_with_peer_id(data: &[u8]) -> (&[u8], PublicKey) {
+pub fn unwrap_payload_with_peer_id(data: &[u8]) -> (Vec<u8>, PublicKey) {
     try_unwrap_payload_with_peer_id(data).expect("Failed to unwrap payload with peer")
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     // Valid test public key
@@ -123,68 +123,16 @@ mod tests {
 
     #[test]
     fn test_wrap_and_unwrap_roundtrip() {
-        let payload = b"test lsps message";
         let peer_id = PublicKey::from_slice(&PUBKEY).unwrap();
-
-        let wrapped = wrap_payload_with_peer_id(payload, peer_id);
-        let (unwrapped_payload, unwrapped_peer_id) = unwrap_payload_with_peer_id(&wrapped);
-
-        assert_eq!(unwrapped_payload, payload);
-        assert_eq!(unwrapped_peer_id, peer_id);
-    }
-
-    #[test]
-    fn test_empty_payload() {
-        let payload = b"";
-        let peer_id = PublicKey::from_slice(&PUBKEY).unwrap();
-
-        let wrapped = wrap_payload_with_peer_id(payload, peer_id);
-        assert_eq!(wrapped.len(), 33); // Just pubkey, no payload
+        let payload =
+            json!({"jsonrpc": "2.0","method": "some-method","params": {},"id": "some-id"});
+        let wrapped = wrap_payload_with_peer_id(payload.to_string().as_bytes(), peer_id);
 
         let (unwrapped_payload, unwrapped_peer_id) = unwrap_payload_with_peer_id(&wrapped);
+        let value: serde_json::Value = serde_json::from_slice(&unwrapped_payload).unwrap();
 
-        assert_eq!(unwrapped_payload, payload);
+        assert_eq!(value, payload);
         assert_eq!(unwrapped_peer_id, peer_id);
-    }
-
-    #[test]
-    fn test_large_payload() {
-        let payload = vec![0x42; 10000];
-        let peer_id = PublicKey::from_slice(&PUBKEY).unwrap();
-
-        let wrapped = wrap_payload_with_peer_id(&payload, peer_id);
-        assert_eq!(wrapped.len(), 33 + 10000);
-
-        let (unwrapped_payload, unwrapped_peer_id) = unwrap_payload_with_peer_id(&wrapped);
-
-        assert_eq!(unwrapped_payload, payload.as_slice());
-        assert_eq!(unwrapped_peer_id, peer_id);
-    }
-
-    #[test]
-    fn test_buffer_too_small() {
-        let small_buffer = [0u8; 10];
-        let result = try_unwrap_payload_with_peer_id(&small_buffer);
-
-        match result {
-            Err(UnwrapError::BufferTooSmall {
-                expected_min: 33,
-                actual: 10,
-            }) => {}
-            _ => panic!("Expected BufferTooSmall error"),
-        }
-    }
-
-    #[test]
-    fn test_exactly_pubkey_size() {
-        // Buffer with exactly 33 bytes (valid pubkey, empty payload)
-        let peer_id = PublicKey::from_slice(&PUBKEY).unwrap();
-        let wrapped = wrap_payload_with_peer_id(b"", peer_id);
-        assert_eq!(wrapped.len(), 33);
-
-        let (payload, recovered_peer_id) = unwrap_payload_with_peer_id(&wrapped);
-        assert_eq!(payload.len(), 0);
-        assert_eq!(recovered_peer_id, peer_id);
     }
 
     #[test]
@@ -193,8 +141,9 @@ mod tests {
         // Set an invalid public key (all zeros)
         invalid_data[0] = 0x02; // Valid prefix
                                 // But rest remains zeros which is invalid
+        let payload = json!({"jsonrpc": "2.0","method": "some-method","params": {},"id": "some-id","peer_id": hex::encode(&invalid_data)});
 
-        let result = try_unwrap_payload_with_peer_id(&invalid_data);
+        let result = try_unwrap_payload_with_peer_id(payload.to_string().as_bytes());
         assert!(matches!(result, Err(UnwrapError::InvalidPublicKey(_))));
     }
 

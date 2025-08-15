@@ -5,7 +5,7 @@ use crate::{
 use bitcoin::hashes::{sha256, Hash, HashEngine, Hmac, HmacEngine};
 use chrono::Utc;
 use log::debug;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
@@ -370,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn serde_promise_ok() {
+    fn test_serde_promise_ok() {
         let json = r#"{"label": "short", "value": "This is valid"}"#;
         let result = serde_json::from_str::<TestData>(json);
         assert!(result.is_ok());
@@ -379,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn serde_promise_too_long() {
+    fn test_serde_promise_too_long() {
         let long_value = "a".repeat(513); // Exceeds 512 bytes
         let json = format!(r#"{{"label": "long", "value": "{}"}}"#, long_value);
         let result = serde_json::from_str::<TestData>(&json);
@@ -392,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn serde_promise_wrong_type() {
+    fn test_serde_promise_wrong_type() {
         // Input JSON has a number where a string is expected for 'value'
         let json = r#"{"label": "wrong_type", "value": 123}"#;
         let result = serde_json::from_str::<TestData>(json);

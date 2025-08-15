@@ -28,7 +28,7 @@ const LSP_FEATURE_BIT: usize = 729;
 
 /// An option to enable this service.
 const OPTION_ENABLED: options::FlagConfigOption = ConfigOption::new_flag(
-    "lsps_service_enabled",
+    "dev-lsps-service-enabled",
     "Enables an LSPS service on the node.",
 );
 
@@ -92,19 +92,34 @@ async fn main() -> Result<(), anyhow::Error> {
         // FIXME: Once this get more cluttered, replace with a match to make it
         // cleaner.
         if plugin.option(&lsps2::OPTION_ENABLED)? {
+            log::debug!("lsps2 enabled");
             let secret_hex = plugin.option(&lsps2::OPTION_PROMISE_SECRET)?;
             if let Some(secret_hex) = secret_hex {
-                let secret: [u8; 32] = hex::decode(secret_hex.trim().to_lowercase())
-                    .with_context(|| {
-                        format!(
-                            "Invalid hex string for promise secret: {}",
-                            secret_hex.trim()
-                        )
-                    })?
-                    .try_into()
-                    .map_err(|v: Vec<u8>| {
-                        anyhow!("Promise secret must be exactly 32 bytes, got {}", v.len())
-                    })?;
+                let secret_hex = secret_hex.trim().to_lowercase();
+
+                let decoded_bytes = match hex::decode(&secret_hex) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return plugin
+                            .disable(&format!(
+                                "Invalid hex string for promise secret: {}",
+                                secret_hex
+                            ))
+                            .await;
+                    }
+                };
+
+                let secret: [u8; 32] = match decoded_bytes.try_into() {
+                    Ok(array) => array,
+                    Err(vec) => {
+                        return plugin
+                            .disable(&format!(
+                                "Promise secret must be exactly 32 bytes, got {}",
+                                vec.len()
+                            ))
+                            .await;
+                    }
+                };
 
                 lsps_builder = lsps_builder
                     .with_handler(
@@ -119,6 +134,7 @@ async fn main() -> Result<(), anyhow::Error> {
         }
 
         let lsps_service = lsps_builder.build();
+        debug!("STARTING LSP WITH SERVICE: {:?}", lsps_service);
         let state = State {
             lsps_service,
             rpc: rpc_arc,
@@ -161,7 +177,12 @@ async fn on_custommsg(
                     continue_response
                 }
                 Err(e) => {
-                    warn!("Failed to handle LSPS message from {}: {}", msg.peer_id, e);
+                    warn!(
+                        "Failed to handle LSPS message {} from {}: {}",
+                        hex::encode(&req.payload),
+                        msg.peer_id,
+                        e
+                    );
                     // Decide if an error response should be sent back via writer?
                     // handle_message already tries to send JSON-RPC errors.
                     // If handle_message itself fails (e.g., transport error in writer), log it.
@@ -225,4 +246,11 @@ impl JsonRpcResponseWriter for LspsResponseWriter {
         let mut rpc = self.rpc.lock().await;
         transport::send_custommsg(&mut rpc, payload.to_vec(), self.peer_id).await
     }
+}
+
+async fn lsps2_htlc_accepted_hook(
+    _p: cln_plugin::Plugin<State>,
+    _v: serde_json::Value,
+) -> Result<serde_json::Value, anyhow::Error> {
+    todo!()
 }

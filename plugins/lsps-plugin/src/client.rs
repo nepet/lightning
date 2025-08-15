@@ -10,7 +10,7 @@ use cln_lsps::lsps2::model::{
     compute_opening_fee, Lsps2BuyRequest, Lsps2BuyResponse, Lsps2GetInfoRequest,
     Lsps2GetInfoResponse, OpeningFeeParams,
 };
-use cln_lsps::util;
+use cln_lsps::util::{self, is_feature_bit_set};
 use cln_rpc::model::requests::ListpeersRequest;
 use cln_rpc::primitives::{AmountOrAny, PublicKey};
 use cln_rpc::ClnRpc;
@@ -140,9 +140,13 @@ async fn on_lsps_lsps2_buy(
     let client = JsonRpcClient::new(transport);
 
     // Convert from AmountOrAny to Msat.
-    let payment_size_msat = match req.payment_size_msat {
-        AmountOrAny::Amount(amount) => Some(Msat::from_msat(amount.msat())),
-        AmountOrAny::Any => None,
+    let payment_size_msat = if let Some(payment_size) = req.payment_size_msat {
+        match payment_size {
+            AmountOrAny::Amount(amount) => Some(Msat::from_msat(amount.msat())),
+            AmountOrAny::Any => None,
+        }
+    } else {
+        None
     };
 
     let selected_params = req.opening_fee_params;
@@ -263,7 +267,7 @@ async fn on_lsps_buy_jit_channel(
     struct Request {
         lsp_id: String,
         // Optional: for fixed-amount invoices
-        payment_size_msat: AmountOrAny,
+        payment_size_msat: Option<AmountOrAny>,
         // Optional: for discounts/API keys
         token: Option<String>,
     }
@@ -342,11 +346,17 @@ async fn on_lsps_buy_jit_channel(
         cltv_expiry_delta: u16::try_from(buy_res.lsp_cltv_expiry_delta)?,
     };
 
+    let amount_msat = if let Some(payment_size) = req.payment_size_msat {
+        payment_size
+    } else {
+        AmountOrAny::Any
+    };
+
     let inv: cln_rpc::model::responses::InvoiceResponse = cln_client
         .call_raw(
             "invoice",
             &InvoiceRequest {
-                amount_msat: req.payment_size_msat,
+                amount_msat,
                 dev_routes: Some(vec![vec![hint]]),
                 description: String::from("TODO"), // TODO: Pass down description from rpc call
                 label: gen_label(None),            // TODO: Pass down label from rpc call
@@ -389,14 +399,13 @@ async fn ensure_lsp_connected(cln_client: &mut ClnRpc, lsp_id: &str) -> Result<(
                 if let Some(feature_bits) = hex::decode(f_str).ok() {
                     let mut fb = feature_bits.clone();
                     fb.reverse();
-                    warn!("CHECKING FEATURES {f_str}");
                     util::is_feature_bit_set(&fb, LSP_FEATURE_BIT)
                 } else {
                     false
                 }
             })
         })
-        .ok_or({
+        .ok_or_else(|| {
             debug!(
                 "Peer {lsp_id} is not an lsp, feature bit {} is missing",
                 LSP_FEATURE_BIT
@@ -440,7 +449,8 @@ struct ClnRpcLsps2GetinfoRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClnRpcLsps2BuyRequest {
     lsp_id: String,
-    payment_size_msat: AmountOrAny,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payment_size_msat: Option<AmountOrAny>,
     opening_fee_params: OpeningFeeParams,
 }
 

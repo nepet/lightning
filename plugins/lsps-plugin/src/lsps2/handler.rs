@@ -59,7 +59,7 @@ impl Lsps2RpcCall for ClnLsps2RpcCall {
         params: &Lsps2PolicyGetInfoRequest,
     ) -> Result<Lsps2PolicyGetInfoResponse, ClnRpcError> {
         let mut rpc = self.rpc.lock().await;
-        rpc.call_raw("dev-lsps2-getinfo", params).await
+        rpc.call_raw("dev-lsps2-getpolicy", params).await
     }
 
     async fn call_getinfo(&self, params: &GetinfoRequest) -> Result<GetinfoResponse, ClnRpcError> {
@@ -169,7 +169,7 @@ impl<T: Lsps2RpcCall + 'static> RequestHandler for Lsps2BuyHandler<T> {
     async fn handle(&self, payload: &[u8]) -> core::result::Result<Vec<u8>, RpcError> {
         let (payload, _) = unwrap_payload_with_peer_id(payload);
 
-        let req: RequestObject<Lsps2BuyRequest> = serde_json::from_slice(payload)
+        let req: RequestObject<Lsps2BuyRequest> = serde_json::from_slice(&payload)
             .map_err(|e| RpcError::parse_error(format!("Failed to parse request: {}", e)))?;
 
         if req.id.is_none() {

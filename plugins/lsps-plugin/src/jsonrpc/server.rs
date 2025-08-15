@@ -1,7 +1,7 @@
 use crate::jsonrpc::{Result, RpcError};
 use async_trait::async_trait;
 use log::{debug, trace};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 /// Responsible for writing JSON-RPC responses back to clients.
 ///
@@ -59,6 +59,14 @@ impl JsonRpcServerBuilder {
 #[derive(Clone)]
 pub struct JsonRpcServer {
     handlers: Arc<HashMap<String, Arc<dyn RequestHandler>>>,
+}
+
+impl Debug for JsonRpcServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonRpcServer")
+            .field("handlers", &self.handlers.keys())
+            .finish()
+    }
 }
 
 impl JsonRpcServer {

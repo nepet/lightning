@@ -1,13 +1,13 @@
+use core::fmt;
+
+use chrono::serde::ts_microseconds_option::deserialize;
 use serde::{
-    de::{Error, Visitor},
+    de::{self, Error, Visitor},
     Deserialize, Deserializer, Serialize, Serializer,
 };
+use serde_json::Value;
 
-// The amount suffix representing Satoshi as per LSPS0.
-const SAT_SUFFIX: &str = "_sat";
-// The amount suffix representing MilliSatoshi as per LSPS0.
-const MSAT_SUFFIX: &str = "_msat";
-const MSAT_PER_SAT: u64 = 1000;
+const MSAT_PER_SAT: u64 = 1_000;
 
 /// Represents a monetary amount as defined in LSPS0.msat. Is converted to a
 /// `String` in json messages with a suffix `_msat` or `_sat` and internally
@@ -16,9 +16,14 @@ const MSAT_PER_SAT: u64 = 1000;
 pub struct Msat(pub u64);
 
 impl Msat {
-    /// Constructs a new `Msat` struct from a `u64`.
+    /// Constructs a new `Msat` struct from a `u64` msat value.
     pub fn from_msat(msat: u64) -> Self {
         Msat(msat)
+    }
+
+    /// Construct a new `Msat` struct from a `u64` sat value.
+    pub fn from_sat(sat: u64) -> Self {
+        Msat(sat * MSAT_PER_SAT)
     }
 
     /// Returns the sat amount of the field. Is a floored integer division e.g
@@ -44,74 +49,7 @@ impl Serialize for Msat {
     where
         S: Serializer,
     {
-        let formatted_string = format!("{}_msat", self.0);
-        serializer.serialize_str(&formatted_string)
-    }
-}
-
-struct MsatVisitor;
-
-impl<'de> Visitor<'de> for MsatVisitor {
-    type Value = Msat;
-
-    fn expecting(&self, formatter: &mut core::fmt::Formatter) -> core::fmt::Result {
-        formatter.write_str("a string formatted as '<numeric_value>_sat' or '<numeric_value>_msat'")
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-    where
-        E: Error,
-    {
-        let msat_val = if let Some(stripped) = value.strip_suffix(SAT_SUFFIX) {
-            let num_sats = stripped.parse::<u64>().map_err(|e| {
-                Error::custom(format!(
-                    "Failed to parse '{}' as u64 (from '{}'): {}",
-                    stripped, value, e
-                ))
-            })?;
-            num_sats.checked_mul(MSAT_PER_SAT).ok_or_else(|| {
-                Error::custom(format!(
-                    "Satoshi value '{}' too large, results in millisatoshi overflow",
-                    num_sats
-                ))
-            })?
-        } else if let Some(stripped) = value.strip_suffix(MSAT_SUFFIX) {
-            stripped.parse::<u64>().map_err(|e| {
-                Error::custom(format!(
-                    "Failed to parse '{}' as u64 (from '{}'): {}",
-                    stripped, value, e
-                ))
-            })?
-        } else {
-            return Err(Error::custom(format!(
-                "Expected string ending with '{}' or '{}', found: '{}'",
-                SAT_SUFFIX, MSAT_SUFFIX, value
-            )));
-        };
-        Ok(Msat(msat_val))
-    }
-
-    // other visit methods returning invalid_type errors.
-    fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
-    where
-        E: Error,
-    {
-        Err(Error::invalid_type(
-            serde::de::Unexpected::Unsigned(v),
-            &self,
-        ))
-    }
-    fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
-    where
-        E: Error,
-    {
-        self.visit_str(v)
-    }
-    fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
-    where
-        E: Error,
-    {
-        self.visit_str(&v)
+        serializer.serialize_str(&self.0.to_string())
     }
 }
 
@@ -120,7 +58,46 @@ impl<'de> Deserialize<'de> for Msat {
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_str(MsatVisitor)
+        struct MsatVisitor;
+
+        impl<'de> de::Visitor<'de> for MsatVisitor {
+            type Value = Msat;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a string representing a number")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Msat, E>
+            where
+                E: de::Error,
+            {
+                value
+                    .parse::<u64>()
+                    .map(Msat::from_msat)
+                    .map_err(|_| E::custom(format!("Invalid number string: {}", value)))
+            }
+
+            // Also handle if JSON mistakenly has a number instead of string
+            fn visit_u64<E>(self, value: u64) -> Result<Msat, E>
+            where
+                E: de::Error,
+            {
+                Ok(Msat::from_msat(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Msat, E>
+            where
+                E: de::Error,
+            {
+                if value < 0 {
+                    Err(E::custom("Msat cannot be negative"))
+                } else {
+                    Ok(Msat::from_msat(value as u64))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(MsatVisitor)
     }
 }
 
@@ -182,9 +159,9 @@ mod tests {
             amount: Msat(12345000),
         };
 
-        let expected_amount_json = r#""amount":"12345000_msat""#;
+        let expected_amount_json = r#""amount":"12345000""#;
 
-        // Assert that the serialized string contains the expected _msat suffix.
+        // Assert that the field gets serialized as string.
         let json_string = serde_json::to_string(&msg).expect("Serialization failed");
         assert!(
             json_string.contains(expected_amount_json),
@@ -199,7 +176,7 @@ mod tests {
             json_value
                 .get("amount")
                 .expect("JSON should have 'amount' field"),
-            &serde_json::Value::String("12345000_msat".to_string()),
+            &serde_json::Value::String("12345000".to_string()),
             "JSON 'amount' field should have the correct string value"
         );
     }
@@ -208,60 +185,18 @@ mod tests {
     #[test]
     fn test_msat_deserialization_and_errors() {
         // Case 1: Input string uses "_msat" suffix
-        let json_input_msat = r#"{"amount":"987654321_msat"}"#;
+        let json_ok = r#"{"amount":"987654321"}"#;
         let expected_value_msat = Msat(987654321);
-        let message1: TestMessage = serde_json::from_str(json_input_msat)
-            .expect("Deserialization from _msat string failed");
+        let message1: TestMessage =
+            serde_json::from_str(json_ok).expect("Deserialization from string failed");
         assert_eq!(message1.amount, expected_value_msat);
 
-        // Case 2: Input string uses "_sat" suffix
-        let json_input_sat = r#"{"amount":"12345_sat"}"#;
-        let expected_value_sat = Msat(12345 * 1000);
-        let message2: TestMessage =
-            serde_json::from_str(json_input_sat).expect("Deserialization from _sat string failed");
-        assert_eq!(message2.amount, expected_value_sat);
-        println!("Deserialized (from _sat): {:?}", message2);
-
-        // Case 3: Invalid Suffix (e.g., "_btc" instead of "_sat" or "_msat")
-        let json_invalid_suffix = r#"{"amount":"100_btc"}"#;
-        let result_suffix = serde_json::from_str::<TestMessage>(json_invalid_suffix);
-        assert!(
-            result_suffix.is_err(),
-            "Deserialization should fail for invalid suffix"
-        );
-
-        // Case 4: Missing Suffix (just a number string)
-        let json_missing_suffix = r#"{"amount":"200"}"#;
-        let result_missing = serde_json::from_str::<TestMessage>(json_missing_suffix);
-        assert!(
-            result_missing.is_err(),
-            "Deserialization should fail for missing suffix"
-        );
-
-        // Case 5: Non-numeric Value before suffix
-        let json_non_numeric = r#"{"amount":"abc_msat"}"#;
+        // Case 2: Non-numeric Value before suffix
+        let json_non_numeric = r#"{"amount":"abc"}"#;
         let result_non_numeric = serde_json::from_str::<TestMessage>(json_non_numeric);
         assert!(
             result_non_numeric.is_err(),
             "Deserialization should fail for non-numeric value"
-        );
-
-        // Case 6: Wrong JSON Type (Number instead of String)
-        let json_wrong_type = r#"{"amount":12345}"#;
-        let result_wrong_type = serde_json::from_str::<TestMessage>(json_wrong_type);
-        assert!(
-            result_wrong_type.is_err(),
-            "Deserialization should fail for wrong JSON type (number)"
-        );
-
-        // Case 7: Overflow when converting from _sat
-        // u64::MAX / 1000 is roughly 1.844e16
-        let value_too_large = (u64::MAX / 500).to_string(); // Guaranteed to overflow when * 1000
-        let json_overflow = format!(r#"{{"amount":"{}_sat"}}"#, value_too_large);
-        let result_overflow = serde_json::from_str::<TestMessage>(&json_overflow);
-        assert!(
-            result_overflow.is_err(),
-            "Deserialization should fail on sat->msat overflow"
         );
     }
 }
