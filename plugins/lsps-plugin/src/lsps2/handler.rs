@@ -1,10 +1,13 @@
 use crate::{
     jsonrpc::{server::RequestHandler, JsonRpcResponse as _, RequestObject, RpcError},
     lsps0::primitives::ShortChannelId,
-    lsps2::model::{
-        DatastoreEntry, FlowMode, Lsps2BuyRequest, Lsps2BuyResponse, Lsps2GetInfoRequest,
-        Lsps2GetInfoResponse, Lsps2PolicyGetInfoRequest, Lsps2PolicyGetInfoResponse,
-        OpeningFeeParams, Promise,
+    lsps2::{
+        model::{
+            DatastoreEntry, Lsps2BuyRequest, Lsps2BuyResponse, Lsps2GetInfoRequest,
+            Lsps2GetInfoResponse, Lsps2PolicyGetInfoRequest, Lsps2PolicyGetInfoResponse,
+            OpeningFeeParams, Promise,
+        },
+        DS_MAIN_KEY, DS_SUB_KEY,
     },
     util::unwrap_payload_with_peer_id,
 };
@@ -22,8 +25,6 @@ use serde_json;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-const DS_MAIN_KEY: &'static str = "lsps";
-const DS_SUB_KEY: &'static str = "lsps2";
 /// Default cltv delta for the last hop.
 const DEFAULT_CLTV_EXPIRY_DELTA: u32 = 144;
 
@@ -167,7 +168,7 @@ impl Lsps2BuyHandler<ClnLsps2RpcCall> {
 #[async_trait]
 impl<T: Lsps2RpcCall + 'static> RequestHandler for Lsps2BuyHandler<T> {
     async fn handle(&self, payload: &[u8]) -> core::result::Result<Vec<u8>, RpcError> {
-        let (payload, _) = unwrap_payload_with_peer_id(payload);
+        let (payload, peer_id) = unwrap_payload_with_peer_id(payload);
 
         let req: RequestObject<Lsps2BuyRequest> = serde_json::from_slice(&payload)
             .map_err(|e| RpcError::parse_error(format!("Failed to parse request: {}", e)))?;
@@ -199,13 +200,10 @@ impl<T: Lsps2RpcCall + 'static> RequestHandler for Lsps2BuyHandler<T> {
         // already handed out -> Check datastore entries.
         let jit_scid_u64 = generate_jit_scid(info.blockheight);
         let jit_scid = ShortChannelId::from(jit_scid_u64);
-        let flow_mode = match req_params.payment_size_msat {
-            Some(_) => FlowMode::MppFixInvoice,
-            None => FlowMode::NoMppVarInvoice,
-        };
         let ds_data = DatastoreEntry {
+            peer_id,
             opening_fee_params: fee_params,
-            mode: flow_mode,
+            expected_payment_size: req_params.payment_size_msat,
         };
         let ds_json = serde_json::to_string(&ds_data).map_err(|e| {
             warn!("Failed to serialize opening fee params to string {}", e);
@@ -547,7 +545,7 @@ mod tests {
         let ds_calls = mock_rpc.datastore_calls().await;
         let ds_json = ds_calls.first().unwrap().string.clone().unwrap();
         let ds_entry: DatastoreEntry = serde_json::from_str(&ds_json).unwrap();
-        assert_eq!(ds_entry.mode, FlowMode::MppFixInvoice)
+        assert_eq!(ds_entry.expected_payment_size, Some(payment_size));
     }
 
     #[tokio::test]
@@ -595,7 +593,7 @@ mod tests {
         let ds_calls = mock_rpc.datastore_calls().await;
         let ds_json = ds_calls.first().unwrap().string.clone().unwrap();
         let ds_entry: DatastoreEntry = serde_json::from_str(&ds_json).unwrap();
-        assert_eq!(ds_entry.mode, FlowMode::NoMppVarInvoice)
+        assert!(ds_entry.expected_payment_size.is_none())
     }
 
     #[tokio::test]

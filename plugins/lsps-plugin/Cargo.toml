@@ -15,6 +15,7 @@ path = "src/service.rs"
 anyhow = "1.0"
 async-trait = "0.1"
 bitcoin = { version = "0.31", default-features = false, features = ["serde"] }
+bytes = { version = "1", features = ["serde"] }
 cln-plugin = { version = "0.5", path = "../" }
 cln-rpc = { version = "0.5", path = "../../cln-rpc" }
 chrono = { version = "0.4", features = ["serde"] }

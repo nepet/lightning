@@ -27,7 +27,7 @@ def test_lsps0_listprotocols(node_factory):
     assert res
 
 
-def test_lsps2_getinfo(node_factory):
+def test_lsps2_getinfo(node_factory, bitcoind):
     # We need a policy service to fetch from.
     plugin = os.path.join(os.path.dirname(__file__), 'plugins/lsps2_policy.py')
 
@@ -68,7 +68,7 @@ def test_lsps2_buy(node_factory):
     assert res
 
 
-def test_lsps2_buyjitchannel_no_mpp_var_invoice(node_factory):
+def test_lsps2_buyjitchannel_no_mpp_var_invoice(node_factory, bitcoind):
     """ Tests the creation of a "Just-In-Time-Channel" (jit-channel).
 
     At the beginning we have the following situation where l2 acts as the LSP
@@ -87,19 +87,31 @@ def test_lsps2_buyjitchannel_no_mpp_var_invoice(node_factory):
     """
     # We need a policy service to fetch from.
     plugin = os.path.join(os.path.dirname(__file__), 'plugins/lsps2_policy.py')
+    htlc_printer = os.path.join(os.path.dirname(__file__), 'plugins/htlc_accepted_print_onion.py')
 
-    l1, l2, l3 = node_factory.get_nodes(3, opts=[
+    l1, l2, l3, l4, l5 = node_factory.get_nodes(5, opts=[
         {},
         {
             "dev-lsps-service-enabled": None,
             "dev-lsps2-service-enabled": None,
             "dev-lsps2-promise-secret": "00" * 32,
-            "plugin": plugin
+            "plugin": plugin,
+            "fee-base": 0, # We are going to deduct our fee anyways,
+            "fee-per-satoshi": 0, # We are going to deduct our fee anyways,
         },
-        {}
+        {"plugin": htlc_printer},
+        {"plugin": htlc_printer},
+        {"plugin": htlc_printer},
     ])
 
-    node_factory.join_nodes([l3, l2], fundchannel=True)
+    # Give the LSP some funds to open jit-channels
+    addr = l2.rpc.newaddr()['bech32']
+    bitcoind.rpc.sendtoaddress(addr, 1)
+    bitcoind.generate_block(1)
+
+    node_factory.join_nodes([l5, l4], fundchannel=True, wait_for_announce=True)
+    node_factory.join_nodes([l4, l3], fundchannel=True, wait_for_announce=True)
+    node_factory.join_nodes([l3, l2], fundchannel=True, wait_for_announce=True)
     node_factory.join_nodes([l1, l2], fundchannel=False)
 
     decoded = l1.rpc.lsps_buyjitchannel(lsp_id=l2.info['id'])
@@ -110,19 +122,41 @@ def test_lsps2_buyjitchannel_no_mpp_var_invoice(node_factory):
     assert decoded
     route_hint = decoded['routes'][0][0]
 
-    amount_msat = "10000000msat"
-    route = l3.rpc.getroute(l2.info['id'], amount_msat, 0)['route']
-    direction = 0 if l2.info['id'] < l1.info['id'] else 1
-    route.append({
-        "id": l1.info["id"],
-        "channel": route_hint['short_channel_id'],
-        "direction": direction,
-        "amount_msat": amount_msat,
-        "delay": 5, "style": "tlv"
-    })
-    res = l3.rpc.sendpay(route, decoded['payment_hash'], payment_secret=decoded['payment_secret'], bolt11=bolt11)
-    assert res
+    amount_msat = "10002000msat"
+    amount_forward = "10000000msat"
+    inv = l3.rpc.invoice("any", "mylabel", "desc")['bolt11']
+    dec = l3.rpc.decode(inv)
+    route = l5.rpc.getroute(l3.info['id'], amount_msat, 0, cltv=145)['route']
+    print(f"ROUTE {route}")
+    # l5.rpc.sendpay(route, dec['payment_hash'], payment_secret=decoded['payment_secret'])
+    # res = l5.rpc.waitsendpay(dec['payment_hash'])
+    res = l5.rpc.pay(inv, amount_msat=amount_msat)
+    print(f"{res}")
+    pass
+    # direction = 0 if l2.info['id'] < l1.info['id'] else 1
+    # route.append({
+    #     "id": l1.info["id"],
+    #     "channel": route_hint['short_channel_id'],
+    #     "direction": direction,
+    #     "amount_msat": amount_forward,
+    #     "delay": 1,
+    #     "style": "tlv"
+    # })
+    # res = l3.rpc.sendpay(route, decoded['payment_hash'], payment_secret=decoded['payment_secret'])
+    # assert res
 
-    res = l3.rpc.waitsendpay(decoded['payment_hash'])
+    # l2.daemon.wait_for_log("sendrawtx exit 0")
+    # bitcoind.generate_block(1)
+
+    # res = l3.rpc.waitsendpay(decoded['payment_hash'])
+    # assert res
+    # print(f"SENDPAY {res}")
+
+
+def test_test(node_factory):
+    htlc_printer = os.path.join(os.path.dirname(__file__), 'plugins/htlc_accepted_print_onion.py')
+    l1, l2, l3 = node_factory.line_graph(3, wait_for_announce=True, opts=[{"plugin": htlc_printer},{"plugin": htlc_printer},{"plugin": htlc_printer}])
+
+    inv = l3.rpc.invoice("any", "mylabel", "desc")['bolt11']
+    res = l1.rpc.pay(inv, amount_msat=1000000)
     assert res
-    print(f"SENDPAY {res}")

@@ -10,7 +10,12 @@ use cln_lsps::lsps2::model::{
     compute_opening_fee, Lsps2BuyRequest, Lsps2BuyResponse, Lsps2GetInfoRequest,
     Lsps2GetInfoResponse, OpeningFeeParams,
 };
-use cln_lsps::util::{self, is_feature_bit_set};
+use cln_lsps::model::tlv::ToBytes;
+use cln_lsps::model::{
+    tlv, HtlcAcceptedContinueResponse, HtlcAcceptedRequest, Onion, TLV_OUTGOING_CLTV,
+    TLV_PAYMENT_SECRET,
+};
+use cln_lsps::util::{self};
 use cln_rpc::model::requests::ListpeersRequest;
 use cln_rpc::primitives::{AmountOrAny, PublicKey};
 use cln_rpc::ClnRpc;
@@ -39,6 +44,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     if let Some(plugin) = cln_plugin::Builder::new(tokio::io::stdin(), tokio::io::stdout())
         .hook("custommsg", CustomMessageHookManager::on_custommsg::<State>)
+        .hook("htlc_accepted", on_htlc_accepted)
         .rpcmethod(
             "lsps-listprotocols",
             "List protocols supported by LSP peer {peer}",
@@ -184,19 +190,6 @@ async fn on_lsps_lsps2_buy(
             "Calculated opening fee: {}msat for payment size {}msat",
             opening_fee, payment_size
         );
-
-        // TODO: Maybe we need a spec change here, we should know what the LSP
-        // expects to be the htlc_minimum_msat in oder to check that the
-        // `payment_size` is big enough. On the other hand, the LSP can always
-        // reject if needed but for UX it would be good to know that in advance.
-        //
-        // const HTLC_MINIMUM_MSAT: u64 = 1000; // Should match LSP's expectation or be configurable
-        // if opening_fee.saturating_add(HTLC_MINIMUM_MSAT) > payment_size.0 {
-        //     return Err(anyhow!(
-        //         "Calculated opening fee {}msat is too high for payment size {}msat (cannot forward minimum HTLC)",
-        //         opening_fee, payment_size
-        //     ));
-        // }
     } else {
         info!("No payment size specified, requesting JIT channel for a variable-amount invoice.");
         // Check if the selected params allow for variable amount (implicitly they do if max > min)
@@ -318,10 +311,6 @@ async fn on_lsps_buy_jit_channel(
 
     info!("Selected fee parameters: {:?}", selected_params);
 
-    // We define the invoice expiry here to avoid cloning `selected_params`
-    // as they are about to be moved to the `Lsps2BuyRequest`.
-    let inv_expiry = u64::try_from(selected_params.valid_until.timestamp())?;
-
     // 3. Request channel from LSP.
     let buy_res: Lsps2BuyResponse = cln_client
         .call_raw(
@@ -329,12 +318,25 @@ async fn on_lsps_buy_jit_channel(
             &ClnRpcLsps2BuyRequest {
                 lsp_id: req.lsp_id.clone(),
                 payment_size_msat: req.payment_size_msat,
-                opening_fee_params: selected_params,
+                opening_fee_params: selected_params.clone(),
             },
         )
         .await?;
 
     debug!("Received lsps2.buy response: {:?}", buy_res);
+
+    // We define the invoice expiry here to avoid cloning `selected_params`
+    // as they are about to be moved to the `Lsps2BuyRequest`.
+    let expiry = (selected_params.valid_until - Utc::now()).num_seconds();
+    if expiry <= 10 {
+        return Err(anyhow!(
+            "Invoice lifetime is too short, options are valid until: {}",
+            selected_params.valid_until,
+        ));
+    }
+
+    // let op = ConfigOption::new_i64_with_default("cltv-final", 144, "Minimum final cltv delta");
+    // let min_cltv = p.option(&op)?;
 
     // 4. Create and return invoice with a route hint pointing to the LSP, using
     // the scid we got from the LSP.
@@ -360,8 +362,8 @@ async fn on_lsps_buy_jit_channel(
                 dev_routes: Some(vec![vec![hint]]),
                 description: String::from("TODO"), // TODO: Pass down description from rpc call
                 label: gen_label(None),            // TODO: Pass down label from rpc call
-                expiry: Some(inv_expiry),
-                cltv: None, // TODO: Get final_cltv from options and add +2 according to LSPS2
+                expiry: Some(expiry as u64),
+                cltv: Some(u32::try_from(16 + 2)?), // TODO: FETCH REAL VALUE!
                 deschashonly: None,
                 preimage: None,
                 exposeprivatechannels: None,
@@ -431,13 +433,21 @@ fn gen_label(label: Option<&str>) -> String {
 /// Checks if the accepted htlc is associated with a lsps request we issued.
 async fn on_htlc_accepted(
     _p: cln_plugin::Plugin<State>,
-    _v: serde_json::Value,
+    v: serde_json::Value,
 ) -> Result<serde_json::Value, anyhow::Error> {
-    // todo: 1. deserialize value
-    // todo: 2. check if the htlc is associated with a lsps htlc
-    // todo:  2. a) if not: return
-    // todo:  2. b) if soL accept
-    todo!();
+    let hook: HtlcAcceptedRequest = serde_json::from_value(v)?;
+    let onion = hook.onion;
+    let htlc = hook.htlc;
+    log::debug!("GOT HTLC ACCEPTED HOOK REQUEST {:?}, {:?}", onion, htlc);
+
+    let mut payload = onion.payload.clone();
+    payload.set_tu64(TLV_OUTGOING_CLTV, 10);
+
+    let payload = tlv::SerializedTlvStream::to_bytes(payload);
+    log::debug!("Serialized payload: {}", hex::encode(&payload));
+
+    let res = HtlcAcceptedContinueResponse::new(Some(payload), None, None);
+    Ok(serde_json::to_value(&res)?)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -554,6 +554,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bitcoin 0.31.2",
+ "bytes",
  "chrono",
  "cln-plugin",
  "cln-rpc",

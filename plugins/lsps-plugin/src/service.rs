@@ -3,7 +3,11 @@ use async_trait::async_trait;
 use cln_lsps::lsps0::model::Lsps0listProtocolsRequest;
 use cln_lsps::lsps0::transport::{self, CustomMsg};
 use cln_lsps::lsps2::handler::{Lsps2BuyHandler, Lsps2GetInfoHandler};
-use cln_lsps::lsps2::model::{Lsps2BuyRequest, Lsps2GetInfoRequest};
+use cln_lsps::lsps2::model::{DatastoreEntry, Lsps2BuyRequest, Lsps2GetInfoRequest};
+use cln_lsps::lsps2::service::{
+    ChannelInfo, ClnRpcCall, HtlcIn, JitChannelCoordinator, JitHtlcAction,
+};
+use cln_lsps::model::{HtlcAcceptedContinueResponse, HtlcAcceptedRequest, HtlcAcceptedResponse};
 use cln_lsps::util::wrap_payload_with_peer_id;
 use cln_lsps::{
     jsonrpc::{
@@ -12,17 +16,23 @@ use cln_lsps::{
     },
     lsps0::handler::Lsps0ListProtocolsHandler,
 };
-use cln_lsps::{lsps0, lsps2, util};
+use cln_lsps::{lsps0, lsps2, model, util};
 use cln_plugin::options::ConfigOption;
 use cln_plugin::{options, Plugin};
+use cln_rpc::model::requests::ListdatastoreRequest;
 use cln_rpc::notifications::CustomMsgNotification;
-use cln_rpc::primitives::PublicKey;
+use cln_rpc::primitives::{Amount, PublicKey, ShortChannelId};
 use cln_rpc::ClnRpc;
-use log::{debug, warn};
-use std::path::Path;
+use hex::FromHex;
+use log::{debug, trace, warn};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
+use tokio::sync::{oneshot, Mutex};
 
 const LSP_FEATURE_BIT: usize = 729;
 
@@ -48,9 +58,41 @@ const OPTION_ENABLED: options::FlagConfigOption = ConfigOption::new_flag(
 // }
 
 #[derive(Clone)]
-struct State {
+pub struct State {
+    rpc_path: PathBuf,
     lsps_service: JsonRpcServer,
     rpc: Arc<Mutex<ClnRpc>>,
+    lsps2_enabled: bool,
+    lsps2_coordinators: Arc<Mutex<HashMap<u64, Weak<JitChannelCoordinator<ClnRpcCall>>>>>,
+}
+
+impl State {
+    async fn get_or_create_lsps2_coordinator(
+        &self,
+        jit_scid: u64,
+        channel_info: ChannelInfo,
+        mpp_timeout: Duration,
+    ) -> Result<Arc<JitChannelCoordinator<ClnRpcCall>>, anyhow::Error> {
+        let mut coord_map = self.lsps2_coordinators.lock().await;
+        if let Some(weak_coord) = coord_map.get(&jit_scid) {
+            if let Some(strong_coord) = weak_coord.upgrade() {
+                return Ok(strong_coord);
+            }
+        }
+
+        log::debug!(
+            "Creating a new JIT channel coordinator for scid {}",
+            jit_scid
+        );
+
+        let rpc = ClnRpc::new(&self.rpc_path)
+            .await
+            .with_context(|| "failed to connect to rpc socket")?;
+        let rpc = Arc::new(ClnRpcCall::new(Mutex::new(rpc)));
+        let new_coord = JitChannelCoordinator::new_arc(jit_scid, channel_info, rpc, mpp_timeout);
+        coord_map.insert(jit_scid, Arc::downgrade(&new_coord));
+        Ok(new_coord)
+    }
 }
 
 #[tokio::main]
@@ -68,6 +110,7 @@ async fn main() -> Result<(), anyhow::Error> {
             util::feature_bit_to_hex(LSP_FEATURE_BIT),
         )
         .hook("custommsg", on_custommsg)
+        .hook("htlc_accepted", on_hltc_accpted)
         .configure()
         .await?
     {
@@ -91,7 +134,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
         // FIXME: Once this get more cluttered, replace with a match to make it
         // cleaner.
-        if plugin.option(&lsps2::OPTION_ENABLED)? {
+        let lsps2_enabled = if plugin.option(&lsps2::OPTION_ENABLED)? {
             log::debug!("lsps2 enabled");
             let secret_hex = plugin.option(&lsps2::OPTION_PROMISE_SECRET)?;
             if let Some(secret_hex) = secret_hex {
@@ -131,13 +174,19 @@ async fn main() -> Result<(), anyhow::Error> {
                         Arc::new(Lsps2BuyHandler::new(rpc_arc.clone(), secret)),
                     );
             }
-        }
+            true
+        } else {
+            false
+        };
 
         let lsps_service = lsps_builder.build();
         debug!("STARTING LSP WITH SERVICE: {:?}", lsps_service);
         let state = State {
             lsps_service,
             rpc: rpc_arc,
+            rpc_path,
+            lsps2_enabled: lsps2_enabled,
+            lsps2_coordinators: Arc::new(Mutex::new(HashMap::new())),
         };
         let plugin = plugin.start(state).await?;
         plugin.join().await
@@ -248,9 +297,153 @@ impl JsonRpcResponseWriter for LspsResponseWriter {
     }
 }
 
-async fn lsps2_htlc_accepted_hook(
-    _p: cln_plugin::Plugin<State>,
-    _v: serde_json::Value,
+pub async fn on_hltc_accpted(
+    p: Plugin<State>,
+    v: serde_json::Value,
 ) -> Result<serde_json::Value, anyhow::Error> {
-    todo!()
+    if !p.state().lsps2_enabled {
+        return Ok(serde_json::to_value(HtlcAcceptedResponse {
+            result: String::from("continue"),
+            payment_key: None,
+        })?);
+    };
+
+    debug!("calling htlc_accepted_hook handler for LSP payments");
+
+    let hook: HtlcAcceptedRequest = serde_json::from_value(v)?;
+    let onion = hook.onion;
+    let htlc = hook.htlc;
+    let jit_scid = match onion.short_channel_id {
+        Some(scid) => scid,
+        None => {
+            debug!("is not a forward, continue.");
+            return Ok(serde_json::to_value(HtlcAcceptedResponse {
+                result: String::from("continue"),
+                payment_key: None,
+            })?);
+        }
+    };
+
+    debug!(
+        "got request with onion {:?} scid {} check datastore for requests",
+        onion, jit_scid
+    );
+
+    let ds_req = ListdatastoreRequest {
+        key: Some(vec![
+            lsps2::DS_MAIN_KEY.to_string(),
+            lsps2::DS_SUB_KEY.to_string(),
+            jit_scid.to_string(),
+        ]),
+    };
+
+    debug!(
+        "got request for scid {} check datastore for requests {:?}",
+        jit_scid, &ds_req
+    );
+
+    let res = p.state().rpc.lock().await.call_typed(&ds_req).await?;
+
+    debug!("returned from datastore {:?}", &res);
+
+    if let Some(ds) = res.datastore.into_iter().next() {
+        if let Some(ds_data_raw) = ds.string {
+            let ds_data: DatastoreEntry = serde_json::from_str(&ds_data_raw)?;
+            let channel_info = ChannelInfo::new(
+                ds_data.peer_id,
+                ds_data.opening_fee_params.clone(),
+                0,
+                Amount::from_msat(ds_data.opening_fee_params.max_payment_size_msat.msat()),
+                ds_data.expected_payment_size,
+            );
+            let coord = match p
+                .state()
+                .get_or_create_lsps2_coordinator(
+                    jit_scid.to_u64(),
+                    channel_info,
+                    Duration::from_secs(90), // FIXME: make this an option, must be >=90s.
+                )
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => return Err(anyhow!("Could not process jit-htlc {}", e)),
+            };
+            let (action_tx, action_rx) = oneshot::channel();
+            let res = coord
+                .new_htlc_in(HtlcIn::new(htlc.id, htlc.amount_msat.msat(), action_tx))
+                .await;
+            match res {
+                Ok(action) => match action {
+                    JitHtlcAction::Wait => {
+                        debug!("htlcs are being processed, waiting...");
+                        let action = action_rx.await?;
+                        return process_action(jit_scid, action);
+                    }
+                    JitHtlcAction::Resolve { payment_key } => {
+                        return create_response("resolve", Some(hex::encode(payment_key)))
+                    }
+                    JitHtlcAction::Fail { failure_message: _ } => {
+                        return create_response("fail", None)
+                    }
+                    JitHtlcAction::Continue {
+                        payload: _,
+                        forward_to,
+                        extra_tlvs: _,
+                    } => {
+                        debug!(
+                            "JIT channel coordinator for {} returned, continue.",
+                            &jit_scid.to_string()
+                        );
+                        let res = HtlcAcceptedContinueResponse::new(None, forward_to, None);
+                        return Ok(serde_json::to_value(&res)?);
+                    }
+                },
+                Err(e) => return Err(anyhow!("Could not process new htlc  {}", e)),
+            }
+        } else {
+            return Err(anyhow!("Datastore entry is empty"));
+        }
+    }
+    // Is not a jit_payment, continue
+    let r = HtlcAcceptedResponse {
+        result: String::from("continue"),
+        payment_key: None,
+    };
+    Ok(serde_json::to_value(&r)?)
+}
+
+fn create_response(
+    result: &str,
+    payment_key: Option<String>,
+) -> Result<serde_json::Value, anyhow::Error> {
+    let response = HtlcAcceptedResponse {
+        result: result.to_string(),
+        payment_key,
+    };
+    serde_json::to_value(&response).map_err(|e| anyhow!("Failed to serialize response: {}", e))
+}
+
+fn process_action(
+    jit_scid: ShortChannelId,
+    action: JitHtlcAction,
+) -> Result<serde_json::Value, anyhow::Error> {
+    match action {
+        JitHtlcAction::Wait => Err(anyhow!("Unexpected wait action")),
+        JitHtlcAction::Continue {
+            payload: _,
+            forward_to,
+            extra_tlvs: _,
+        } => {
+            debug!(
+                "JIT channel coordinator for {} returned, continue.",
+                &jit_scid.to_string()
+            );
+            let res = HtlcAcceptedContinueResponse::new(None, forward_to, None);
+            return Ok(serde_json::to_value(&res)?);
+        }
+        JitHtlcAction::Resolve { payment_key } => {
+            create_response("resolve", Some(hex::encode(payment_key)))
+        }
+        JitHtlcAction::Fail { failure_message: _ } => create_response("fail", None),
+    }
 }

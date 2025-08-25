@@ -5,7 +5,7 @@ use crate::{
 use bitcoin::hashes::{sha256, Hash, HashEngine, Hmac, HmacEngine};
 use chrono::Utc;
 use log::debug;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
@@ -289,16 +289,11 @@ impl PolicyOpeningFeeParams {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[repr(u8)]
-pub enum FlowMode {
-    MppFixInvoice = 0,
-    NoMppVarInvoice = 1,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DatastoreEntry {
+    pub peer_id: cln_rpc::primitives::PublicKey,
     pub opening_fee_params: OpeningFeeParams,
-    pub mode: FlowMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_payment_size: Option<Msat>,
 }
 
 /// Computes the opening fee in millisatoshis as described in LSPS2.
