@@ -12,11 +12,13 @@ use cln_lsps::lsps2::model::{
 };
 use cln_lsps::model::tlv::ToBytes;
 use cln_lsps::model::{
-    tlv, HtlcAcceptedContinueResponse, HtlcAcceptedRequest, Onion, TLV_OUTGOING_CLTV,
-    TLV_PAYMENT_SECRET,
+    tlv, HtlcAcceptedContinueResponse, HtlcAcceptedRequest, HtlcAcceptedResponse, Onion,
+    TLV_OUTGOING_CLTV, TLV_PAYMENT_SECRET,
 };
 use cln_lsps::util::{self};
+use cln_plugin::options::{self, ConfigOption};
 use cln_rpc::model::requests::ListpeersRequest;
+use cln_rpc::model::responses::InvoiceResponse;
 use cln_rpc::primitives::{AmountOrAny, PublicKey};
 use cln_rpc::ClnRpc;
 use log::{debug, info, warn};
@@ -25,6 +27,12 @@ use std::path::Path;
 use std::str::FromStr;
 
 const LSP_FEATURE_BIT: usize = 729;
+
+/// An option to enable this service.
+const OPTION_ENABLED: options::FlagConfigOption = options::ConfigOption::new_flag(
+    "dev-lsps-client-enabled",
+    "Enables an LSPS client on the node.",
+);
 
 #[derive(Clone)]
 struct State {
@@ -45,6 +53,7 @@ async fn main() -> Result<(), anyhow::Error> {
     if let Some(plugin) = cln_plugin::Builder::new(tokio::io::stdin(), tokio::io::stdout())
         .hook("custommsg", CustomMessageHookManager::on_custommsg::<State>)
         .hook("htlc_accepted", on_htlc_accepted)
+        .option(OPTION_ENABLED)
         .rpcmethod(
             "lsps-listprotocols",
             "List protocols supported by LSP peer {peer}",
@@ -65,9 +74,16 @@ async fn main() -> Result<(), anyhow::Error> {
             "Low-level command to return the lsps2.buy result from an ",
             on_lsps_lsps2_buy,
         )
-        .start(state)
+        .configure()
         .await?
     {
+        if !plugin.option(&OPTION_ENABLED)? {
+            return plugin
+                .disable(&format!("`{}` not enabled", OPTION_ENABLED.name))
+                .await;
+        }
+
+        let plugin = plugin.start(state).await?;
         plugin.join().await
     } else {
         Ok(())
@@ -363,7 +379,7 @@ async fn on_lsps_buy_jit_channel(
                 description: String::from("TODO"), // TODO: Pass down description from rpc call
                 label: gen_label(None),            // TODO: Pass down label from rpc call
                 expiry: Some(expiry as u64),
-                cltv: Some(u32::try_from(16 + 2)?), // TODO: FETCH REAL VALUE!
+                cltv: Some(u32::try_from(6 + 2)?), // TODO: FETCH REAL VALUE!
                 deschashonly: None,
                 preimage: None,
                 exposeprivatechannels: None,
@@ -372,8 +388,18 @@ async fn on_lsps_buy_jit_channel(
         )
         .await?;
 
-    // TODO: Add some more usefull information here.
-    let out = LspsBuyJitChannelResponse { bolt11: inv.bolt11 };
+    let out = InvoiceResponse {
+        bolt11: inv.bolt11,
+        created_index: inv.created_index,
+        warning_capacity: inv.warning_capacity,
+        warning_deadends: inv.warning_deadends,
+        warning_mpp: inv.warning_mpp,
+        warning_offline: inv.warning_offline,
+        warning_private_unused: inv.warning_private_unused,
+        expires_at: inv.expires_at,
+        payment_hash: inv.payment_hash,
+        payment_secret: inv.payment_secret,
+    };
     Ok(serde_json::to_value(out)?)
 }
 
@@ -440,13 +466,14 @@ async fn on_htlc_accepted(
     let htlc = hook.htlc;
     log::debug!("GOT HTLC ACCEPTED HOOK REQUEST {:?}, {:?}", onion, htlc);
 
-    let mut payload = onion.payload.clone();
-    payload.set_tu64(TLV_OUTGOING_CLTV, 10);
+    // let mut payload = onion.payload.clone();
+    // payload.set_tu64(TLV_OUTGOING_CLTV, 10);
 
-    let payload = tlv::SerializedTlvStream::to_bytes(payload);
-    log::debug!("Serialized payload: {}", hex::encode(&payload));
+    // let payload = tlv::SerializedTlvStream::to_bytes(payload);
+    // log::debug!("Serialized payload: {}", hex::encode(&payload));
 
-    let res = HtlcAcceptedContinueResponse::new(Some(payload), None, None);
+    // let res = HtlcAcceptedContinueResponse::new(Some(payload), None, None);
+    let res = HtlcAcceptedContinueResponse::new(None, None, None);
     Ok(serde_json::to_value(&res)?)
 }
 

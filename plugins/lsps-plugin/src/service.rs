@@ -7,7 +7,11 @@ use cln_lsps::lsps2::model::{DatastoreEntry, Lsps2BuyRequest, Lsps2GetInfoReques
 use cln_lsps::lsps2::service::{
     ChannelInfo, ClnRpcCall, HtlcIn, JitChannelCoordinator, JitHtlcAction,
 };
-use cln_lsps::model::{HtlcAcceptedContinueResponse, HtlcAcceptedRequest, HtlcAcceptedResponse};
+use cln_lsps::model::tlv::ToBytes;
+use cln_lsps::model::{
+    tlv, HtlcAcceptedContinueResponse, HtlcAcceptedRequest, HtlcAcceptedResponse,
+    TLV_SHORT_CHANNEL_ID,
+};
 use cln_lsps::util::wrap_payload_with_peer_id;
 use cln_lsps::{
     jsonrpc::{
@@ -377,7 +381,7 @@ pub async fn on_hltc_accpted(
                     JitHtlcAction::Wait => {
                         debug!("htlcs are being processed, waiting...");
                         let action = action_rx.await?;
-                        return process_action(jit_scid, action);
+                        return process_action(jit_scid, action, onion.payload);
                     }
                     JitHtlcAction::Resolve { payment_key } => {
                         return create_response("resolve", Some(hex::encode(payment_key)))
@@ -389,6 +393,7 @@ pub async fn on_hltc_accpted(
                         payload: _,
                         forward_to,
                         extra_tlvs: _,
+                        channel: _,
                     } => {
                         debug!(
                             "JIT channel coordinator for {} returned, continue.",
@@ -426,6 +431,7 @@ fn create_response(
 fn process_action(
     jit_scid: ShortChannelId,
     action: JitHtlcAction,
+    pl: tlv::SerializedTlvStream,
 ) -> Result<serde_json::Value, anyhow::Error> {
     match action {
         JitHtlcAction::Wait => Err(anyhow!("Unexpected wait action")),
@@ -433,11 +439,19 @@ fn process_action(
             payload: _,
             forward_to,
             extra_tlvs: _,
+            channel: scid,
         } => {
             debug!(
                 "JIT channel coordinator for {} returned, continue.",
                 &jit_scid.to_string()
             );
+
+            let scid = scid.unwrap();
+            let mut payload = pl.clone();
+            payload.set_tu64(TLV_SHORT_CHANNEL_ID, scid);
+            let payload = tlv::SerializedTlvStream::to_bytes(payload);
+            debug!("Replace payload with {}", hex::encode(&payload));
+
             let res = HtlcAcceptedContinueResponse::new(None, forward_to, None);
             return Ok(serde_json::to_value(&res)?);
         }

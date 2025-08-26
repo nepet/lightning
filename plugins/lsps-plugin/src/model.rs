@@ -4,6 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub const TLV_FORWARD_AMT: u64 = 2;
 pub const TLV_OUTGOING_CLTV: u64 = 4;
+pub const TLV_SHORT_CHANNEL_ID: u64 = 6;
 pub const TLV_PAYMENT_SECRET: u64 = 8;
 
 #[derive(Debug, Deserialize)]

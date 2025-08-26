@@ -1,5 +1,6 @@
-from fixtures import *  # noqa: F401,F403
 import os
+from fixtures import *  # noqa: F401,F403
+from utils import only_one
 
 RUST_PROFILE = os.environ.get("RUST_PROFILE", "debug")
 
@@ -17,7 +18,7 @@ def test_lsps_service_disabled(node_factory):
 
 def test_lsps0_listprotocols(node_factory):
     l1, l2 = node_factory.get_nodes(2, opts=[
-        {}, {"dev-lsps-service-enabled": None}
+        {"dev-lsps-client-enabled": None}, {"dev-lsps-service-enabled": None}
     ])
 
     # We don't need a channel to query for lsps services
@@ -32,11 +33,13 @@ def test_lsps2_getinfo(node_factory, bitcoind):
     plugin = os.path.join(os.path.dirname(__file__), 'plugins/lsps2_policy.py')
 
     l1, l2 = node_factory.get_nodes(2, opts=[
-        {}, {
+        {"dev-lsps-client-enabled": None},
+        {
             "dev-lsps-service-enabled": None,
             "dev-lsps2-service-enabled": None,
             "dev-lsps2-promise-secret": "00" * 32,
-            "plugin": plugin}
+            "plugin": plugin
+        }
     ])
 
     # We don't need a channel to query for lsps services
@@ -51,11 +54,13 @@ def test_lsps2_buy(node_factory):
     plugin = os.path.join(os.path.dirname(__file__), 'plugins/lsps2_policy.py')
 
     l1, l2 = node_factory.get_nodes(2, opts=[
-        {}, {
+        {"dev-lsps-client-enabled": None},
+        {
             "dev-lsps-service-enabled": None,
             "dev-lsps2-service-enabled": None,
             "dev-lsps2-promise-secret": "00" * 32,
-            "plugin": plugin}
+            "plugin": plugin
+        }
     ])
 
     # We don't need a channel to query for lsps services
@@ -89,19 +94,17 @@ def test_lsps2_buyjitchannel_no_mpp_var_invoice(node_factory, bitcoind):
     plugin = os.path.join(os.path.dirname(__file__), 'plugins/lsps2_policy.py')
     htlc_printer = os.path.join(os.path.dirname(__file__), 'plugins/htlc_accepted_print_onion.py')
 
-    l1, l2, l3, l4, l5 = node_factory.get_nodes(5, opts=[
-        {},
+    l1, l2, l3= node_factory.get_nodes(3, opts=[
+        {"dev-lsps-client-enabled": None},
         {
             "dev-lsps-service-enabled": None,
             "dev-lsps2-service-enabled": None,
             "dev-lsps2-promise-secret": "00" * 32,
-            "plugin": plugin,
+            "plugin": [htlc_printer, plugin],
             "fee-base": 0, # We are going to deduct our fee anyways,
             "fee-per-satoshi": 0, # We are going to deduct our fee anyways,
         },
-        {"plugin": htlc_printer},
-        {"plugin": htlc_printer},
-        {"plugin": htlc_printer},
+        {},
     ])
 
     # Give the LSP some funds to open jit-channels
@@ -109,54 +112,37 @@ def test_lsps2_buyjitchannel_no_mpp_var_invoice(node_factory, bitcoind):
     bitcoind.rpc.sendtoaddress(addr, 1)
     bitcoind.generate_block(1)
 
-    node_factory.join_nodes([l5, l4], fundchannel=True, wait_for_announce=True)
-    node_factory.join_nodes([l4, l3], fundchannel=True, wait_for_announce=True)
     node_factory.join_nodes([l3, l2], fundchannel=True, wait_for_announce=True)
     node_factory.join_nodes([l1, l2], fundchannel=False)
 
-    decoded = l1.rpc.lsps_buyjitchannel(lsp_id=l2.info['id'])
-    assert decoded['bolt11']
-    bolt11 = decoded['bolt11']
+    chanid = only_one(l3.rpc.listpeerchannels(l2.info['id'])['channels'])['short_channel_id']
 
-    decoded = l3.rpc.decode(bolt11)
-    assert decoded
-    route_hint = decoded['routes'][0][0]
+    inv = l1.rpc.lsps_buyjitchannel(lsp_id=l2.info['id'])
+    assert inv
 
-    amount_msat = "10002000msat"
-    amount_forward = "10000000msat"
-    inv = l3.rpc.invoice("any", "mylabel", "desc")['bolt11']
-    dec = l3.rpc.decode(inv)
-    route = l5.rpc.getroute(l3.info['id'], amount_msat, 0, cltv=145)['route']
-    print(f"ROUTE {route}")
-    # l5.rpc.sendpay(route, dec['payment_hash'], payment_secret=decoded['payment_secret'])
-    # res = l5.rpc.waitsendpay(dec['payment_hash'])
-    res = l5.rpc.pay(inv, amount_msat=amount_msat)
-    print(f"{res}")
-    pass
-    # direction = 0 if l2.info['id'] < l1.info['id'] else 1
-    # route.append({
-    #     "id": l1.info["id"],
-    #     "channel": route_hint['short_channel_id'],
-    #     "direction": direction,
-    #     "amount_msat": amount_forward,
-    #     "delay": 1,
-    #     "style": "tlv"
-    # })
-    # res = l3.rpc.sendpay(route, decoded['payment_hash'], payment_secret=decoded['payment_secret'])
-    # assert res
+    dec = l3.rpc.decode(inv['bolt11'])
+    assert dec
 
-    # l2.daemon.wait_for_log("sendrawtx exit 0")
-    # bitcoind.generate_block(1)
+    routehint = only_one(only_one(dec['routes']))
 
-    # res = l3.rpc.waitsendpay(decoded['payment_hash'])
-    # assert res
-    # print(f"SENDPAY {res}")
+    amt = 10000000
+    fee = amt * 10 // 1000000 + 1
 
+    route = [{'amount_msat': amt + fee,
+              'id': l2.info['id'],
+              'delay': 14,
+              'channel': chanid},
+             {'amount_msat': amt,
+              'id': l1.info['id'],
+              'delay': 8,
+              'channel': routehint['short_channel_id']}]
 
-def test_test(node_factory):
-    htlc_printer = os.path.join(os.path.dirname(__file__), 'plugins/htlc_accepted_print_onion.py')
-    l1, l2, l3 = node_factory.line_graph(3, wait_for_announce=True, opts=[{"plugin": htlc_printer},{"plugin": htlc_printer},{"plugin": htlc_printer}])
-
-    inv = l3.rpc.invoice("any", "mylabel", "desc")['bolt11']
-    res = l1.rpc.pay(inv, amount_msat=1000000)
+    res = l3.rpc.sendpay(route, dec['payment_hash'], payment_secret=inv['payment_secret'], bolt11=inv['bolt11'])
     assert res
+
+    l2.daemon.wait_for_log("sendrawtx exit 0")
+    bitcoind.generate_block(1)
+
+    res = l3.rpc.waitsendpay(dec['payment_hash'])
+    assert res
+    print(f"SENDPAY {res}")

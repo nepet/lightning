@@ -102,6 +102,7 @@ pub enum JitHtlcAction {
         payload: Option<String>,
         forward_to: Option<Vec<u8>>,
         extra_tlvs: Option<String>,
+        channel: Option<u64>,
     },
     Resolve {
         payment_key: Vec<u8>,
@@ -113,13 +114,13 @@ pub enum JitHtlcAction {
 
 #[derive(Debug, Clone, PartialEq)]
 enum JitChannelCoordinatorEvent {
-    ChannelReady { channel_id: Vec<u8> },
+    ChannelReady { channel_id: Vec<u8>, scid: u64 },
 }
 
 impl fmt::Display for JitChannelCoordinatorEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            JitChannelCoordinatorEvent::ChannelReady { channel_id } => {
+            JitChannelCoordinatorEvent::ChannelReady { channel_id, .. } => {
                 write!(f, "event_channel_ready {}", hex::encode(&channel_id))
             }
         }
@@ -276,9 +277,10 @@ where
 
     async fn handle_event(&self, event: JitChannelCoordinatorEvent) {
         match event {
-            JitChannelCoordinatorEvent::ChannelReady { channel_id } => {
-                self.handle_channel_ready(channel_id).await
-            }
+            JitChannelCoordinatorEvent::ChannelReady {
+                channel_id,
+                scid: channel,
+            } => self.handle_channel_ready(channel_id, channel).await,
         }
     }
 
@@ -423,12 +425,13 @@ where
                     payload: None,
                     forward_to: None,
                     extra_tlvs: None,
+                    channel: None,
                 });
             }
         }
     }
 
-    async fn handle_channel_ready(&self, channel_id: Vec<u8>) {
+    async fn handle_channel_ready(&self, channel_id: Vec<u8>, channel: u64) {
         let mut phase = self.state.lock().await;
         if let JitChannelState::AwaitingChannelReady { waiting_htlcs } = &*phase {
             let htlcs = waiting_htlcs.lock().await.drain();
@@ -442,6 +445,7 @@ where
                     payload: None,
                     forward_to: Some(channel_id.clone()),
                     extra_tlvs: None,
+                    channel: Some(channel),
                 })
             });
 
@@ -501,20 +505,21 @@ async fn fund_channel_with_event<L: LightningRpc>(
             .first()
         {
             cur_state = chan.state;
-            chan_is_ready = chan.state == ChannelState::CHANNELD_NORMAL;
+            if chan.state == ChannelState::CHANNELD_NORMAL {
+                _ = event_tx.send(JitChannelCoordinatorEvent::ChannelReady {
+                    channel_id: channel_id.clone().to_vec(),
+                    scid: chan.short_channel_id.unwrap().to_u64(),
+                });
+                return;
+            };
         };
-        if !chan_is_ready {
-            log::debug!(
-                "JIT channel {} not ready yet, state is {:?}, try again in 10s...",
-                hex::encode(channel_id),
-                cur_state,
-            );
-            tokio::time::sleep(Duration::from_secs(10)).await;
-        }
+        log::debug!(
+            "JIT channel {} not ready yet, state is {:?}, try again in 10s...",
+            hex::encode(channel_id),
+            cur_state,
+        );
+        tokio::time::sleep(Duration::from_secs(10)).await;
     }
-    _ = event_tx.send(JitChannelCoordinatorEvent::ChannelReady {
-        channel_id: channel_id.to_vec(),
-    });
 }
 
 #[derive(Debug)]
