@@ -137,12 +137,14 @@ def test_lsps2_buyjitchannel_no_mpp_var_invoice(node_factory, bitcoind):
               'delay': 8,
               'channel': routehint['short_channel_id']}]
 
-    res = l3.rpc.sendpay(route, dec['payment_hash'], payment_secret=inv['payment_secret'], bolt11=inv['bolt11'])
-    assert res
+    l3.rpc.sendpay(route, dec['payment_hash'], payment_secret=inv['payment_secret'], bolt11=inv['bolt11'])
 
+    # Wait for the channel opening tx being broadcasted.
     l2.daemon.wait_for_log("sendrawtx exit 0")
     bitcoind.generate_block(1)
 
     res = l3.rpc.waitsendpay(dec['payment_hash'])
-    assert res
-    print(f"SENDPAY {res}")
+    assert res['payment_preimage']
+
+    chs = l1.rpc.listpeerchannels()['channels']
+    assert len(chs) == 1
