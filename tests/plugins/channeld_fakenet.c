@@ -1259,6 +1259,7 @@ static struct io_plan *recv_req(struct io_conn *conn,
 	case WIRE_CHANNELD_SPLICE_STATE_ERROR:
 	case WIRE_CHANNELD_LOCAL_ANCHOR_INFO:
 	case WIRE_CHANNELD_REESTABLISHED:
+	case WIRE_CHANNELD_REMOVED_HTLC:
 		break;
 	}
 	master_badmsg(-1, msg);

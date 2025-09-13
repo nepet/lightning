@@ -78,6 +78,36 @@ struct existing_htlc *new_existing_htlc(const tal_t *ctx,
 	return existing;
 }
 
+struct removed_htlc *new_removed_htlc(const tal_t *ctx,
+				      u64 id,
+				      const struct amount_msat amount,
+				      const struct sha256 *payment_hash,
+				      const u8 onion_routing_packet[TOTAL_PACKET_SIZE(ROUTING_INFO_SIZE)],
+				      const struct tlv_field *extra_tlvs TAKES,
+				      const struct preimage *preimage TAKES,
+				      const struct failed_htlc *failed TAKES)
+{
+	struct removed_htlc *removed = tal(ctx, struct removed_htlc);
+
+	removed->id = id;
+	removed->amount = amount;
+	removed->payment_hash = *payment_hash;
+	memcpy(removed->onion_routing_packet, onion_routing_packet,
+	       sizeof(removed->onion_routing_packet));
+	if (extra_tlvs)
+		removed->extra_tlvs = tlv_field_arr_dup(removed, extra_tlvs);
+	else
+		removed->extra_tlvs = NULL;
+	removed->payment_preimage
+		= tal_dup_or_null(removed, struct preimage, preimage);
+	if (failed)
+		removed->failed = failed_htlc_dup(removed, failed);
+	else
+		removed->failed = NULL;
+
+	return removed;
+}
+
 static void towire_len_and_tlvstream(u8 **pptr, struct tlv_field *extra_tlvs)
 {
 	/* Making a copy is a bit awful, but it's the easiest way to
@@ -111,6 +141,30 @@ void towire_added_htlc(u8 **pptr, const struct added_htlc *added)
 	} else
 		towire_bool(pptr, false);
 	towire_bool(pptr, added->fail_immediate);
+}
+
+void towire_removed_htlc(u8 **pptr, const struct removed_htlc *removed)
+{
+	towire_u64(pptr, removed->id);
+	towire_amount_msat(pptr, removed->amount);
+	towire_sha256(pptr, &removed->payment_hash);
+	towire(pptr, removed->onion_routing_packet,
+	       sizeof(removed->onion_routing_packet));
+	if (removed->extra_tlvs) {
+		towire_bool(pptr, true);
+		towire_len_and_tlvstream(pptr, removed->extra_tlvs);
+	} else
+		towire_bool(pptr, false);
+	if (removed->payment_preimage) {
+		towire_bool(pptr, true);
+		towire_preimage(pptr, removed->payment_preimage);
+	} else
+		towire_bool(pptr, false);
+	if (removed->failed) {
+		towire_bool(pptr, true);
+		towire_failed_htlc(pptr, removed->failed);
+	} else
+		towire_bool(pptr, false);
 }
 
 void towire_existing_htlc(u8 **pptr, const struct existing_htlc *existing)
@@ -237,6 +291,32 @@ struct added_htlc *fromwire_added_htlc(const tal_t *ctx, const u8 **cursor,
 		added->extra_tlvs = NULL;
 	added->fail_immediate = fromwire_bool(cursor, max);
 	return added;
+}
+
+struct removed_htlc *fromwire_removed_htlc(const tal_t *ctx,
+					     const u8 **cursor, size_t *max)
+{
+	struct removed_htlc *removed = tal(ctx, struct removed_htlc);
+
+	removed->id = fromwire_u64(cursor, max);
+	removed->amount = fromwire_amount_msat(cursor, max);
+	fromwire_sha256(cursor, max, &removed->payment_hash);
+	fromwire(cursor, max, removed->onion_routing_packet,
+		 sizeof(removed->onion_routing_packet));
+	if (fromwire_bool(cursor, max)) {
+		removed->extra_tlvs = fromwire_len_and_tlvstream(removed, cursor, max);
+	} else
+		removed->extra_tlvs = NULL;
+	if (fromwire_bool(cursor, max)) {
+		removed->payment_preimage = tal(removed, struct preimage);
+		fromwire_preimage(cursor, max, removed->payment_preimage);
+	} else
+		removed->payment_preimage = NULL;
+	if (fromwire_bool(cursor, max))
+		removed->failed = fromwire_failed_htlc(removed, cursor, max);
+	else
+		removed->failed = NULL;
+	return removed;
 }
 
 struct existing_htlc *fromwire_existing_htlc(const tal_t *ctx,

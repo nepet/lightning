@@ -6607,6 +6607,7 @@ static void req_in(struct peer *peer, const u8 *msg)
 	case WIRE_CHANNELD_LOCAL_ANCHOR_INFO:
 	case WIRE_CHANNELD_REESTABLISHED:
 	case WIRE_CHANNELD_DEV_PEER_SHACHAIN:
+	case WIRE_CHANNELD_REMOVED_HTLC:
 		break;
 	}
 	master_badmsg(-1, msg);

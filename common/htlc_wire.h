@@ -20,6 +20,19 @@ struct added_htlc {
 	struct tlv_field *extra_tlvs;
 };
 
+/* This is how channeld tells lightingd about a removed htlc */
+struct removed_htlc {
+	u64 id;
+	struct amount_msat amount;
+	struct sha256 payment_hash;
+	u8 onion_routing_packet[TOTAL_PACKET_SIZE(ROUTING_INFO_SIZE)];
+	struct tlv_field *extra_tlvs;
+	/* If fulfilled this is set */
+	struct preimage *payment_preimage;
+	/* if failed, this is set */
+	const struct failed_htlc *failed;
+};
+
 /* This is how lightningd tells us about HTLCs which already exist at startup */
 struct existing_htlc {
 	u64 id;
@@ -78,7 +91,17 @@ struct existing_htlc *new_existing_htlc(const tal_t *ctx,
 					const struct failed_htlc *failed TAKES,
 					const struct tlv_field *extra_tlvs TAKES);
 
+struct removed_htlc *new_removed_htlc(const tal_t *ctx,
+				      u64 id,
+				      const struct amount_msat amount,
+				      const struct sha256 *payment_hash,
+				      const u8 onion_routing_packet[TOTAL_PACKET_SIZE(ROUTING_INFO_SIZE)],
+				      const struct tlv_field *extra_tlvs TAKES,
+				      const struct preimage *preimage TAKES,
+				      const struct failed_htlc *failed TAKES);
+
 void towire_added_htlc(u8 **pptr, const struct added_htlc *added);
+void towire_removed_htlc(u8 **pptr, const struct removed_htlc *removed);
 void towire_existing_htlc(u8 **pptr, const struct existing_htlc *existing);
 void towire_fulfilled_htlc(u8 **pptr, const struct fulfilled_htlc *fulfilled);
 void towire_failed_htlc(u8 **pptr, const struct failed_htlc *failed);
@@ -87,6 +110,8 @@ void towire_side(u8 **pptr, const enum side side);
 void towire_shachain(u8 **pptr, const struct shachain *shachain);
 
 struct added_htlc *fromwire_added_htlc(const tal_t *ctx, const u8 **cursor,
+				       size_t *max);
+struct removed_htlc *fromwire_removed_htlc(const tal_t *ctx, const u8 **cursor,
 				       size_t *max);
 struct existing_htlc *fromwire_existing_htlc(const tal_t *ctx,
 					     const u8 **cursor, size_t *max);

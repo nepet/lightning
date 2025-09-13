@@ -231,6 +231,7 @@ class Type(FieldSet):
         'gossip_getchannels_entry',
         'failed_htlc',
         'added_htlc',
+        'removed_htlc',
         'existing_htlc',
         'inflight',
         'hsm_utxo',
