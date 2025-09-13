@@ -1,4 +1,7 @@
+#include "bitcoin/short_channel_id.h"
+#include "common/htlc_wire.h"
 #include "config.h"
+#include "lightningd/lightningd.h"
 #include <ccan/asort/asort.h>
 #include <ccan/cast/cast.h>
 #include <ccan/mem/mem.h>
@@ -1537,6 +1540,20 @@ static void handle_confirmed_stfu(struct lightningd *ld,
 	was_pending(command_success(cc->cmd, response));
 }
 
+/* Channeld removed an htlc, ligthningd needs to notify subscribers */
+static void handle_htlc_removed(struct lightningd *ld,
+				struct channel *channel,
+				const u8 *msg)
+{
+	struct removed_htlc *htlc;
+	if(!fromwire_channeld_removed_htlc(msg, msg, &htlc)) {
+		channel_internal_error(channel,
+				       "bad handle_htlc_removed %s",
+				       tal_hex(channel, msg));
+	}
+	notify_htlc_removed(ld, &channel->cid, channel->scid, htlc);
+}
+
 static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 {
 	enum channeld_wire t = fromwire_peektype(msg);
@@ -1621,6 +1638,7 @@ static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 		handle_channel_upgrade(sd->channel, msg);
 		break;
 	case WIRE_CHANNELD_REMOVED_HTLC:
+		handle_htlc_removed(sd->ld, sd->channel, msg);
 	/* And we never get these from channeld. */
 	case WIRE_CHANNELD_INIT:
 	case WIRE_CHANNELD_FUNDING_DEPTH:

@@ -10,6 +10,7 @@
  *    reading and writing synchronously we could deadlock if we hit buffer
  *    limits, unlikely as that is.
  */
+#include "common/htlc_wire.h"
 #include "config.h"
 #include <bitcoin/script.h>
 #include <ccan/asort/asort.h>
@@ -2596,6 +2597,8 @@ static void handle_peer_fulfill_htlc(struct peer *peer, const u8 *msg)
 	struct preimage preimage;
 	enum channel_remove_err e;
 	struct htlc *h;
+	struct removed_htlc *removed;
+	u8 *cmsg;
 
 	if (!fromwire_update_fulfill_htlc(msg, &channel_id,
 					  &id, &preimage)) {
@@ -2603,11 +2606,18 @@ static void handle_peer_fulfill_htlc(struct peer *peer, const u8 *msg)
 				 "Bad update_fulfill_htlc %s", tal_hex(msg, msg));
 	}
 
+
 	e = channel_fulfill_htlc(peer->channel, LOCAL, id, &preimage, &h);
 	switch (e) {
 	case CHANNEL_ERR_REMOVE_OK:
 		/* FIXME: We could send preimages to master immediately. */
 		start_commit_timer(peer);
+		/* Inform master about the removed htlc */
+		removed = new_removed_htlc(tmpctx, h->id, h->amount, &h->rhash,
+					   h->routing, h->extra_tlvs, &preimage,
+					   h->failed);
+		cmsg = towire_channeld_removed_htlc(NULL, removed);
+		wire_sync_write(MASTER_FD, take(cmsg));
 		return;
 	/* These shouldn't happen, because any offered HTLC (which would give
 	 * us the preimage) should have timed out long before.  If we
