@@ -1,4 +1,8 @@
+#include "common/htlc_wire.h"
+#include "common/json_stream.h"
+#include "common/sphinx.h"
 #include "config.h"
+#include "wire/onion_wiregen.h"
 #include <ccan/cast/cast.h>
 #include <common/configdir.h>
 #include <lightningd/channel.h>
@@ -679,3 +683,49 @@ void notify_plugin_stopped(struct lightningd *ld, struct plugin *plugin)
 	plugin_notification_serialize(n->stream, plugin);
 	notify_send(ld, n);
 }
+
+static void htlc_removed_serialize(struct json_stream *stream,
+				   const struct channel_id *cid,
+				   const struct short_channel_id *scid,
+				   const struct removed_htlc *htlc)
+{
+	json_add_channel_id(stream, "channel_id", cid);
+	json_add_short_channel_id(stream, "short_channel_id", *scid);
+	json_object_start(stream, "htlc");
+		json_add_u64(stream, "id", htlc->id);
+		json_add_amount_msat(stream, "amount_msat", htlc->amount);
+		json_add_hex(stream, "onion_routing_packet", htlc->onion_routing_packet, sizeof(htlc->onion_routing_packet));
+		if (htlc->extra_tlvs)
+			json_add_hex_talarr(stream, "extra_tlvs", htlc->extra_tlvs);
+		if (htlc->payment_preimage) {
+			json_add_preimage(stream, "payment_preimage", htlc->payment_preimage);
+		} else if (htlc->failed) {
+			json_object_start(stream, "failed_htlc");
+				json_add_u64(stream, "id", htlc->failed->id);
+				json_add_string(stream, "badonion", onion_wire_name(htlc->failed->badonion));
+
+				if (htlc->failed->sha256_of_onion)
+					json_add_sha256(stream, "sha256_of_onion", htlc->failed->sha256_of_onion);
+
+				if (htlc->failed->onion)
+					json_add_hex_talarr(stream, "onion", htlc->failed->onion);
+
+			json_object_end(stream);
+		}
+	json_object_end(stream);
+}
+
+/* FIXME: Add reason and htlc to the notification */
+void notify_htlc_removed(struct lightningd *ld,
+			 const struct channel_id *cid,
+			 const struct short_channel_id *scid,
+			 const struct removed_htlc *htlc)
+{
+	struct jsonrpc_notification *n = notify_start(ld, "htlc_removed");
+	if (!n)
+		return;
+	htlc_removed_serialize(n->stream, cid, scid, htlc);
+	notify_send(ld, n);
+}
+
+REGISTER_NOTIFICATION(htlc_removed)

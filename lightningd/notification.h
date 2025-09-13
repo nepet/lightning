@@ -2,6 +2,7 @@
 #define LIGHTNING_LIGHTNINGD_NOTIFICATION_H
 #include "config.h"
 #include <common/coin_mvt.h>
+#include <common/htlc_wire.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/pay.h>
 #include <lightningd/plugin.h>
@@ -124,4 +125,8 @@ void notify_log(struct lightningd *ld, const struct log_entry *l);
 
 void notify_plugin_started(struct lightningd *ld, struct plugin *plugin);
 void notify_plugin_stopped(struct lightningd *ld, struct plugin *plugin);
+void notify_htlc_removed(struct lightningd *ld,
+			 const struct channel_id *cid,
+			 const struct short_channel_id *scid,
+			 const struct removed_htlc *htlc);
 #endif /* LIGHTNING_LIGHTNINGD_NOTIFICATION_H */
