@@ -2639,9 +2639,10 @@ static void handle_peer_fail_htlc(struct peer *peer, const u8 *msg)
 	struct channel_id channel_id;
 	u64 id;
 	enum channel_remove_err e;
-	u8 *reason;
+	u8 *reason, *cmsg;
 	struct htlc *htlc;
 	struct failed_htlc *f;
+	struct removed_htlc *r;
 
 	/* reason is not an onionreply because spec doesn't know about that */
 	if (!fromwire_update_fail_htlc(msg, msg,
@@ -2658,6 +2659,12 @@ static void handle_peer_fail_htlc(struct peer *peer, const u8 *msg)
 		f->sha256_of_onion = NULL;
 		f->onion = new_onionreply(f, take(reason));
 		start_commit_timer(peer);
+		/* Inform master about failed htlc */
+		r = new_removed_htlc(tmpctx, htlc->id, htlc->amount,
+				     &htlc->rhash, htlc->routing,
+				     htlc->extra_tlvs, NULL, htlc->failed);
+		cmsg = towire_channeld_removed_htlc(NULL, r);
+		wire_sync_write(MASTER_FD, take(cmsg));
 		return;
 	}
 	case CHANNEL_ERR_NO_SUCH_ID:
@@ -2680,8 +2687,10 @@ static void handle_peer_fail_malformed_htlc(struct peer *peer, const u8 *msg)
 	enum channel_remove_err e;
 	struct sha256 sha256_of_onion;
 	u16 failure_code;
+	u8 *cmsg;
 	struct htlc *htlc;
 	struct failed_htlc *f;
+	struct removed_htlc *r;
 
 	if (!fromwire_update_fail_malformed_htlc(msg, &channel_id, &id,
 						 &sha256_of_onion,
@@ -2715,6 +2724,12 @@ static void handle_peer_fail_malformed_htlc(struct peer *peer, const u8 *msg)
 		f->sha256_of_onion = tal_dup(f, struct sha256, &sha256_of_onion);
 		f->badonion = failure_code;
 		start_commit_timer(peer);
+		/* Inform master about failed htlc */
+		r = new_removed_htlc(tmpctx, htlc->id, htlc->amount,
+				     &htlc->rhash, htlc->routing,
+				     htlc->extra_tlvs, NULL, htlc->failed);
+		cmsg = towire_channeld_removed_htlc(NULL, r);
+		wire_sync_write(MASTER_FD, take(cmsg));
 		return;
 	case CHANNEL_ERR_NO_SUCH_ID:
 	case CHANNEL_ERR_ALREADY_FULFILLED:
