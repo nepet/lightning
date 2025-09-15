@@ -4564,3 +4564,22 @@ def test_notify_htlc_removed_fulfilled(node_factory):
     inv = l2.rpc.invoice(42, 'hltcremoved_fulfilled000', '', preimage=preimage)['bolt11']
     l1.rpc.pay(inv)
     l1.daemon.wait_for_log(rf"notification htlc_removed:.*'payment_preimage': '{re.escape(preimage)}'")
+
+
+def test_notify_htlc_removed_failed(node_factory):
+    """htlc_removed should contain info about the failed htlc.
+    """
+    opts = [
+        {'plugin':os.path.join(os.path.dirname(__file__), 'plugins/all_notifications.py')},
+        {'plugin':os.path.join(os.path.dirname(__file__), 'plugins/htlc_accepted-failonion.py')},
+    ]
+
+    l1, l2 = node_factory.line_graph(2, opts=opts)
+
+    # an invalid onion
+    l2.rpc.setfailonion('0' * (292 * 2))
+    inv = l2.rpc.invoice(42, 'htlcremoved_failonion000', '')['bolt11']
+    with pytest.raises(RpcError):
+        l1.rpc.pay(inv)
+
+    l1.daemon.wait_for_log(rf"notification htlc_removed:.*'failed_htlc':.*")
