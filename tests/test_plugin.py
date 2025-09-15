@@ -4548,3 +4548,19 @@ def test_openchannel_hook_channel_type(node_factory, bitcoind):
         l2.daemon.wait_for_log(r"plugin-openchannel_hook_accepter.py: accept by design: channel_type {'bits': \[12, 22\], 'names': \['static_remotekey/even', 'anchors/even'\]}")
     else:
         l2.daemon.wait_for_log(r"plugin-openchannel_hook_accepter.py: accept by design: channel_type {'bits': \[12\], 'names': \['static_remotekey/even'\]}")
+
+
+def test_notify_htlc_removed_fulfilled(node_factory):
+    """htlc_removed should contain the payment preimage.
+    """
+    opts = [
+        {'plugin':os.path.join(os.path.dirname(__file__), 'plugins/all_notifications.py')},
+        {}
+    ]
+
+    l1, l2 = node_factory.line_graph(2, opts=opts)
+
+    preimage = "0" * 60 + "ffff"
+    inv = l2.rpc.invoice(42, 'hltcremoved_fulfilled000', '', preimage=preimage)['bolt11']
+    l1.rpc.pay(inv)
+    l1.daemon.wait_for_log(rf"notification htlc_removed:.*'payment_preimage': '{re.escape(preimage)}'")
