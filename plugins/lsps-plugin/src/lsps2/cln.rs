@@ -649,10 +649,55 @@ pub mod tlv {
         }
 
         #[test]
+        fn set_and_get_u64_basic() -> Result<()> {
+            let mut s = TlvStream::default();
+            s.set_u64(42, 123456789);
+            assert_eq!(s.get_u64(42)?, Some(123456789));
+            Ok(())
+        }
+
+        #[test]
+        fn set_u64_overwrite_keeps_order() -> Result<()> {
+            let mut s = TlvStream(vec![
+                TlvRecord {
+                    type_: 1,
+                    value: vec![0xaa],
+                },
+                TlvRecord {
+                    type_: 10,
+                    value: vec![0xbb],
+                },
+            ]);
+
+            // insert between 1 and 10
+            s.set_u64(5, 7);
+            assert_eq!(
+                s.0.iter().map(|r| r.type_).collect::<Vec<_>>(),
+                vec![1, 5, 10]
+            );
+            assert_eq!(s.get_u64(5)?, Some(7));
+
+            // overwrite existing 5 (no duplicate, order preserved)
+            s.set_u64(5, 9);
+            let types: Vec<u64> = s.0.iter().map(|r| r.type_).collect();
+            assert_eq!(types, vec![1, 5, 10]);
+            assert_eq!(s.0.iter().filter(|r| r.type_ == 5).count(), 1);
+            assert_eq!(s.get_u64(5)?, Some(9));
+            Ok(())
+        }
+
+        #[test]
         fn set_and_get_tu64_basic() -> Result<()> {
             let mut s = TlvStream::default();
             s.set_tu64(42, 123456789);
             assert_eq!(s.get_tu64(42)?, Some(123456789));
+            Ok(())
+        }
+
+        #[test]
+        fn get_u64_missing_returns_none() -> Result<()> {
+            let s = TlvStream::default();
+            assert_eq!(s.get_u64(999)?, None);
             Ok(())
         }
 
