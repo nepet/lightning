@@ -66,7 +66,7 @@ def test_lsps2_getinfo(node_factory):
                 "experimental-lsps2-promise-secret": "0" * 64,
                 "plugin": plugin,
             },
-        ]
+        ],
     )
 
     node_factory.join_nodes([l1, l2], fundchannel=False)
@@ -88,7 +88,7 @@ def test_lsps2_buy(node_factory):
                 "experimental-lsps2-promise-secret": "0" * 64,
                 "plugin": plugin,
             },
-        ]
+        ],
     )
 
     # We don't need a channel to query for lsps services
