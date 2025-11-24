@@ -10,7 +10,7 @@ pub const INVALID_PARAMS: i64 = -32602;
 pub const INTERNAL_ERROR: i64 = -32603;
 
 // Lsps0 error definitions. Are in the range 00000 to 00099.
-const CLIENT_REJECTED: i64 = 1;
+pub const CLIENT_REJECTED: i64 = 1;
 
 pub enum Error {
     ClientRejected(String),
