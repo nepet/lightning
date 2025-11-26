@@ -1,4 +1,4 @@
-use crate::proto::jsonrpc::JsonRpcRequest;
+use crate::proto::jsonrpc::{JsonRpcRequest, RpcError};
 use core::fmt;
 use serde::{
     de::{self},
@@ -14,17 +14,35 @@ pub const LSP_FEATURE_BIT: usize = 729;
 pub const LSPS0_MESSAGE_TYPE: u16 = 37913;
 
 // Lsps0 error definitions. Are in the range 00000 to 00099.
-pub const CLIENT_REJECTED: i64 = 1;
+const CLIENT_REJECTED: i64 = 001;
 
+#[derive(Clone, Debug, PartialEq)]
 pub enum Error {
-    ClientRejected(String),
+    ClientRejected,
 }
 
-impl Error {
-    pub fn client_rejected(msg: String) -> Error {
-        Self::ClientRejected(msg)
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let err_str = match self {
+            Error::ClientRejected => "client rejected",
+        };
+        write!(f, "{}", &err_str)
     }
 }
+
+impl From<Error> for RpcError {
+    fn from(value: Error) -> Self {
+        match value {
+            Error::ClientRejected => RpcError {
+                code: CLIENT_REJECTED,
+                message: "client rejected".to_string(),
+                data: None,
+            },
+        }
+    }
+}
+
+impl core::error::Error for Error {}
 
 /// Represents a monetary amount as defined in LSPS0.msat. Is converted to a
 /// `String` in json messages with a suffix `_msat` or `_sat` and internally

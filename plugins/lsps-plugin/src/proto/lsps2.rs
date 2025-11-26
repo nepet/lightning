@@ -1,6 +1,6 @@
-use crate::{
-    proto::jsonrpc::{JsonRpcRequest, RpcError},
-    proto::lsps0::{DateTime, Msat, Ppm, ShortChannelId},
+use crate::proto::{
+    jsonrpc::{JsonRpcRequest, RpcError},
+    lsps0::{DateTime, Msat, Ppm, ShortChannelId},
 };
 use bitcoin::hashes::{sha256, Hash, HashEngine, Hmac, HmacEngine};
 use chrono::Utc;
@@ -12,12 +12,16 @@ pub mod failure_codes {
     pub const UNKNOWN_NEXT_PEER: &'static str = "4010";
 }
 
+// Custom lsps2 error types.
+const INVALID_OPENING_FEE_PARAMS: i64 = 201;
+const PAYMENT_SIZE_TOO_SMALL: i64 = 202;
+const PAYMENT_SIZE_TOO_LARGE: i64 = 203;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
     InvalidOpeningFeeParams,
     PaymentSizeTooSmall,
     PaymentSizeTooLarge,
-    ClientRejected,
 }
 
 impl core::fmt::Display for Error {
@@ -26,7 +30,6 @@ impl core::fmt::Display for Error {
             Error::InvalidOpeningFeeParams => "invalid opening fee params",
             Error::PaymentSizeTooSmall => "payment size too small",
             Error::PaymentSizeTooLarge => "payment size too large",
-            Error::ClientRejected => "client rejected",
         };
         write!(f, "{}", &err_str)
     }
@@ -36,23 +39,18 @@ impl From<Error> for RpcError {
     fn from(value: Error) -> Self {
         match value {
             Error::InvalidOpeningFeeParams => RpcError {
-                code: 201,
+                code: INVALID_OPENING_FEE_PARAMS,
                 message: "invalid opening fee params".to_string(),
                 data: None,
             },
             Error::PaymentSizeTooSmall => RpcError {
-                code: 202,
+                code: PAYMENT_SIZE_TOO_SMALL,
                 message: "payment size too small".to_string(),
                 data: None,
             },
             Error::PaymentSizeTooLarge => RpcError {
-                code: 203,
+                code: PAYMENT_SIZE_TOO_LARGE,
                 message: "payment size too large".to_string(),
-                data: None,
-            },
-            Error::ClientRejected => RpcError {
-                code: 001,
-                message: "client rejected".to_string(),
                 data: None,
             },
         }
