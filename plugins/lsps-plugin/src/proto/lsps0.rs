@@ -13,36 +13,19 @@ pub const LSP_FEATURE_BIT: usize = 729;
 // Required message type for BOLT8 transport.
 pub const LSPS0_MESSAGE_TYPE: u16 = 37913;
 
-// Lsps0 error definitions. Are in the range 00000 to 00099.
-const CLIENT_REJECTED: i64 = 001;
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum Error {
-    ClientRejected,
+// Lsps0 specific error codes defined in BLIP-50.
+// Are in the range 00000 to 00099.
+pub mod error_codes {
+    pub const CLIENT_REJECTED: i64 = 001;
 }
 
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let err_str = match self {
-            Error::ClientRejected => "client rejected",
-        };
-        write!(f, "{}", &err_str)
+pub trait LSPS0RpcErrorExt {
+    rpc_error_methods! {
+        client_rejected => error_codes::CLIENT_REJECTED,
     }
 }
 
-impl From<Error> for RpcError {
-    fn from(value: Error) -> Self {
-        match value {
-            Error::ClientRejected => RpcError {
-                code: CLIENT_REJECTED,
-                message: "client rejected".to_string(),
-                data: None,
-            },
-        }
-    }
-}
-
-impl core::error::Error for Error {}
+impl LSPS0RpcErrorExt for RpcError {}
 
 /// Represents a monetary amount as defined in LSPS0.msat. Is converted to a
 /// `String` in json messages with a suffix `_msat` or `_sat` and internally

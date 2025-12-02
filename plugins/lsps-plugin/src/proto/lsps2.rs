@@ -12,10 +12,13 @@ pub mod failure_codes {
     pub const UNKNOWN_NEXT_PEER: &'static str = "4010";
 }
 
-// Custom lsps2 error types.
-const INVALID_OPENING_FEE_PARAMS: i64 = 201;
-const PAYMENT_SIZE_TOO_SMALL: i64 = 202;
-const PAYMENT_SIZE_TOO_LARGE: i64 = 203;
+// Lsps2 specific error codes defined in BLIP-52.
+// Are in the range 00200 to 00299.
+pub mod error_codes {
+    pub const INVALID_OPENING_FEE_PARAMS: i64 = 201;
+    pub const PAYMENT_SIZE_TOO_SMALL: i64 = 202;
+    pub const PAYMENT_SIZE_TOO_LARGE: i64 = 203;
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
@@ -27,37 +30,35 @@ pub enum Error {
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let err_str = match self {
-            Error::InvalidOpeningFeeParams => "invalid opening fee params",
-            Error::PaymentSizeTooSmall => "payment size too small",
-            Error::PaymentSizeTooLarge => "payment size too large",
+            Error::InvalidOpeningFeeParams => "Invalid opening fee params",
+            Error::PaymentSizeTooSmall => "Payment size too small",
+            Error::PaymentSizeTooLarge => "Payment size too large",
         };
         write!(f, "{}", &err_str)
     }
 }
 
 impl From<Error> for RpcError {
-    fn from(value: Error) -> Self {
-        match value {
-            Error::InvalidOpeningFeeParams => RpcError {
-                code: INVALID_OPENING_FEE_PARAMS,
-                message: "invalid opening fee params".to_string(),
-                data: None,
-            },
-            Error::PaymentSizeTooSmall => RpcError {
-                code: PAYMENT_SIZE_TOO_SMALL,
-                message: "payment size too small".to_string(),
-                data: None,
-            },
-            Error::PaymentSizeTooLarge => RpcError {
-                code: PAYMENT_SIZE_TOO_LARGE,
-                message: "payment size too large".to_string(),
-                data: None,
-            },
+    fn from(error: Error) -> Self {
+        match error {
+            Error::InvalidOpeningFeeParams => RpcError::invalid_opening_fee_params(error),
+            Error::PaymentSizeTooSmall => RpcError::payment_size_too_small(error),
+            Error::PaymentSizeTooLarge => RpcError::payment_size_too_large(error),
         }
     }
 }
 
 impl core::error::Error for Error {}
+
+pub trait LSPS2RpcErrorExt {
+    rpc_error_methods! {
+        invalid_opening_fee_params => error_codes::INVALID_OPENING_FEE_PARAMS,
+        payment_size_too_small => error_codes::PAYMENT_SIZE_TOO_SMALL,
+        payment_size_too_large => error_codes::PAYMENT_SIZE_TOO_LARGE
+    }
+}
+
+impl LSPS2RpcErrorExt for RpcError {}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Lsps2GetInfoRequest {
