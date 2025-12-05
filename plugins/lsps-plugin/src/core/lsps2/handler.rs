@@ -37,6 +37,7 @@ use cln_rpc::{
 };
 use log::{debug, warn};
 use rand::{rng, Rng as _};
+use serde::Serialize;
 use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
 
 #[async_trait]
@@ -147,6 +148,53 @@ impl ClnApi for ClnApiRpc {
 }
 
 #[async_trait]
+impl DatastoreProvider for ClnApiRpc {
+    async fn store_buy_request(
+        &self,
+        scid: &ShortChannelId,
+        peer_id: &PublicKey,
+        offer: &OpeningFeeParams,
+        payment_msat: &Option<Msat>,
+    ) -> AnyResult<bool> {
+        let mut rpc = self.create_rpc().await?;
+        #[derive(Serialize)]
+        struct DatastoreEntry<'a> {
+            peer_id: &'a PublicKey,
+            offer: &'a OpeningFeeParams,
+            #[serde(borrow)]
+            payment_msat: &'a Option<Msat>,
+        }
+
+        let ds = DatastoreEntry {
+            peer_id,
+            offer,
+            payment_msat,
+        };
+        let json_str = serde_json::to_string(&ds)?;
+
+        let ds = DatastoreRequest {
+            generation: None,
+            hex: None,
+            mode: Some(DatastoreMode::MUST_CREATE),
+            string: Some(json_str),
+            key: vec![
+                DS_MAIN_KEY.to_string(),
+                DS_SUB_KEY.to_string(),
+                scid.to_string(),
+            ],
+        };
+
+        let _ = rpc
+            .call_typed(&ds)
+            .await
+            .map_err(anyhow::Error::new)
+            .with_context(|| "calling datastore")?;
+
+        Ok(true)
+    }
+}
+
+#[async_trait]
 impl Lsps2OfferProvider for ClnApiRpc {
     async fn get_offer(
         &self,
@@ -185,6 +233,17 @@ type Blockheight = u32;
 #[async_trait]
 pub trait BlockheightProvider: Send + Sync {
     async fn get_blockheight(&self) -> AnyResult<Blockheight>;
+}
+
+#[async_trait]
+pub trait DatastoreProvider: Send + Sync {
+    async fn store_buy_request(
+        &self,
+        scid: &ShortChannelId,
+        peer_id: &PublicKey,
+        offer: &OpeningFeeParams,
+        payment_size_msat: &Option<Msat>,
+    ) -> AnyResult<bool>;
 }
 
 pub struct Lsps2ServiceHandler<A> {
@@ -249,7 +308,7 @@ fn make_opening_fee_params(
 }
 
 #[async_trait]
-impl<A: ClnApi + BlockheightProvider + Lsps2OfferProvider + 'static> Lsps2Handler
+impl<A: DatastoreProvider + BlockheightProvider + Lsps2OfferProvider + 'static> Lsps2Handler
     for Lsps2ServiceHandler<A>
 {
     async fn handle_get_info(
@@ -280,34 +339,17 @@ impl<A: ClnApi + BlockheightProvider + Lsps2OfferProvider + 'static> Lsps2Handle
 
         // FIXME: Future task: Check that we don't conflict with any jit scid we
         // already handed out -> Check datastore entries.
-        let jit_scid_u64 = generate_jit_scid(blockheight);
-        let jit_scid = ShortChannelId::from(jit_scid_u64);
-        let ds_data = DatastoreEntry {
-            peer_id: peer_id.to_owned(),
-            opening_fee_params: fee_params,
-            expected_payment_size: request.payment_size_msat,
-        };
-        let ds_json = serde_json::to_string(&ds_data).map_err(|e| {
-            warn!("Failed to serialize opening fee params to string {}", e);
-            RpcError::internal_error("Internal error")
-        })?;
+        let jit_scid = ShortChannelId::from(generate_jit_scid(blockheight));
 
-        let ds_req = DatastoreRequest {
-            generation: None,
-            hex: None,
-            mode: Some(DatastoreMode::MUST_CREATE),
-            string: Some(ds_json),
-            key: vec![
-                DS_MAIN_KEY.to_string(),
-                DS_SUB_KEY.to_string(),
-                jit_scid.to_string(),
-            ],
-        };
+        let ok = self
+            .api
+            .store_buy_request(&jit_scid, &peer_id, &fee_params, &request.payment_size_msat)
+            .await
+            .map_err(|_| RpcError::internal_error("internal error"))?;
 
-        let _ds_res = self.api.cln_datastore(&ds_req).await.map_err(|e| {
-            warn!("Failed to store jit request in ds via rpc {}", e);
-            RpcError::internal_error("Internal error")
-        })?;
+        if !ok {
+            return Err(RpcError::internal_error("internal error"))?;
+        }
 
         Ok(Lsps2BuyResponse {
             jit_channel_scid: jit_scid,
@@ -716,6 +758,7 @@ mod tests {
         lsps2_getpolicy_error: Arc<Mutex<Option<ClnRpcError>>>,
         blockheight_response: Option<u32>,
         blockheight_error: Arc<Mutex<Option<anyhow::Error>>>,
+        store_buy_request_response: bool,
         cln_datastore_response: Arc<Mutex<Option<DatastoreResponse>>>,
         cln_datastore_error: Arc<Mutex<Option<ClnRpcError>>>,
         cln_listdatastore_response: Arc<Mutex<Option<ListdatastoreResponse>>>,
@@ -917,6 +960,19 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl DatastoreProvider for FakeCln {
+        async fn store_buy_request(
+            &self,
+            _scid: &ShortChannelId,
+            _peer_id: &PublicKey,
+            _offer: &OpeningFeeParams,
+            _payment_size_msat: &Option<Msat>,
+        ) -> AnyResult<bool> {
+            Ok(self.store_buy_request_response)
+        }
+    }
+
     fn create_test_htlc_request(
         scid: Option<ShortChannelId>,
         amount_msat: u64,
@@ -1033,6 +1089,7 @@ mod tests {
         let promise_secret = test_promise_secret();
         let mut fake = FakeCln::default();
         fake.blockheight_response = Some(900_000);
+        fake.store_buy_request_response = true;
         *fake.cln_datastore_response.lock().unwrap() = Some(DatastoreResponse {
             generation: Some(0),
             hex: None,
@@ -1066,6 +1123,7 @@ mod tests {
         let promise_secret = test_promise_secret();
         let mut fake = FakeCln::default();
         fake.blockheight_response = Some(900_100);
+        fake.store_buy_request_response = true;
         *fake.cln_datastore_response.lock().unwrap() = Some(DatastoreResponse {
             generation: Some(0),
             hex: None,
