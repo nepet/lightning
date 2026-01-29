@@ -1651,6 +1651,7 @@ def test_lsps2_mpp_abandoned_session_releases_utxos(node_factory, bitcoind):
     )
 
     # Client uses hold_htlcs with hold-result=fail to reject incoming HTLCs
+    # LSP uses a short collect timeout (5s) so the test doesn't take 90 seconds
     l1, l2, l3 = node_factory.get_nodes(
         3,
         opts=[
@@ -1666,6 +1667,7 @@ def test_lsps2_mpp_abandoned_session_releases_utxos(node_factory, bitcoind):
                 "plugin": policy_plugin,
                 "fee-base": 0,
                 "fee-per-satoshi": 0,
+                "lsps2-collect-timeout": 5,  # Short timeout for testing
             },
             {},
         ],
@@ -1740,42 +1742,20 @@ def test_lsps2_mpp_abandoned_session_releases_utxos(node_factory, bitcoind):
     with pytest.raises(RpcError):
         l3.rpc.waitsendpay(payment_hash, partid=1, groupid=1, timeout=15)
 
-    # At this point, session should be in AwaitingRetry
-    # Modify the datastore entry to have a very short valid_until
-    ds_key = ["lsps", "lsps2", scid]
-    ds_entries = l2.rpc.listdatastore(ds_key)["datastore"]
+    # At this point, session is in AwaitingRetry state.
+    # The collect_timeout (5 seconds) will trigger the session to transition
+    # to Abandoned state, which releases the channel and UTXOs.
 
-    if len(ds_entries) == 1:
-        entry_data = json.loads(ds_entries[0]["string"])
-        short_valid_until = (
-            datetime.now(timezone.utc) + timedelta(seconds=3)
-        ).isoformat().replace("+00:00", "Z")
-        entry_data["opening_fee_params"]["valid_until"] = short_valid_until
+    # CRITICAL CHECK: LSP's UTXOs should be released after collect_timeout
+    # Wait for the log message confirming unreserveinputs was called.
+    # Note: We can't use listfunds() here because the withheld channel may still
+    # be in CHANNELD_NORMAL state without a short_channel_id, which fails CLN's
+    # schema validation.
+    l2.daemon.wait_for_log(r"UTXOs unreserved for abandoned channel", timeout=15)
 
-        # Update the datastore entry
-        l2.rpc.datastore(
-            key=ds_key,
-            string=json.dumps(entry_data),
-            mode="must-replace",
-        )
-
-        # Wait for valid_until to expire and session to be abandoned
-        time.sleep(5)
-
-    # CRITICAL CHECK: Funding tx should NOT be in mempool
+    # CRITICAL CHECK: Funding tx should NOT be in mempool (it was withheld)
     mempool_after_abandon = bitcoind.rpc.getmempoolinfo()["size"]
     assert mempool_after_abandon == initial_mempool_size, (
         f"Funding tx should NOT be in mempool after session abandoned "
         f"(expected {initial_mempool_size}, got {mempool_after_abandon})"
-    )
-
-    # Wait a moment for UTXO release to complete
-    time.sleep(1)
-
-    # CRITICAL CHECK: LSP's UTXOs should be released
-    # After abandonment, unreserveinputs should free the reserved UTXOs
-    final_outputs = len(l2.rpc.listfunds()["outputs"])
-    assert final_outputs >= initial_outputs, (
-        f"LSP's UTXOs should be released after session abandoned "
-        f"(initial: {initial_outputs}, final: {final_outputs})"
     )
