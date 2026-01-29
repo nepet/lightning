@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use bitcoin::psbt::{Output, Psbt};
-use bitcoin::{Amount, ScriptBuf, Txid, TxOut};
+use bitcoin::{Amount, ScriptBuf, TxOut, Txid};
 
 /// Weight of a P2WSH funding output in weight units.
 /// 8 bytes value + 1 byte scriptLen + 34 bytes script = 43 bytes = 172 WU.
@@ -27,8 +27,7 @@ pub fn add_funding_output(
     let mut psbt =
         Psbt::deserialize(&psbt_bytes).context("deserializing PSBT from BIP-174 binary")?;
 
-    let script_bytes =
-        hex::decode(scriptpubkey_hex).context("decoding scriptpubkey from hex")?;
+    let script_bytes = hex::decode(scriptpubkey_hex).context("decoding scriptpubkey from hex")?;
 
     let txout = TxOut {
         value: Amount::from_sat(amount_sat),
@@ -51,8 +50,7 @@ pub fn extract_funding_info(psbt_base64: &str) -> Result<(Txid, u32)> {
         .decode(psbt_base64)
         .context("decoding PSBT from base64")?;
 
-    let psbt =
-        Psbt::deserialize(&psbt_bytes).context("deserializing PSBT from BIP-174 binary")?;
+    let psbt = Psbt::deserialize(&psbt_bytes).context("deserializing PSBT from BIP-174 binary")?;
 
     anyhow::ensure!(
         !psbt.unsigned_tx.output.is_empty(),
@@ -174,12 +172,10 @@ mod tests {
     fn test_add_funding_output_invalid_base64() {
         let result = add_funding_output("not-valid-base64!!!", 100_000, "0020ab");
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("decoding PSBT from base64")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("decoding PSBT from base64"));
     }
 
     #[test]
@@ -187,12 +183,10 @@ mod tests {
         let bad_psbt = BASE64.encode(b"not a psbt");
         let result = add_funding_output(&bad_psbt, 100_000, "0020ab");
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("deserializing PSBT")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("deserializing PSBT"));
     }
 
     #[test]
@@ -200,12 +194,10 @@ mod tests {
         let psbt_b64 = make_minimal_psbt();
         let result = add_funding_output(&psbt_b64, 100_000, "not_hex!");
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("decoding scriptpubkey")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("decoding scriptpubkey"));
     }
 
     #[test]

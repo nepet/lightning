@@ -165,7 +165,12 @@ impl SimulatingOutputHandler {
     where
         F: Fn(&SessionOutput) -> bool,
     {
-        self.outputs.lock().unwrap().iter().filter(|o| predicate(o)).count()
+        self.outputs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|o| predicate(o))
+            .count()
     }
 }
 
@@ -209,7 +214,9 @@ impl SessionOutputHandler for SimulatingOutputHandler {
                 ..
             } => {
                 // Release HTLCs with failure
-                self.htlc_holder.release_fail(session_id, failure_code).await;
+                self.htlc_holder
+                    .release_fail(session_id, failure_code)
+                    .await;
                 Ok(None)
             }
 
@@ -324,7 +331,7 @@ async fn test_mpp_payment_happy_path() {
     let config = test_mpp_config(1_000_000);
 
     // Configure output handler with channel info
-        
+
     // Step 1: Create session
     manager.create_session(session_id, config).await.unwrap();
     assert_eq!(
@@ -418,11 +425,14 @@ async fn test_mpp_payment_happy_path() {
 
     // Step 8: Funding broadcast
     let phase = manager
-        .apply_input(session_id, SessionInput::FundingBroadcasted {
-            txid: "0000000000000000000000000000000000000000000000000000000000000001"
-                .parse()
-                .unwrap(),
-        })
+        .apply_input(
+            session_id,
+            SessionInput::FundingBroadcasted {
+                txid: "0000000000000000000000000000000000000000000000000000000000000001"
+                    .parse()
+                    .unwrap(),
+            },
+        )
         .await
         .unwrap();
     assert_eq!(phase, SessionPhase::Done);
@@ -646,7 +656,6 @@ async fn test_retry_after_client_rejection() {
     let session_id = test_session_id();
     let config = test_mpp_config(1_000_000);
 
-        
     // Get to WaitingPreimage state
     manager.create_session(session_id, config).await.unwrap();
     manager
@@ -733,11 +742,14 @@ async fn test_retry_after_client_rejection() {
         .await
         .unwrap();
     let phase = manager
-        .apply_input(session_id, SessionInput::FundingBroadcasted {
-            txid: "0000000000000000000000000000000000000000000000000000000000000001"
-                .parse()
-                .unwrap(),
-        })
+        .apply_input(
+            session_id,
+            SessionInput::FundingBroadcasted {
+                txid: "0000000000000000000000000000000000000000000000000000000000000001"
+                    .parse()
+                    .unwrap(),
+            },
+        )
         .await
         .unwrap();
 
@@ -789,7 +801,6 @@ async fn test_awaiting_retry_valid_until_abandons() {
     let session_id = test_session_id();
     let config = test_mpp_config(1_000_000);
 
-        
     // Get to AwaitingRetry state
     manager.create_session(session_id, config).await.unwrap();
     manager

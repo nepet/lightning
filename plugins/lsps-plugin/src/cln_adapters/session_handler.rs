@@ -74,10 +74,7 @@ impl SessionOutputHandler for ClnSessionOutputHandler {
                     .fund_channel_start(&client_node_id, channel_size_sat, false, Some(0))
                     .await
                     .map_err(|e| {
-                        SessionOutputError::ChannelError(format!(
-                            "fundchannel_start failed: {}",
-                            e
-                        ))
+                        SessionOutputError::ChannelError(format!("fundchannel_start failed: {}", e))
                     })?;
 
                 debug!(
@@ -100,18 +97,18 @@ impl SessionOutputHandler for ClnSessionOutputHandler {
                 );
 
                 // Step 3: Add the funding output to the PSBT
-                let assembled_psbt =
-                    add_funding_output(&fund_result.psbt, channel_size_sat, &start_result.scriptpubkey)
-                        .map_err(|e| {
-                            SessionOutputError::ChannelError(format!(
-                                "PSBT assembly failed: {}",
-                                e
-                            ))
-                        })?;
+                let assembled_psbt = add_funding_output(
+                    &fund_result.psbt,
+                    channel_size_sat,
+                    &start_result.scriptpubkey,
+                )
+                .map_err(|e| {
+                    SessionOutputError::ChannelError(format!("PSBT assembly failed: {}", e))
+                })?;
 
                 // Step 4: Extract funding txid and outpoint from the assembled PSBT
-                let (funding_txid, funding_outpoint) =
-                    extract_funding_info(&assembled_psbt).map_err(|e| {
+                let (funding_txid, funding_outpoint) = extract_funding_info(&assembled_psbt)
+                    .map_err(|e| {
                         SessionOutputError::ChannelError(format!(
                             "extracting funding info failed: {}",
                             e
@@ -222,21 +219,14 @@ impl SessionOutputHandler for ClnSessionOutputHandler {
             SessionOutput::BroadcastFunding { psbt } => {
                 info!("Broadcasting withheld funding transaction");
 
-                let result = self
-                    .provider
-                    .broadcast_funding(&psbt)
-                    .await
-                    .map_err(|e| {
-                        SessionOutputError::ChannelError(format!(
-                            "sendpsbt (broadcast funding) failed: {}",
-                            e
-                        ))
-                    })?;
+                let result = self.provider.broadcast_funding(&psbt).await.map_err(|e| {
+                    SessionOutputError::ChannelError(format!(
+                        "sendpsbt (broadcast funding) failed: {}",
+                        e
+                    ))
+                })?;
 
-                info!(
-                    "Funding transaction broadcast: txid={}",
-                    result.txid
-                );
+                info!("Funding transaction broadcast: txid={}", result.txid);
 
                 // Return feedback: FundingBroadcasted transitions Settling → Done
                 Ok(Some(SessionInput::FundingBroadcasted { txid: result.txid }))
@@ -253,10 +243,7 @@ impl SessionOutputHandler for ClnSessionOutputHandler {
                 // already in terminal (Abandoned) state.
 
                 if let Err(e) = self.provider.close_channel(&channel_id.0).await {
-                    warn!(
-                        "Failed to close withheld channel {:?}: {}",
-                        channel_id, e
-                    );
+                    warn!("Failed to close withheld channel {:?}: {}", channel_id, e);
                 }
 
                 if let Err(e) = self.provider.unreserve_inputs(&funding_psbt).await {
@@ -284,11 +271,11 @@ mod tests {
         ChannelInfo, FundChannelCompleteResult, FundChannelStartResult, FundPsbtResult,
         SendPsbtResult, SignPsbtResult,
     };
-    use bitcoin::hashes::sha256::Hash;
     use crate::core::lsps2::session::{ChannelId, FailureCode, ForwardInstruction, SessionId};
     use crate::core::tlv::TlvStream;
     use crate::proto::lsps0::{Msat, ShortChannelId};
     use anyhow::Result as AnyResult;
+    use bitcoin::hashes::sha256::Hash;
     use bitcoin::secp256k1::PublicKey;
     use tokio::sync::oneshot;
 
@@ -298,11 +285,7 @@ mod tests {
 
     #[async_trait]
     impl LightningProvider for PanicProvider {
-        async fn fund_jit_channel(
-            &self,
-            _: &PublicKey,
-            _: &Msat,
-        ) -> AnyResult<(Hash, String)> {
+        async fn fund_jit_channel(&self, _: &PublicKey, _: &Msat) -> AnyResult<(Hash, String)> {
             unimplemented!("not needed for this test")
         }
         async fn is_channel_ready(&self, _: &PublicKey, _: &Hash) -> AnyResult<bool> {
@@ -512,11 +495,7 @@ mod tests {
 
     #[async_trait]
     impl LightningProvider for OpenChannelMockProvider {
-        async fn fund_jit_channel(
-            &self,
-            _: &PublicKey,
-            _: &Msat,
-        ) -> AnyResult<(Hash, String)> {
+        async fn fund_jit_channel(&self, _: &PublicKey, _: &Msat) -> AnyResult<(Hash, String)> {
             unimplemented!()
         }
         async fn is_channel_ready(&self, _: &PublicKey, _: &Hash) -> AnyResult<bool> {
@@ -606,8 +585,8 @@ mod tests {
         let handler = ClnSessionOutputHandler::new(htlc_holder, provider);
 
         let client_node_id = bitcoin::secp256k1::PublicKey::from_slice(&[
-            2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-            1, 1, 1, 1, 1,
+            2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1,
         ])
         .unwrap();
 
@@ -649,11 +628,7 @@ mod tests {
 
         #[async_trait]
         impl LightningProvider for FailingStartProvider {
-            async fn fund_jit_channel(
-                &self,
-                _: &PublicKey,
-                _: &Msat,
-            ) -> AnyResult<(Hash, String)> {
+            async fn fund_jit_channel(&self, _: &PublicKey, _: &Msat) -> AnyResult<(Hash, String)> {
                 unimplemented!()
             }
             async fn is_channel_ready(&self, _: &PublicKey, _: &Hash) -> AnyResult<bool> {
@@ -704,8 +679,8 @@ mod tests {
         let handler = ClnSessionOutputHandler::new(htlc_holder, provider);
 
         let client_node_id = bitcoin::secp256k1::PublicKey::from_slice(&[
-            2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-            1, 1, 1, 1, 1,
+            2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1,
         ])
         .unwrap();
 
@@ -732,11 +707,7 @@ mod tests {
 
         #[async_trait]
         impl LightningProvider for BroadcastMockProvider {
-            async fn fund_jit_channel(
-                &self,
-                _: &PublicKey,
-                _: &Msat,
-            ) -> AnyResult<(Hash, String)> {
+            async fn fund_jit_channel(&self, _: &PublicKey, _: &Msat) -> AnyResult<(Hash, String)> {
                 unimplemented!()
             }
             async fn is_channel_ready(&self, _: &PublicKey, _: &Hash) -> AnyResult<bool> {
@@ -762,9 +733,9 @@ mod tests {
                 use bitcoin::hashes::Hash as _;
                 Ok(SendPsbtResult {
                     tx: "02000000...".to_string(),
-                    txid: bitcoin::Txid::from_raw_hash(
-                        bitcoin::hashes::sha256d::Hash::hash(b"test_txid"),
-                    ),
+                    txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::hash(
+                        b"test_txid",
+                    )),
                 })
             }
             async fn get_channel_info(
@@ -821,11 +792,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl LightningProvider for ReleaseChannelMockProvider {
-            async fn fund_jit_channel(
-                &self,
-                _: &PublicKey,
-                _: &Msat,
-            ) -> AnyResult<(Hash, String)> {
+            async fn fund_jit_channel(&self, _: &PublicKey, _: &Msat) -> AnyResult<(Hash, String)> {
                 unimplemented!()
             }
             async fn is_channel_ready(&self, _: &PublicKey, _: &Hash) -> AnyResult<bool> {
@@ -878,8 +845,10 @@ mod tests {
             unreserve_called: AtomicBool::new(false),
         });
         let htlc_holder = Arc::new(HtlcHolder::new());
-        let handler =
-            ClnSessionOutputHandler::new(htlc_holder, provider.clone() as Arc<dyn LightningProvider>);
+        let handler = ClnSessionOutputHandler::new(
+            htlc_holder,
+            provider.clone() as Arc<dyn LightningProvider>,
+        );
 
         let result = handler
             .execute(SessionOutput::ReleaseChannel {
@@ -901,11 +870,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl LightningProvider for FailingProvider {
-            async fn fund_jit_channel(
-                &self,
-                _: &PublicKey,
-                _: &Msat,
-            ) -> AnyResult<(Hash, String)> {
+            async fn fund_jit_channel(&self, _: &PublicKey, _: &Msat) -> AnyResult<(Hash, String)> {
                 unimplemented!()
             }
             async fn is_channel_ready(&self, _: &PublicKey, _: &Hash) -> AnyResult<bool> {

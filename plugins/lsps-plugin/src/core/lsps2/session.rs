@@ -2487,10 +2487,7 @@ mod tests {
         if let SessionOutput::ForwardHtlcs { instructions, .. } = &result.outputs[0] {
             assert_eq!(instructions.len(), 1);
             assert_eq!(instructions[0].htlc_id, 1);
-            assert_eq!(
-                instructions[0].forward_to_channel_id,
-                ChannelId([1u8; 32])
-            );
+            assert_eq!(instructions[0].forward_to_channel_id, ChannelId([1u8; 32]));
             // Verify extra_tlvs contains opening fee
             assert!(instructions[0].extra_tlvs.get(TLV_OPENING_FEE).is_some());
         } else {

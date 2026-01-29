@@ -67,7 +67,9 @@ impl LightningProvider for ClnApiRpc {
     ) -> Result<(Sha256, String)> {
         log::debug!(
             "fund_jit_channel: connecting to RPC socket at {:?}, peer={}, amount={}",
-            self.rpc_path, peer_id, amount.msat()
+            self.rpc_path,
+            peer_id,
+            amount.msat()
         );
         let mut rpc = self.create_rpc().await?;
         log::debug!("fund_jit_channel: RPC connected, calling fundchannel");
@@ -91,7 +93,8 @@ impl LightningProvider for ClnApiRpc {
             .with_context(|| "calling fundchannel")?;
         log::debug!(
             "fund_jit_channel: fundchannel returned channel_id={}, txid={}",
-            res.channel_id, res.txid
+            res.channel_id,
+            res.txid
         );
         Ok((res.channel_id, res.txid))
     }
@@ -255,8 +258,8 @@ impl LightningProvider for ClnApiRpc {
         feerate: &str,
         startweight: u32,
     ) -> Result<FundPsbtResult> {
-        let feerate_parsed = Feerate::try_from(feerate)
-            .with_context(|| format!("parsing feerate '{}'", feerate))?;
+        let feerate_parsed =
+            Feerate::try_from(feerate).with_context(|| format!("parsing feerate '{}'", feerate))?;
 
         let mut rpc = self.create_rpc().await?;
         let res = rpc
