@@ -1,6 +1,6 @@
 from fixtures import *  # noqa: F401,F403
 from pyln.client import RpcError
-from pyln.testing.utils import RUST
+from pyln.testing.utils import RUST, sync_blockheight
 from utils import only_one
 import os
 import pytest
@@ -851,3 +851,81 @@ def test_lsps2_mpp_valid_until_expired(node_factory, bitcoind):
     # Verify no JIT channel was created
     channels = l1.rpc.listpeerchannels()["channels"]
     assert len(channels) == 0, "No channel should be created on valid_until expiry"
+
+
+@unittest.skipUnless(RUST, "RUST is not enabled")
+def test_lsps2_mpp_unsafe_cltv(node_factory, bitcoind):
+    """Tests CLTV unsafe hold detection in Collecting phase.
+
+    When HTLCs are held and the block height approaches their CLTV expiry
+    (within min_cltv_margin=2 blocks), the timeout manager detects the unsafe
+    hold condition and fails the session with temporary_channel_failure.
+
+    Setup: 3-node topology, send partial MPP with short CLTV delay (10 blocks)
+    Action: Mine 10 blocks so blocks_remaining drops to 1 (below margin of 2)
+    Expected: Timeout manager detects unsafe hold, fails HTLCs with
+              temporary_channel_failure (4103), no channel created
+    """
+    l1, l2, l3, chanid = setup_lsps2_mpp_topology(node_factory, bitcoind)
+
+    amount_msat = 10_000_000
+
+    # Buy JIT channel and create invoice
+    invoice_data = buy_and_create_invoice(l1, l2, amount_msat)
+
+    routehint = invoice_data["routehint"]
+    payment_hash = invoice_data["payment_hash"]
+    payment_secret = invoice_data["payment_secret"]
+    bolt11 = invoice_data["bolt11"]
+
+    # Send 5 of 10 parts with SHORT CLTV delay (delay=10 on first hop).
+    # This sets cltv_expiry = current_height + 10 for the HTLCs.
+    # The sum won't be reached, so session stays in Collecting.
+    total_split = 10
+    send_count = 5
+    amount_per_part = amount_msat // total_split
+
+    route_part = [
+        {
+            "amount_msat": amount_per_part,
+            "id": l2.info["id"],
+            "delay": 10,
+            "channel": chanid,
+        },
+        {
+            "amount_msat": amount_per_part,
+            "id": l1.info["id"],
+            "delay": 5,
+            "channel": routehint["short_channel_id"],
+        },
+    ]
+
+    for partid in range(1, send_count + 1):
+        l3.rpc.sendpay(
+            route_part,
+            payment_hash,
+            payment_secret=payment_secret,
+            bolt11=bolt11,
+            amount_msat=f"{amount_msat}msat",
+            groupid=1,
+            partid=partid,
+        )
+
+    # Mine enough blocks so blocks_remaining < min_cltv_margin (2).
+    # With delay=10, cltv_expiry = send_height + 10.
+    # We need current_height >= cltv_expiry - 1 (i.e. blocks_remaining <= 1).
+    # Mining 10 blocks ensures height advances past the threshold.
+    bitcoind.generate_block(10)
+    sync_blockheight(bitcoind, [l2])
+
+    # Wait for timeout manager to detect unsafe hold (1s check interval + buffer)
+    with pytest.raises(RpcError) as exc_info:
+        l3.rpc.waitsendpay(payment_hash, partid=1, groupid=1, timeout=15)
+
+    # Verify payment failed with temporary_channel_failure (wire code 0x1007 = 4103)
+    assert exc_info.value.error["code"] == 204
+    assert exc_info.value.error["data"]["failcode"] == 4103
+
+    # Verify no JIT channel was created
+    channels = l1.rpc.listpeerchannels()["channels"]
+    assert len(channels) == 0, "No channel should be created on unsafe CLTV hold"
