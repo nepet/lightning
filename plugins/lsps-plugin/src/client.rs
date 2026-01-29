@@ -268,6 +268,7 @@ async fn on_lsps_lsps2_approve(
     let ds_rec = DatastoreRecord {
         jit_channel_scid: req.jit_channel_scid.clone(),
         client_trusts_lsp: req.client_trusts_lsp.unwrap_or_default(),
+        opening_fee_msat: req.opening_fee_msat,
     };
     let ds_rec_json = serde_json::to_string(&ds_rec)?;
 
@@ -364,7 +365,8 @@ async fn on_lsps_lsps2_invoice(
     };
 
     // Check that the amount is big enough to cover the fee and a single HTLC.
-    let reduced_amount_msat = if let Some(payment_msat) = payment_size_msat {
+    // Also store the opening_fee_msat for later validation of extra_fee TLVs.
+    let (reduced_amount_msat, opening_fee_msat) = if let Some(payment_msat) = payment_size_msat {
         match compute_opening_fee(
             payment_msat.msat(),
             selected_params.min_fee_msat.msat(),
@@ -379,12 +381,12 @@ async fn on_lsps_lsps2_invoice(
                         fee_msat
                     );
                 }
-                Some(payment_msat.msat() - fee_msat)
+                (Some(payment_msat.msat() - fee_msat), Some(fee_msat))
             }
             None => bail!("failed to compute opening fee"),
         }
     } else {
-        None
+        (None, None)
     };
 
     // 3. Request channel from LSP.
@@ -485,6 +487,7 @@ async fn on_lsps_lsps2_invoice(
         jit_channel_scid: buy_res.jit_channel_scid,
         payment_hash: public_inv.payment_hash.to_string(),
         client_trusts_lsp: Some(buy_res.client_trusts_lsp),
+        opening_fee_msat,
     };
     let _: serde_json::Value = cln_client.call_raw("lsps-lsps2-approve", &appr_req).await?;
 
@@ -895,10 +898,16 @@ struct ClnRpcLsps2Approve {
     payment_hash: String,
     #[serde(default)]
     client_trusts_lsp: Option<bool>,
+    /// The opening fee agreed upon during lsps2.buy
+    #[serde(default)]
+    opening_fee_msat: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DatastoreRecord {
     jit_channel_scid: ShortChannelId,
     client_trusts_lsp: bool,
+    /// The opening fee agreed upon during lsps2.buy, used to validate extra_fee TLVs
+    #[serde(default)]
+    opening_fee_msat: Option<u64>,
 }
