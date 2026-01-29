@@ -753,6 +753,27 @@ impl Session {
             .map(|p| p.payment_hash)
     }
 
+    /// Returns the channel_id if the session has progressed past Opening.
+    pub fn channel_id(&self) -> Option<ChannelId> {
+        match &self.state {
+            SessionState::AwaitingChannelReady { channel_id, .. }
+            | SessionState::Forwarding { channel_id, .. }
+            | SessionState::WaitingPreimage { channel_id, .. }
+            | SessionState::AwaitingRetry { channel_id, .. }
+            | SessionState::Settling { channel_id, .. }
+            | SessionState::Done { channel_id, .. }
+            | SessionState::Abandoned { channel_id, .. } => Some(*channel_id),
+            SessionState::Collecting { .. }
+            | SessionState::Opening { .. }
+            | SessionState::Failed { .. } => None,
+        }
+    }
+
+    /// Returns the client's node ID.
+    pub fn client_node_id(&self) -> &PublicKey {
+        &self.config.client_node_id
+    }
+
     /// Returns the HTLC IDs from collected parts.
     pub fn htlc_ids(&self) -> Vec<u64> {
         self.state

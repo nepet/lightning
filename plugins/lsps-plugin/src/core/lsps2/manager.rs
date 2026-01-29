@@ -267,6 +267,55 @@ where
         sessions.keys().copied().collect()
     }
 
+    // ========================================================================
+    // Lookup Methods (for notification handlers)
+    // ========================================================================
+
+    /// Find a session by its channel_id.
+    ///
+    /// Returns the SessionId of the first session with a matching channel_id.
+    /// Used by `channel_state_changed` notification handler.
+    pub async fn find_by_channel_id(&self, channel_id: &[u8; 32]) -> Option<SessionId> {
+        let sessions = self.sessions.lock().await;
+        for (id, session) in sessions.iter() {
+            if let Some(cid) = session.channel_id() {
+                if cid.as_bytes() == channel_id {
+                    return Some(*id);
+                }
+            }
+        }
+        None
+    }
+
+    /// Find a session by payment_hash.
+    ///
+    /// Returns the SessionId of the first session with HTLCs matching
+    /// the given payment_hash. Used by `forward_event` notification handler.
+    pub async fn find_by_payment_hash(&self, payment_hash: &[u8; 32]) -> Option<SessionId> {
+        let sessions = self.sessions.lock().await;
+        for (id, session) in sessions.iter() {
+            if let Some(hash) = session.payment_hash() {
+                if &hash == payment_hash {
+                    return Some(*id);
+                }
+            }
+        }
+        None
+    }
+
+    /// Find all sessions for a given peer (client node ID).
+    ///
+    /// Returns all SessionIds where the client_node_id matches.
+    /// Used by `disconnect` notification handler.
+    pub async fn find_by_peer_id(&self, peer_id: &bitcoin::secp256k1::PublicKey) -> Vec<SessionId> {
+        let sessions = self.sessions.lock().await;
+        sessions
+            .iter()
+            .filter(|(_, session)| session.client_node_id() == peer_id)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     /// Removes all sessions in terminal states.
     ///
     /// Returns the number of sessions removed.
