@@ -2,22 +2,27 @@ use anyhow::bail;
 use bitcoin::hashes::Hash;
 use cln_lsps::{
     cln_adapters::{
-        hooks::service_custommsg_hook, rpc::ClnApiRpc, sender::ClnSender, state::ServiceState,
-        types::HtlcAcceptedRequest,
+        hooks::service_custommsg_hook, rpc::ClnApiRpc, sender::ClnSender,
+        session_handler::ClnSessionOutputHandler, state::ServiceState, types::HtlcAcceptedRequest,
     },
     core::{
         lsps2::{
             htlc::{Htlc, HtlcAcceptedHookHandler, HtlcDecision, Onion, RejectReason},
+            htlc_holder::{HtlcHolder, HtlcInfo, HtlcResponse},
+            manager::SessionManager,
+            provider::{DatastoreProvider, NoOpEventEmitter},
             service::Lsps2ServiceHandler,
+            session::{HtlcPart, SessionConfig, SessionId, SessionInput},
         },
         server::LspsService,
     },
-    proto::lsps0::Msat,
+    proto::lsps0::{Msat, ShortChannelId},
 };
 use cln_plugin::{options, Plugin};
-use log::{debug, error, trace};
+use log::{debug, error, trace, warn};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::oneshot;
 
 pub const OPTION_ENABLED: options::FlagConfigOption = options::ConfigOption::new_flag(
     "experimental-lsps2-service",
@@ -30,11 +35,18 @@ pub const OPTION_PROMISE_SECRET: options::StringConfigOption =
         "A 64-character hex string that is the secret for promises",
     );
 
+/// Type alias for the SessionManager with CLN-specific handlers.
+type ClnSessionManager = SessionManager<NoOpEventEmitter, ClnSessionOutputHandler>;
+
 #[derive(Clone)]
 struct State {
     lsps_service: Arc<LspsService>,
     sender: ClnSender,
     lsps2_enabled: bool,
+    /// Session manager for MPP HTLC sessions
+    session_manager: Arc<ClnSessionManager>,
+    /// HTLC holder for deferred hook responses
+    htlc_holder: Arc<HtlcHolder>,
 }
 
 impl State {
@@ -43,10 +55,25 @@ impl State {
         let sender = ClnSender::new(rpc_path);
         let lsps2_handler = Arc::new(Lsps2ServiceHandler::new(api, promise_secret));
         let lsps_service = Arc::new(LspsService::builder().with_protocol(lsps2_handler).build());
+
+        // Create HTLC holder for deferred hook responses
+        let htlc_holder = Arc::new(HtlcHolder::new());
+
+        // Create session output handler (uses HtlcHolder to release HTLCs)
+        let output_handler = Arc::new(ClnSessionOutputHandler::new(htlc_holder.clone()));
+
+        // Create session manager with no-op event emitter and CLN output handler
+        let session_manager = Arc::new(SessionManager::new(
+            Arc::new(NoOpEventEmitter),
+            output_handler,
+        ));
+
         Self {
             lsps_service,
             sender,
             lsps2_enabled: true,
+            session_manager,
+            htlc_holder,
         }
     }
 }
@@ -167,7 +194,30 @@ async fn handle_htlc_inner(
     };
 
     let rpc_path = Path::new(&p.configuration().lightning_dir).join(&p.configuration().rpc_file);
-    let api = ClnApiRpc::new(rpc_path);
+    let api = ClnApiRpc::new(rpc_path.clone());
+
+    // Check if this SCID is a JIT session and whether it's MPP
+    let ds_entry = match api.get_buy_request(&short_channel_id).await {
+        Ok(entry) => entry,
+        Err(_) => {
+            // Not a JIT session SCID, continue
+            trace!("SCID {} is not a JIT session, continue.", short_channel_id);
+            return Ok(json_continue());
+        }
+    };
+
+    // Check if this is an MPP payment
+    if ds_entry.expected_payment_size.is_some() {
+        // MPP payment - use the new session flow
+        debug!(
+            "MPP HTLC for JIT session {}: amount={}",
+            short_channel_id,
+            req.htlc.amount_msat.msat()
+        );
+        return handle_mpp_htlc(p, &req, short_channel_id, ds_entry).await;
+    }
+
+    // No-MPP payment - use the existing blocking flow
     // Fixme: Use real htlc_minimum_amount.
     let handler = HtlcAcceptedHookHandler::new(api, 1000);
 
@@ -181,7 +231,7 @@ async fn handle_htlc_inner(
         extra_tlvs: req.htlc.extra_tlvs.unwrap_or_default(),
     };
 
-    debug!("Handle potential jit-session HTLC.");
+    debug!("Handle no-MPP JIT session HTLC.");
     let response = match handler.handle(&htlc, &onion).await {
         Ok(dec) => {
             log_decision(&dec);
@@ -195,6 +245,106 @@ async fn handle_htlc_inner(
     };
 
     Ok(serde_json::to_value(&response)?)
+}
+
+/// Handle an MPP HTLC using the session state machine.
+///
+/// This function:
+/// 1. Creates or gets the session from SessionManager
+/// 2. Holds the HTLC using HtlcHolder with a oneshot channel
+/// 3. Submits the HTLC part to the session
+/// 4. Awaits the response on the oneshot channel
+/// 5. Converts the HtlcResponse to JSON
+async fn handle_mpp_htlc(
+    p: &Plugin<State>,
+    req: &HtlcAcceptedRequest,
+    jit_scid: ShortChannelId,
+    ds_entry: cln_lsps::proto::lsps2::DatastoreEntry,
+) -> Result<serde_json::Value, anyhow::Error> {
+    let state = p.state();
+    let session_id = SessionId::from(jit_scid);
+
+    // Create session config from datastore entry
+    let config = SessionConfig::new(
+        ds_entry.peer_id,
+        ds_entry.opening_fee_params.clone(),
+        ds_entry.expected_payment_size,
+    );
+
+    // Get or create the session
+    let created = state
+        .session_manager
+        .get_or_create_session(session_id, || config)
+        .await;
+
+    match created {
+        Ok(true) => debug!("Created new MPP session: {}", session_id),
+        Ok(false) => debug!("Using existing MPP session: {}", session_id),
+        Err(e) => {
+            warn!("Failed to get/create session {}: {}", session_id, e);
+            return Ok(json_continue());
+        }
+    }
+
+    // Create the HtlcInfo for the holder
+    let htlc_info = htlc_info_from_request(req);
+
+    // Create the oneshot channel for the response
+    let (tx, rx) = oneshot::channel();
+
+    // Hold the HTLC (this stores the sender)
+    state.htlc_holder.hold(session_id, htlc_info, tx).await;
+
+    // Create the HtlcPart for the session
+    let part = htlc_part_from_request(req, jit_scid);
+
+    // Submit the part to the session
+    let input = SessionInput::PartArrived { part };
+    match state.session_manager.apply_input(session_id, input).await {
+        Ok(phase) => {
+            debug!("Session {} transitioned to phase: {:?}", session_id, phase);
+        }
+        Err(e) => {
+            warn!("Failed to apply input to session {}: {}", session_id, e);
+            // Try to release the HTLC we just held
+            state
+                .htlc_holder
+                .release_fail(
+                    session_id,
+                    cln_lsps::core::lsps2::session::FailureCode::TemporaryChannelFailure,
+                )
+                .await;
+            return Ok(json_continue());
+        }
+    }
+
+    // Await the response from the HTLC holder
+    // This will be sent when the session decides what to do (forward or fail)
+    match rx.await {
+        Ok(response) => {
+            debug!(
+                "Got HTLC response for session {}: {:?}",
+                session_id,
+                match &response {
+                    HtlcResponse::Continue { forward_to, .. } =>
+                        format!("Continue to {}", forward_to),
+                    HtlcResponse::Fail { failure_code } => format!("Fail with {:?}", failure_code),
+                }
+            );
+            htlc_response_to_json(response)
+        }
+        Err(_) => {
+            // The sender was dropped without sending - this shouldn't happen
+            // in normal operation but could happen if the session was removed
+            warn!(
+                "HTLC response channel dropped for session {}, failing HTLC",
+                session_id
+            );
+            Ok(json_fail(
+                cln_lsps::proto::lsps2::failure_codes::TEMPORARY_CHANNEL_FAILURE,
+            ))
+        }
+    }
 }
 
 fn decision_to_response(decision: HtlcDecision) -> Result<serde_json::Value, anyhow::Error> {
@@ -256,6 +406,84 @@ fn log_decision(decision: &HtlcDecision) {
         }
         HtlcDecision::Reject { reason } => {
             debug!("Rejecting HTLC: {:?}", reason);
+        }
+    }
+}
+
+// ============================================================================
+// MPP Session Helper Functions
+// ============================================================================
+
+/// Convert HtlcAcceptedRequest to HtlcPart for the session state machine.
+///
+/// # Arguments
+/// * `req` - The HTLC accepted request from the hook
+/// * `jit_scid` - The JIT SCID that this HTLC targets
+fn htlc_part_from_request(req: &HtlcAcceptedRequest, jit_scid: ShortChannelId) -> HtlcPart {
+    // Convert payment_hash from Vec<u8> to [u8; 32]
+    let mut payment_hash = [0u8; 32];
+    if req.htlc.payment_hash.len() == 32 {
+        payment_hash.copy_from_slice(&req.htlc.payment_hash);
+    }
+
+    HtlcPart::new(
+        req.htlc.id,
+        Msat::from_msat(req.htlc.amount_msat.msat()),
+        req.htlc.cltv_expiry,
+        payment_hash,
+        req.onion.payload.clone(),
+        req.htlc.extra_tlvs.clone().unwrap_or_default(),
+        jit_scid,
+    )
+}
+
+/// Convert HtlcAcceptedRequest to HtlcInfo for the HTLC holder.
+///
+/// # Arguments
+/// * `req` - The HTLC accepted request from the hook
+fn htlc_info_from_request(req: &HtlcAcceptedRequest) -> HtlcInfo {
+    // Convert payment_hash from Vec<u8> to [u8; 32]
+    let mut payment_hash = [0u8; 32];
+    if req.htlc.payment_hash.len() == 32 {
+        payment_hash.copy_from_slice(&req.htlc.payment_hash);
+    }
+
+    HtlcInfo {
+        htlc_id: req.htlc.id,
+        amount_msat: Msat::from_msat(req.htlc.amount_msat.msat()),
+        cltv_expiry: req.htlc.cltv_expiry,
+        payment_hash,
+        payload: req.onion.payload.clone(),
+    }
+}
+
+/// Convert HtlcResponse to JSON for the hook response.
+fn htlc_response_to_json(response: HtlcResponse) -> Result<serde_json::Value, anyhow::Error> {
+    use cln_lsps::core::lsps2::session::FailureCode;
+
+    match response {
+        HtlcResponse::Continue {
+            forward_to,
+            mut payload,
+            mut extra_tlvs,
+        } => {
+            // CLN expects forward_to as the SCID string
+            Ok(serde_json::json!({
+                "result": "continue",
+                "payload": hex::encode(payload.to_bytes()?),
+                "forward_to": forward_to.to_string(),
+                "extra_tlvs": hex::encode(extra_tlvs.to_bytes()?)
+            }))
+        }
+        HtlcResponse::Fail { failure_code } => {
+            let failure_message = match failure_code {
+                FailureCode::TemporaryChannelFailure => "1007", // temporary_channel_failure
+                FailureCode::UnknownNextPeer => "400a",         // unknown_next_peer
+            };
+            Ok(serde_json::json!({
+                "result": "fail",
+                "failure_message": failure_message
+            }))
         }
     }
 }
