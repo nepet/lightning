@@ -2,8 +2,16 @@ use anyhow::bail;
 use bitcoin::hashes::Hash;
 use cln_lsps::{
     cln_adapters::{
-        hooks::service_custommsg_hook, rpc::ClnApiRpc, sender::ClnSender,
-        session_handler::ClnSessionOutputHandler, state::ServiceState, types::HtlcAcceptedRequest,
+        hooks::service_custommsg_hook,
+        notifications::{
+            map_channel_state_changed, map_forward_event, parse_forward_event, parse_payment_hash,
+            ForwardStatus,
+        },
+        rpc::ClnApiRpc,
+        sender::ClnSender,
+        session_handler::ClnSessionOutputHandler,
+        state::ServiceState,
+        types::HtlcAcceptedRequest,
     },
     core::{
         lsps2::{
@@ -19,6 +27,7 @@ use cln_lsps::{
     proto::lsps0::{Msat, ShortChannelId},
 };
 use cln_plugin::{options, Plugin};
+use cln_rpc::notifications::ChannelStateChangedNotification;
 use log::{debug, error, trace, warn};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -486,4 +495,248 @@ fn htlc_response_to_json(response: HtlcResponse) -> Result<serde_json::Value, an
             }))
         }
     }
+}
+
+// ============================================================================
+// Notification Handlers
+// ============================================================================
+
+/// Handle channel_state_changed notification.
+///
+/// This notification is sent when a channel's state changes. We use it to detect:
+/// - `CHANNELD_NORMAL`: Channel is ready for forwarding (triggers `ClientChannelReady`)
+/// - Closing states: Channel is closing (triggers `ClientDisconnected`)
+async fn on_channel_state_changed(
+    p: Plugin<State>,
+    v: serde_json::Value,
+) -> Result<(), anyhow::Error> {
+    // Parse the notification
+    let notif: ChannelStateChangedNotification = match serde_json::from_value(v) {
+        Ok(n) => n,
+        Err(e) => {
+            debug!("Failed to parse channel_state_changed notification: {}", e);
+            return Ok(());
+        }
+    };
+
+    let state = p.state();
+    if !state.lsps2_enabled {
+        return Ok(());
+    }
+
+    // Convert channel_id to [u8; 32]
+    let channel_id: [u8; 32] = *notif.channel_id.as_byte_array();
+
+    // Find session by channel_id
+    let session_id = match state.session_manager.find_by_channel_id(&channel_id).await {
+        Some(id) => id,
+        None => {
+            trace!(
+                "No JIT session found for channel_id {}",
+                hex::encode(channel_id)
+            );
+            return Ok(());
+        }
+    };
+
+    debug!(
+        "channel_state_changed for session {:?}: {:?} -> {:?}",
+        session_id, notif.old_state, notif.new_state
+    );
+
+    // Get alias SCID from the notification's short_channel_id field
+    // For zero-conf channels, this should be the alias SCID
+    let alias_scid = notif.short_channel_id;
+
+    // Map to SessionInput
+    let input = match map_channel_state_changed(notif.new_state, alias_scid) {
+        Some(input) => input,
+        None => {
+            trace!(
+                "Channel state {:?} does not trigger session transition",
+                notif.new_state
+            );
+            return Ok(());
+        }
+    };
+
+    // Apply input to session
+    match state.session_manager.apply_input(session_id, input).await {
+        Ok(phase) => {
+            debug!(
+                "Session {:?} transitioned to phase {:?} after channel_state_changed",
+                session_id, phase
+            );
+        }
+        Err(e) => {
+            warn!(
+                "Failed to apply channel_state_changed to session {:?}: {}",
+                session_id, e
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle forward_event notification.
+///
+/// This notification is sent when a forward's status changes. We use it to detect:
+/// - `settled`: Preimage received (triggers `PreimageReceived`)
+/// - `failed`/`local_failed`: Client rejected (triggers `ClientRejectedPayment`)
+async fn on_forward_event(p: Plugin<State>, v: serde_json::Value) -> Result<(), anyhow::Error> {
+    // Parse the notification using our custom parser (not in cln_rpc)
+    let notif = match parse_forward_event(&v) {
+        Some(n) => n,
+        None => {
+            debug!("Failed to parse forward_event notification");
+            return Ok(());
+        }
+    };
+
+    let state = p.state();
+    if !state.lsps2_enabled {
+        return Ok(());
+    }
+
+    // Parse payment_hash
+    let payment_hash = match parse_payment_hash(&notif.payment_hash) {
+        Some(h) => h,
+        None => {
+            debug!(
+                "Invalid payment_hash in forward_event: {}",
+                notif.payment_hash
+            );
+            return Ok(());
+        }
+    };
+
+    // Find session by payment_hash
+    let session_id = match state
+        .session_manager
+        .find_by_payment_hash(&payment_hash)
+        .await
+    {
+        Some(id) => id,
+        None => {
+            trace!(
+                "No JIT session found for payment_hash {}",
+                notif.payment_hash
+            );
+            return Ok(());
+        }
+    };
+
+    debug!(
+        "forward_event for session {:?}: status={:?}",
+        session_id, notif.status
+    );
+
+    // Map to SessionInput
+    let input = match map_forward_event(&notif) {
+        Some(input) => input,
+        None => {
+            trace!(
+                "Forward status {:?} does not trigger session transition",
+                notif.status
+            );
+            return Ok(());
+        }
+    };
+
+    // Log preimage if available
+    if notif.status == ForwardStatus::Settled {
+        if let Some(ref preimage_hex) = notif.preimage {
+            debug!(
+                "Session {:?} received preimage: {}",
+                session_id, preimage_hex
+            );
+        }
+    }
+
+    // Apply input to session
+    match state.session_manager.apply_input(session_id, input).await {
+        Ok(phase) => {
+            debug!(
+                "Session {:?} transitioned to phase {:?} after forward_event",
+                session_id, phase
+            );
+        }
+        Err(e) => {
+            warn!(
+                "Failed to apply forward_event to session {:?}: {}",
+                session_id, e
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle disconnect notification.
+///
+/// This notification is sent when a peer disconnects. We use it to detect
+/// client disconnection during channel opening, which should fail the session.
+async fn on_disconnect(p: Plugin<State>, v: serde_json::Value) -> Result<(), anyhow::Error> {
+    // Parse the peer_id from the notification
+    // The disconnect notification has format: {"id": "pubkey_hex"}
+    let peer_id: bitcoin::secp256k1::PublicKey = match v.get("id") {
+        Some(serde_json::Value::String(s)) => match s.parse() {
+            Ok(pk) => pk,
+            Err(e) => {
+                debug!("Failed to parse peer_id in disconnect notification: {}", e);
+                return Ok(());
+            }
+        },
+        _ => {
+            debug!("Missing or invalid 'id' in disconnect notification");
+            return Ok(());
+        }
+    };
+
+    let state = p.state();
+    if !state.lsps2_enabled {
+        return Ok(());
+    }
+
+    // Find all sessions for this peer
+    let session_ids = state.session_manager.find_by_peer_id(&peer_id).await;
+
+    if session_ids.is_empty() {
+        trace!("No JIT sessions found for disconnected peer {}", peer_id);
+        return Ok(());
+    }
+
+    debug!(
+        "Peer {} disconnected, found {} JIT session(s)",
+        peer_id,
+        session_ids.len()
+    );
+
+    // Apply ClientDisconnected to each session
+    let input = SessionInput::ClientDisconnected;
+    for session_id in session_ids {
+        match state
+            .session_manager
+            .apply_input(session_id, input.clone())
+            .await
+        {
+            Ok(phase) => {
+                debug!(
+                    "Session {:?} transitioned to phase {:?} after disconnect",
+                    session_id, phase
+                );
+            }
+            Err(e) => {
+                // Session may already be in a terminal state, which is fine
+                trace!(
+                    "Failed to apply disconnect to session {:?}: {}",
+                    session_id,
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
