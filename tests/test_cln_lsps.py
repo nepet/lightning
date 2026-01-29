@@ -93,7 +93,7 @@ def buy_and_create_invoice(client, lsp, amount_msat):
     client.rpc.lsps_lsps2_buy(
         lsp_id=lsp.info["id"],
         opening_fee_params=opening_fee_params,
-        payment_size_msat=f"{amount_msat}msat",
+        amount_msat=f"{amount_msat}msat",
     )
 
     # Create invoice with route hint to JIT channel
@@ -555,3 +555,50 @@ def test_lsps2_non_approved_zero_conf(node_factory, bitcoind):
     # l1 shouldn't have a new channel.
     chs = l1.rpc.listpeerchannels()["channels"]
     assert len(chs) == 0
+
+
+# ============================================================================
+# MPP Integration Tests (using Rust implementation, not Python mock)
+# ============================================================================
+
+
+@unittest.skipUnless(RUST, "RUST is not enabled")
+def test_lsps2_mpp_happy_path_fixed_invoice(node_factory, bitcoind):
+    """Tests MPP JIT channel creation using the Rust service implementation.
+
+    This test verifies the complete MPP flow:
+    1. Client buys JIT channel with fixed payment size
+    2. Client creates invoice with route hint
+    3. Payer sends multiple HTLC parts
+    4. LSP collects parts, opens zero-conf channel
+    5. LSP forwards HTLCs after channel ready
+    6. Client receives payment, session completes
+
+    Setup: 3-node topology with l1 (client), l2 (LSP with Rust service), l3 (payer)
+    Action: Client buys JIT channel, payer sends 10-part MPP payment
+    Expected: JIT channel created, payment succeeds, datastore cleaned up
+
+    Note: This test uses lsps2_policy.py (NOT lsps2_service_mock.py) to test
+    the actual Rust MPP implementation in service.rs.
+    """
+    # Setup topology: l1 (client) -- l2 (LSP) -- l3 (payer)
+    l1, l2, l3, chanid = setup_lsps2_mpp_topology(node_factory, bitcoind)
+
+    # Payment amount: 10,000,000 msat (will be split into 10 parts)
+    amount_msat = 10_000_000
+
+    # Buy JIT channel and create invoice
+    invoice_data = buy_and_create_invoice(l1, l2, amount_msat)
+
+    # Send MPP payment with 10 parts (1,000,000 msat each)
+    result = send_mpp_parts(l3, l2, l1, chanid, invoice_data, num_parts=10)
+
+    # Verify payment succeeded
+    assert result["payment_preimage"], "Payment should have a preimage"
+
+    # Verify JIT channel was created
+    channel = wait_for_jit_channel(l1)
+    assert channel, "JIT channel should exist"
+
+    # Verify client datastore is cleaned up
+    verify_cleanup(l1)
