@@ -36,6 +36,20 @@ pub const MAX_PARTS: usize = 483;
 /// capacity meets CLN's minimum. Using 20000sat as a safe minimum.
 pub const MIN_CHANNEL_SIZE_SAT: u64 = 20000;
 
+/// Additional capacity for CLN's fee reserve mechanism.
+///
+/// CLN reserves capacity for potential fee rate increases. When forwarding
+/// HTLCs, CLN checks that there's enough capacity left to pay for a potential
+/// fee rate increase (roughly 2x current feerate). The reserve grows with
+/// the number of HTLCs because each HTLC adds weight to the commitment tx.
+///
+/// For 10 HTLCs, the reserve can exceed 20,000 sat. Using 25,000 sat provides
+/// margin for the maximum allowed 10 HTLCs plus some buffer.
+///
+/// Adding this buffer ensures the channel has enough capacity for both the
+/// payment HTLCs AND CLN's fee reserve requirements.
+pub const FEE_RESERVE_BUFFER_SAT: u64 = 25000;
+
 // ============================================================================
 // Core Types
 // ============================================================================
@@ -861,14 +875,19 @@ impl Session {
     ///
     /// Ensures the channel size is at least `MIN_CHANNEL_SIZE_SAT` to meet
     /// CLN's minimum effective capacity requirements after reserves.
+    ///
+    /// Also adds `FEE_RESERVE_BUFFER_SAT` to accommodate CLN's fee reserve
+    /// mechanism, which reserves capacity for potential fee rate increases.
     fn compute_channel_size(&self, parts: &[HtlcPart]) -> u64 {
         let total_msat: u64 = parts.iter().map(|p| p.amount_msat.msat()).sum();
         let opening_fee = self.compute_fee(parts);
         let receivable = total_msat.saturating_sub(opening_fee);
         // Convert to satoshis (floor division)
         let size_sat = receivable / 1000;
+        // Add fee reserve buffer for CLN's fee increase mechanism
+        let size_with_reserve = size_sat + FEE_RESERVE_BUFFER_SAT;
         // Ensure minimum channel size for CLN's reserve requirements
-        std::cmp::max(size_sat, MIN_CHANNEL_SIZE_SAT)
+        std::cmp::max(size_with_reserve, MIN_CHANNEL_SIZE_SAT)
     }
 
     /// Generate forward instructions for all parts.
