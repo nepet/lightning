@@ -30,7 +30,7 @@ use crate::core::lsps2::session::{ChannelId, SessionInput, SessionOutput};
 /// - `ForwardHtlcs`: Releases held HTLCs with forward instructions
 /// - `FailHtlcs`: Releases held HTLCs with failure codes
 /// - `BroadcastFunding`: TODO - Will call sendpsbt
-/// - `ReleaseChannel`: TODO - Will close/release the channel
+/// - `ReleaseChannel`: Closes the withheld channel and unreserves wallet UTXOs
 pub struct ClnSessionOutputHandler {
     /// The HTLC holder for releasing held HTLCs
     htlc_holder: Arc<HtlcHolder>,
@@ -242,16 +242,30 @@ impl SessionOutputHandler for ClnSessionOutputHandler {
                 Ok(Some(SessionInput::FundingBroadcasted { txid: result.txid }))
             }
 
-            SessionOutput::ReleaseChannel { channel_id } => {
-                // TODO: Implement channel release
-                // This is needed for abandoned sessions where we need to
-                // close the withheld channel and release the UTXOs
-                //
-                // For now, log and return success (placeholder)
-                debug!(
-                    "ReleaseChannel output received (not yet implemented): channel_id={:?}",
-                    channel_id
-                );
+            SessionOutput::ReleaseChannel {
+                channel_id,
+                funding_psbt,
+            } => {
+                // Best-effort cleanup for abandoned sessions:
+                // 1. Close the withheld channel
+                // 2. Unreserve the wallet UTXOs
+                // Errors are logged but not propagated since the session is
+                // already in terminal (Abandoned) state.
+
+                if let Err(e) = self.provider.close_channel(&channel_id.0).await {
+                    warn!(
+                        "Failed to close withheld channel {:?}: {}",
+                        channel_id, e
+                    );
+                }
+
+                if let Err(e) = self.provider.unreserve_inputs(&funding_psbt).await {
+                    warn!(
+                        "Failed to unreserve inputs for channel {:?}: {}",
+                        channel_id, e
+                    );
+                }
+
                 Ok(None)
             }
         }
@@ -797,17 +811,159 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_release_channel_placeholder() {
-        let htlc_holder = Arc::new(HtlcHolder::new());
-        let handler = ClnSessionOutputHandler::new(htlc_holder, mock_provider());
+    async fn test_release_channel() {
+        use std::sync::atomic::{AtomicBool, Ordering};
 
-        // Test that ReleaseChannel doesn't panic (placeholder implementation)
+        struct ReleaseChannelMockProvider {
+            close_called: AtomicBool,
+            unreserve_called: AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl LightningProvider for ReleaseChannelMockProvider {
+            async fn fund_jit_channel(
+                &self,
+                _: &PublicKey,
+                _: &Msat,
+            ) -> AnyResult<(Hash, String)> {
+                unimplemented!()
+            }
+            async fn is_channel_ready(&self, _: &PublicKey, _: &Hash) -> AnyResult<bool> {
+                unimplemented!()
+            }
+            async fn fund_channel_start(
+                &self,
+                _: &PublicKey,
+                _: u64,
+                _: bool,
+                _: Option<u32>,
+            ) -> AnyResult<FundChannelStartResult> {
+                unimplemented!()
+            }
+            async fn fund_channel_complete_withheld(
+                &self,
+                _: &PublicKey,
+                _: &str,
+            ) -> AnyResult<FundChannelCompleteResult> {
+                unimplemented!()
+            }
+            async fn broadcast_funding(&self, _: &str) -> AnyResult<SendPsbtResult> {
+                unimplemented!()
+            }
+            async fn get_channel_info(
+                &self,
+                _: &PublicKey,
+                _: Option<&[u8; 32]>,
+            ) -> AnyResult<Option<ChannelInfo>> {
+                unimplemented!()
+            }
+            async fn fund_psbt(&self, _: u64, _: &str, _: u32) -> AnyResult<FundPsbtResult> {
+                unimplemented!()
+            }
+            async fn sign_psbt(&self, _: &str) -> AnyResult<SignPsbtResult> {
+                unimplemented!()
+            }
+            async fn unreserve_inputs(&self, _: &str) -> AnyResult<()> {
+                self.unreserve_called.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn close_channel(&self, _: &[u8; 32]) -> AnyResult<()> {
+                self.close_called.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let provider = Arc::new(ReleaseChannelMockProvider {
+            close_called: AtomicBool::new(false),
+            unreserve_called: AtomicBool::new(false),
+        });
+        let htlc_holder = Arc::new(HtlcHolder::new());
+        let handler =
+            ClnSessionOutputHandler::new(htlc_holder, provider.clone() as Arc<dyn LightningProvider>);
+
         let result = handler
             .execute(SessionOutput::ReleaseChannel {
                 channel_id: ChannelId([1u8; 32]),
+                funding_psbt: "test_psbt".to_string(),
             })
             .await;
 
         assert!(result.is_ok());
+        assert!(result.unwrap().is_none()); // No feedback for terminal cleanup
+        assert!(provider.close_called.load(Ordering::SeqCst));
+        assert!(provider.unreserve_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_release_channel_errors_are_swallowed() {
+        // Even if close/unreserve fail, the handler returns Ok(None)
+        struct FailingProvider;
+
+        #[async_trait::async_trait]
+        impl LightningProvider for FailingProvider {
+            async fn fund_jit_channel(
+                &self,
+                _: &PublicKey,
+                _: &Msat,
+            ) -> AnyResult<(Hash, String)> {
+                unimplemented!()
+            }
+            async fn is_channel_ready(&self, _: &PublicKey, _: &Hash) -> AnyResult<bool> {
+                unimplemented!()
+            }
+            async fn fund_channel_start(
+                &self,
+                _: &PublicKey,
+                _: u64,
+                _: bool,
+                _: Option<u32>,
+            ) -> AnyResult<FundChannelStartResult> {
+                unimplemented!()
+            }
+            async fn fund_channel_complete_withheld(
+                &self,
+                _: &PublicKey,
+                _: &str,
+            ) -> AnyResult<FundChannelCompleteResult> {
+                unimplemented!()
+            }
+            async fn broadcast_funding(&self, _: &str) -> AnyResult<SendPsbtResult> {
+                unimplemented!()
+            }
+            async fn get_channel_info(
+                &self,
+                _: &PublicKey,
+                _: Option<&[u8; 32]>,
+            ) -> AnyResult<Option<ChannelInfo>> {
+                unimplemented!()
+            }
+            async fn fund_psbt(&self, _: u64, _: &str, _: u32) -> AnyResult<FundPsbtResult> {
+                unimplemented!()
+            }
+            async fn sign_psbt(&self, _: &str) -> AnyResult<SignPsbtResult> {
+                unimplemented!()
+            }
+            async fn unreserve_inputs(&self, _: &str) -> AnyResult<()> {
+                anyhow::bail!("unreserve failed")
+            }
+            async fn close_channel(&self, _: &[u8; 32]) -> AnyResult<()> {
+                anyhow::bail!("close failed")
+            }
+        }
+
+        let htlc_holder = Arc::new(HtlcHolder::new());
+        let provider: Arc<dyn LightningProvider> = Arc::new(FailingProvider);
+        let handler = ClnSessionOutputHandler::new(htlc_holder, provider);
+
+        let result = handler
+            .execute(SessionOutput::ReleaseChannel {
+                channel_id: ChannelId([1u8; 32]),
+                funding_psbt: "test_psbt".to_string(),
+            })
+            .await;
+
+        // Should succeed even though both calls failed
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 }

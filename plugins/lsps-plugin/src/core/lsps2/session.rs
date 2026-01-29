@@ -659,7 +659,11 @@ pub enum SessionOutput {
     BroadcastFunding { psbt: String },
 
     /// Release/close the channel (for abandoned sessions).
-    ReleaseChannel { channel_id: ChannelId },
+    /// Calls close + unreserveinputs to clean up the withheld channel.
+    ReleaseChannel {
+        channel_id: ChannelId,
+        funding_psbt: String,
+    },
 }
 
 /// Result of applying an input to the session state machine.
@@ -1603,6 +1607,7 @@ impl Session {
                 SessionState::AwaitingRetry {
                     parts,
                     channel_id,
+                    funding_psbt,
                     retry_count,
                     ..
                 },
@@ -1622,7 +1627,10 @@ impl Session {
                         reason: "valid_until_expired".to_string(),
                     },
                 ];
-                let mut outputs = vec![SessionOutput::ReleaseChannel { channel_id }];
+                let mut outputs = vec![SessionOutput::ReleaseChannel {
+                    channel_id,
+                    funding_psbt: funding_psbt.clone(),
+                }];
                 if !htlc_ids.is_empty() {
                     outputs.push(SessionOutput::FailHtlcs {
                         session_id: self.id,
@@ -1645,6 +1653,7 @@ impl Session {
                 SessionState::AwaitingRetry {
                     parts,
                     channel_id,
+                    funding_psbt,
                     retry_count,
                     first_part_at,
                     ..
@@ -1665,7 +1674,10 @@ impl Session {
                         reason: "collect_timeout".to_string(),
                     },
                 ];
-                let mut outputs = vec![SessionOutput::ReleaseChannel { channel_id }];
+                let mut outputs = vec![SessionOutput::ReleaseChannel {
+                    channel_id,
+                    funding_psbt: funding_psbt.clone(),
+                }];
                 if !htlc_ids.is_empty() {
                     outputs.push(SessionOutput::FailHtlcs {
                         session_id: self.id,
@@ -1688,6 +1700,7 @@ impl Session {
                 SessionState::AwaitingRetry {
                     parts,
                     channel_id,
+                    funding_psbt,
                     retry_count,
                     ..
                 },
@@ -1712,7 +1725,10 @@ impl Session {
                         reason: "unsafe_hold".to_string(),
                     },
                 ];
-                let mut outputs = vec![SessionOutput::ReleaseChannel { channel_id }];
+                let mut outputs = vec![SessionOutput::ReleaseChannel {
+                    channel_id,
+                    funding_psbt: funding_psbt.clone(),
+                }];
                 if !htlc_ids.is_empty() {
                     outputs.push(SessionOutput::FailHtlcs {
                         session_id: self.id,
