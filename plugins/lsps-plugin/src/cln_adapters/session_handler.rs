@@ -220,15 +220,26 @@ impl SessionOutputHandler for ClnSessionOutputHandler {
             }
 
             SessionOutput::BroadcastFunding { psbt } => {
-                // TODO: Implement funding broadcast via sendpsbt
-                // This requires calling the sendpsbt RPC with the withheld PSBT
-                //
-                // For now, log and return success (placeholder)
-                debug!(
-                    "BroadcastFunding output received (not yet implemented): psbt_len={}",
-                    psbt.len()
+                info!("Broadcasting withheld funding transaction");
+
+                let result = self
+                    .provider
+                    .broadcast_funding(&psbt)
+                    .await
+                    .map_err(|e| {
+                        SessionOutputError::ChannelError(format!(
+                            "sendpsbt (broadcast funding) failed: {}",
+                            e
+                        ))
+                    })?;
+
+                info!(
+                    "Funding transaction broadcast: txid={}",
+                    result.txid
                 );
-                Ok(None)
+
+                // Return feedback: FundingBroadcasted transitions Settling → Done
+                Ok(Some(SessionInput::FundingBroadcasted { txid: result.txid }))
             }
 
             SessionOutput::ReleaseChannel { channel_id } => {
@@ -701,11 +712,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_broadcast_funding_placeholder() {
-        let htlc_holder = Arc::new(HtlcHolder::new());
-        let handler = ClnSessionOutputHandler::new(htlc_holder, mock_provider());
+    async fn test_broadcast_funding() {
+        /// Mock that returns a successful broadcast result
+        struct BroadcastMockProvider;
 
-        // Test that BroadcastFunding doesn't panic (placeholder implementation)
+        #[async_trait]
+        impl LightningProvider for BroadcastMockProvider {
+            async fn fund_jit_channel(
+                &self,
+                _: &PublicKey,
+                _: &Msat,
+            ) -> AnyResult<(Hash, String)> {
+                unimplemented!()
+            }
+            async fn is_channel_ready(&self, _: &PublicKey, _: &Hash) -> AnyResult<bool> {
+                unimplemented!()
+            }
+            async fn fund_channel_start(
+                &self,
+                _: &PublicKey,
+                _: u64,
+                _: bool,
+                _: Option<u32>,
+            ) -> AnyResult<FundChannelStartResult> {
+                unimplemented!()
+            }
+            async fn fund_channel_complete_withheld(
+                &self,
+                _: &PublicKey,
+                _: &str,
+            ) -> AnyResult<FundChannelCompleteResult> {
+                unimplemented!()
+            }
+            async fn broadcast_funding(&self, _psbt: &str) -> AnyResult<SendPsbtResult> {
+                use bitcoin::hashes::Hash as _;
+                Ok(SendPsbtResult {
+                    tx: "02000000...".to_string(),
+                    txid: bitcoin::Txid::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::hash(b"test_txid"),
+                    ),
+                })
+            }
+            async fn get_channel_info(
+                &self,
+                _: &PublicKey,
+                _: Option<&[u8; 32]>,
+            ) -> AnyResult<Option<ChannelInfo>> {
+                unimplemented!()
+            }
+            async fn fund_psbt(&self, _: u64, _: &str, _: u32) -> AnyResult<FundPsbtResult> {
+                unimplemented!()
+            }
+            async fn sign_psbt(&self, _: &str) -> AnyResult<SignPsbtResult> {
+                unimplemented!()
+            }
+            async fn unreserve_inputs(&self, _: &str) -> AnyResult<()> {
+                unimplemented!()
+            }
+            async fn close_channel(&self, _: &[u8; 32]) -> AnyResult<()> {
+                unimplemented!()
+            }
+        }
+
+        let htlc_holder = Arc::new(HtlcHolder::new());
+        let provider: Arc<dyn LightningProvider> = Arc::new(BroadcastMockProvider);
+        let handler = ClnSessionOutputHandler::new(htlc_holder, provider);
+
         let result = handler
             .execute(SessionOutput::BroadcastFunding {
                 psbt: "test_psbt".to_string(),
@@ -713,6 +785,15 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
+        let feedback = result.unwrap();
+        assert!(feedback.is_some());
+
+        match feedback.unwrap() {
+            SessionInput::FundingBroadcasted { txid } => {
+                assert!(!txid.to_string().is_empty());
+            }
+            other => panic!("Expected FundingBroadcasted, got {:?}", other),
+        }
     }
 
     #[tokio::test]
