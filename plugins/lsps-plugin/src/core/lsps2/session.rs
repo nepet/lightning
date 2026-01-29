@@ -1706,9 +1706,80 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::lsps2::provider::{
+        SessionEventEmitter, SessionOutputError, SessionOutputHandler,
+    };
     use crate::proto::lsps0::Ppm;
     use crate::proto::lsps2::Promise;
     use chrono::{TimeZone, Utc};
+    use std::sync::Mutex;
+
+    // ========================================================================
+    // Capturing Test Implementations
+    // ========================================================================
+
+    /// Event emitter that captures all events for test inspection.
+    #[derive(Debug, Default)]
+    pub struct CapturingEventEmitter {
+        events: Mutex<Vec<SessionEvent>>,
+    }
+
+    impl CapturingEventEmitter {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Returns a clone of all captured events.
+        pub fn events(&self) -> Vec<SessionEvent> {
+            self.events.lock().unwrap().clone()
+        }
+
+        /// Clears captured events and returns them.
+        pub fn take_events(&self) -> Vec<SessionEvent> {
+            std::mem::take(&mut *self.events.lock().unwrap())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionEventEmitter for CapturingEventEmitter {
+        async fn emit(&self, event: SessionEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    /// Output handler that captures all outputs for test inspection.
+    #[derive(Debug, Default)]
+    pub struct CapturingOutputHandler {
+        outputs: Mutex<Vec<SessionOutput>>,
+    }
+
+    impl CapturingOutputHandler {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Returns a clone of all captured outputs.
+        pub fn outputs(&self) -> Vec<SessionOutput> {
+            self.outputs.lock().unwrap().clone()
+        }
+
+        /// Clears captured outputs and returns them.
+        pub fn take_outputs(&self) -> Vec<SessionOutput> {
+            std::mem::take(&mut *self.outputs.lock().unwrap())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionOutputHandler for CapturingOutputHandler {
+        async fn execute(&self, output: SessionOutput) -> Result<(), SessionOutputError> {
+            self.outputs.lock().unwrap().push(output);
+            Ok(())
+        }
+    }
+
+    // ========================================================================
+    // Test Helpers
+    // ========================================================================
 
     fn test_public_key() -> PublicKey {
         "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
@@ -2321,5 +2392,124 @@ mod tests {
         } else {
             panic!("Expected ForwardHtlcs output");
         }
+    }
+
+    // ========================================================================
+    // Capturing Implementation Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_capturing_event_emitter() {
+        let emitter = CapturingEventEmitter::new();
+
+        // Emit some events
+        emitter
+            .emit(SessionEvent::SessionCreated {
+                session_id: SessionId::from(ShortChannelId::from(123u64)),
+                scid: ShortChannelId::from(123u64),
+                client_node_id: test_public_key(),
+                payment_size_msat: Some(Msat::from_msat(100_000)),
+                valid_until: Utc::now(),
+            })
+            .await;
+
+        emitter
+            .emit(SessionEvent::CollectTimeout {
+                session_id: SessionId::from(ShortChannelId::from(123u64)),
+                elapsed_ms: 90_000,
+                parts_count: 1,
+                parts_sum_msat: 50_000,
+            })
+            .await;
+
+        // Verify events were captured
+        let events = emitter.events();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], SessionEvent::SessionCreated { .. }));
+        assert!(matches!(events[1], SessionEvent::CollectTimeout { .. }));
+
+        // Verify take_events clears the list
+        let taken = emitter.take_events();
+        assert_eq!(taken.len(), 2);
+        assert!(emitter.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_capturing_output_handler() {
+        let handler = CapturingOutputHandler::new();
+
+        // Execute some outputs
+        handler
+            .execute(SessionOutput::OpenChannel {
+                client_node_id: test_public_key(),
+                channel_size_sat: 100_000,
+            })
+            .await
+            .unwrap();
+
+        handler
+            .execute(SessionOutput::FailHtlcs {
+                htlc_ids: vec![1, 2, 3],
+                failure_code: FailureCode::TemporaryChannelFailure,
+            })
+            .await
+            .unwrap();
+
+        // Verify outputs were captured
+        let outputs = handler.outputs();
+        assert_eq!(outputs.len(), 2);
+        assert!(matches!(outputs[0], SessionOutput::OpenChannel { .. }));
+        assert!(matches!(outputs[1], SessionOutput::FailHtlcs { .. }));
+
+        // Verify take_outputs clears the list
+        let taken = handler.take_outputs();
+        assert_eq!(taken.len(), 2);
+        assert!(handler.outputs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_emit_all() {
+        let emitter = CapturingEventEmitter::new();
+        let session_id = SessionId::from(ShortChannelId::from(123u64));
+
+        let events = vec![
+            SessionEvent::CollectTimeout {
+                session_id,
+                elapsed_ms: 90_000,
+                parts_count: 1,
+                parts_sum_msat: 50_000,
+            },
+            SessionEvent::HtlcsFailedUpstream {
+                session_id,
+                htlc_count: 1,
+                error_code: "temporary_channel_failure".to_string(),
+                reason: "collect_timeout".to_string(),
+            },
+        ];
+
+        emitter.emit_all(events).await;
+
+        let captured = emitter.events();
+        assert_eq!(captured.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_execute_all() {
+        let handler = CapturingOutputHandler::new();
+
+        let outputs = vec![
+            SessionOutput::OpenChannel {
+                client_node_id: test_public_key(),
+                channel_size_sat: 100_000,
+            },
+            SessionOutput::BroadcastFunding {
+                psbt: "psbt_data".to_string(),
+            },
+        ];
+
+        handler.execute_all(outputs).await.unwrap();
+
+        let captured = handler.outputs();
+        assert_eq!(captured.len(), 2);
     }
 }
