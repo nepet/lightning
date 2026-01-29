@@ -7,11 +7,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use log::{debug, warn};
+use log::{debug, info, warn};
 
 use crate::core::lsps2::htlc_holder::HtlcHolder;
-use crate::core::lsps2::provider::{SessionOutputError, SessionOutputHandler};
-use crate::core::lsps2::session::{SessionInput, SessionOutput};
+use crate::core::lsps2::provider::{LightningProvider, SessionOutputError, SessionOutputHandler};
+use crate::core::lsps2::psbt::{add_funding_output, extract_funding_info, P2WSH_OUTPUT_WEIGHT};
+use crate::core::lsps2::session::{ChannelId, SessionInput, SessionOutput};
 
 // ============================================================================
 // CLN Session Output Handler
@@ -24,14 +25,17 @@ use crate::core::lsps2::session::{SessionInput, SessionOutput};
 ///
 /// # Implemented Outputs
 ///
+/// - `OpenChannel`: Executes withheld funding flow (fundchannel_start → fundpsbt →
+///   add_funding_output → fundchannel_complete_withheld → signpsbt)
 /// - `ForwardHtlcs`: Releases held HTLCs with forward instructions
 /// - `FailHtlcs`: Releases held HTLCs with failure codes
-/// - `OpenChannel`: TODO - Will call fundchannel_start/fundchannel_complete
 /// - `BroadcastFunding`: TODO - Will call sendpsbt
 /// - `ReleaseChannel`: TODO - Will close/release the channel
 pub struct ClnSessionOutputHandler {
     /// The HTLC holder for releasing held HTLCs
     htlc_holder: Arc<HtlcHolder>,
+    /// The lightning provider for RPC calls
+    provider: Arc<dyn LightningProvider>,
 }
 
 impl ClnSessionOutputHandler {
@@ -39,8 +43,12 @@ impl ClnSessionOutputHandler {
     ///
     /// # Arguments
     /// * `htlc_holder` - The HTLC holder for managing pending HTLCs
-    pub fn new(htlc_holder: Arc<HtlcHolder>) -> Self {
-        Self { htlc_holder }
+    /// * `provider` - The lightning provider for RPC calls
+    pub fn new(htlc_holder: Arc<HtlcHolder>, provider: Arc<dyn LightningProvider>) -> Self {
+        Self {
+            htlc_holder,
+            provider,
+        }
     }
 }
 
@@ -55,22 +63,105 @@ impl SessionOutputHandler for ClnSessionOutputHandler {
                 client_node_id,
                 channel_size_sat,
             } => {
-                // TODO: Implement channel opening via fundchannel_start/fundchannel_complete
-                // This requires:
-                // 1. Call fundchannel_start with the client_node_id and channel_size_sat
-                // 2. Call fundpsbt to get wallet inputs
-                // 3. Add funding output to PSBT
-                // 4. Call fundchannel_complete with withheld=true
-                // 5. Sign the PSBT
-                // 6. Return FundingSigned feedback
-                //
-                // For now, log and return success (placeholder)
-                debug!(
-                    "OpenChannel output received (not yet implemented): client_node_id={}, channel_size_sat={}",
-                    client_node_id,
-                    channel_size_sat
+                info!(
+                    "Opening withheld channel: peer={}, size={}sat",
+                    client_node_id, channel_size_sat
                 );
-                Ok(None)
+
+                // Step 1: Initiate channel funding, get the funding scriptpubkey
+                let start_result = self
+                    .provider
+                    .fund_channel_start(&client_node_id, channel_size_sat, false, Some(0))
+                    .await
+                    .map_err(|e| {
+                        SessionOutputError::ChannelError(format!(
+                            "fundchannel_start failed: {}",
+                            e
+                        ))
+                    })?;
+
+                debug!(
+                    "fundchannel_start succeeded: scriptpubkey={}",
+                    &start_result.scriptpubkey
+                );
+
+                // Step 2: Select and reserve wallet UTXOs
+                let fund_result = self
+                    .provider
+                    .fund_psbt(channel_size_sat, "normal", P2WSH_OUTPUT_WEIGHT)
+                    .await
+                    .map_err(|e| {
+                        SessionOutputError::ChannelError(format!("fundpsbt failed: {}", e))
+                    })?;
+
+                debug!(
+                    "fundpsbt succeeded: feerate_per_kw={}, weight={}",
+                    fund_result.feerate_per_kw, fund_result.estimated_final_weight
+                );
+
+                // Step 3: Add the funding output to the PSBT
+                let assembled_psbt =
+                    add_funding_output(&fund_result.psbt, channel_size_sat, &start_result.scriptpubkey)
+                        .map_err(|e| {
+                            SessionOutputError::ChannelError(format!(
+                                "PSBT assembly failed: {}",
+                                e
+                            ))
+                        })?;
+
+                // Step 4: Extract funding txid and outpoint from the assembled PSBT
+                let (funding_txid, funding_outpoint) =
+                    extract_funding_info(&assembled_psbt).map_err(|e| {
+                        SessionOutputError::ChannelError(format!(
+                            "extracting funding info failed: {}",
+                            e
+                        ))
+                    })?;
+
+                debug!(
+                    "PSBT assembled: funding_txid={}, funding_outpoint={}",
+                    funding_txid, funding_outpoint
+                );
+
+                // Step 5: Complete channel negotiation with withheld broadcast
+                let complete_result = self
+                    .provider
+                    .fund_channel_complete_withheld(&client_node_id, &assembled_psbt)
+                    .await
+                    .map_err(|e| {
+                        SessionOutputError::ChannelError(format!(
+                            "fundchannel_complete (withheld) failed: {}",
+                            e
+                        ))
+                    })?;
+
+                debug!(
+                    "fundchannel_complete succeeded: channel_id={:?}",
+                    hex::encode(complete_result.channel_id)
+                );
+
+                // Step 6: Sign the PSBT (wallet inputs)
+                let sign_result = self
+                    .provider
+                    .sign_psbt(&assembled_psbt)
+                    .await
+                    .map_err(|e| {
+                        SessionOutputError::ChannelError(format!("signpsbt failed: {}", e))
+                    })?;
+
+                info!(
+                    "Withheld channel opened: channel_id={}, funding_txid={}",
+                    hex::encode(complete_result.channel_id),
+                    funding_txid
+                );
+
+                // Return feedback: FundingSigned transitions Opening → AwaitingChannelReady
+                Ok(Some(SessionInput::FundingSigned {
+                    channel_id: ChannelId(complete_result.channel_id),
+                    funding_txid,
+                    funding_outpoint,
+                    funding_psbt: sign_result.signed_psbt,
+                }))
             }
 
             SessionOutput::ForwardHtlcs {
@@ -164,10 +255,77 @@ impl SessionOutputHandler for ClnSessionOutputHandler {
 mod tests {
     use super::*;
     use crate::core::lsps2::htlc_holder::HtlcInfo;
+    use crate::core::lsps2::provider::{
+        ChannelInfo, FundChannelCompleteResult, FundChannelStartResult, FundPsbtResult,
+        SendPsbtResult, SignPsbtResult,
+    };
+    use bitcoin::hashes::sha256::Hash;
     use crate::core::lsps2::session::{ChannelId, FailureCode, ForwardInstruction, SessionId};
     use crate::core::tlv::TlvStream;
     use crate::proto::lsps0::{Msat, ShortChannelId};
+    use anyhow::Result as AnyResult;
+    use bitcoin::secp256k1::PublicKey;
     use tokio::sync::oneshot;
+
+    /// Mock provider that panics on any call.
+    /// Used for tests that don't exercise the OpenChannel path.
+    struct PanicProvider;
+
+    #[async_trait]
+    impl LightningProvider for PanicProvider {
+        async fn fund_jit_channel(
+            &self,
+            _: &PublicKey,
+            _: &Msat,
+        ) -> AnyResult<(Hash, String)> {
+            unimplemented!("not needed for this test")
+        }
+        async fn is_channel_ready(&self, _: &PublicKey, _: &Hash) -> AnyResult<bool> {
+            unimplemented!("not needed for this test")
+        }
+        async fn fund_channel_start(
+            &self,
+            _: &PublicKey,
+            _: u64,
+            _: bool,
+            _: Option<u32>,
+        ) -> AnyResult<FundChannelStartResult> {
+            unimplemented!("not needed for this test")
+        }
+        async fn fund_channel_complete_withheld(
+            &self,
+            _: &PublicKey,
+            _: &str,
+        ) -> AnyResult<FundChannelCompleteResult> {
+            unimplemented!("not needed for this test")
+        }
+        async fn broadcast_funding(&self, _: &str) -> AnyResult<SendPsbtResult> {
+            unimplemented!("not needed for this test")
+        }
+        async fn get_channel_info(
+            &self,
+            _: &PublicKey,
+            _: Option<&[u8; 32]>,
+        ) -> AnyResult<Option<ChannelInfo>> {
+            unimplemented!("not needed for this test")
+        }
+        async fn fund_psbt(&self, _: u64, _: &str, _: u32) -> AnyResult<FundPsbtResult> {
+            unimplemented!("not needed for this test")
+        }
+        async fn sign_psbt(&self, _: &str) -> AnyResult<SignPsbtResult> {
+            unimplemented!("not needed for this test")
+        }
+        async fn unreserve_inputs(&self, _: &str) -> AnyResult<()> {
+            unimplemented!("not needed for this test")
+        }
+        async fn close_channel(&self, _: &[u8; 32]) -> AnyResult<()> {
+            unimplemented!("not needed for this test")
+        }
+    }
+
+    fn mock_provider() -> Arc<dyn LightningProvider> {
+        Arc::new(PanicProvider)
+    }
 
     fn test_session_id() -> SessionId {
         SessionId::from(ShortChannelId::from(123u64))
@@ -186,7 +344,7 @@ mod tests {
     #[tokio::test]
     async fn test_forward_htlcs() {
         let htlc_holder = Arc::new(HtlcHolder::new());
-        let handler = ClnSessionOutputHandler::new(htlc_holder.clone());
+        let handler = ClnSessionOutputHandler::new(htlc_holder.clone(), mock_provider());
 
         let session_id = test_session_id();
 
@@ -240,7 +398,7 @@ mod tests {
     #[tokio::test]
     async fn test_fail_htlcs() {
         let htlc_holder = Arc::new(HtlcHolder::new());
-        let handler = ClnSessionOutputHandler::new(htlc_holder.clone());
+        let handler = ClnSessionOutputHandler::new(htlc_holder.clone(), mock_provider());
 
         let session_id = test_session_id();
 
@@ -283,7 +441,7 @@ mod tests {
     #[tokio::test]
     async fn test_forward_htlcs_no_pending() {
         let htlc_holder = Arc::new(HtlcHolder::new());
-        let handler = ClnSessionOutputHandler::new(htlc_holder);
+        let handler = ClnSessionOutputHandler::new(htlc_holder, mock_provider());
 
         let session_id = test_session_id();
 
@@ -307,7 +465,7 @@ mod tests {
     #[tokio::test]
     async fn test_fail_htlcs_no_pending() {
         let htlc_holder = Arc::new(HtlcHolder::new());
-        let handler = ClnSessionOutputHandler::new(htlc_holder);
+        let handler = ClnSessionOutputHandler::new(htlc_holder, mock_provider());
 
         let session_id = test_session_id();
 
@@ -324,33 +482,228 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
-    async fn test_open_channel_placeholder() {
-        let htlc_holder = Arc::new(HtlcHolder::new());
-        let handler = ClnSessionOutputHandler::new(htlc_holder);
+    /// Mock provider that returns valid responses for the OpenChannel flow.
+    struct OpenChannelMockProvider;
 
-        // Test that OpenChannel doesn't panic (placeholder implementation)
+    #[async_trait]
+    impl LightningProvider for OpenChannelMockProvider {
+        async fn fund_jit_channel(
+            &self,
+            _: &PublicKey,
+            _: &Msat,
+        ) -> AnyResult<(Hash, String)> {
+            unimplemented!()
+        }
+        async fn is_channel_ready(&self, _: &PublicKey, _: &Hash) -> AnyResult<bool> {
+            unimplemented!()
+        }
+        async fn fund_channel_start(
+            &self,
+            _: &PublicKey,
+            _: u64,
+            _: bool,
+            _: Option<u32>,
+        ) -> AnyResult<FundChannelStartResult> {
+            // Return a P2WSH scriptpubkey (OP_0 <32-byte hash>)
+            let scriptpubkey = "0020".to_string() + &"ab".repeat(32);
+            Ok(FundChannelStartResult {
+                funding_address: "bc1qtest".to_string(),
+                scriptpubkey,
+                mindepth: Some(0),
+            })
+        }
+        async fn fund_channel_complete_withheld(
+            &self,
+            _: &PublicKey,
+            _: &str,
+        ) -> AnyResult<FundChannelCompleteResult> {
+            Ok(FundChannelCompleteResult {
+                channel_id: [42u8; 32],
+                commitments_secured: true,
+            })
+        }
+        async fn broadcast_funding(&self, _: &str) -> AnyResult<SendPsbtResult> {
+            unimplemented!()
+        }
+        async fn get_channel_info(
+            &self,
+            _: &PublicKey,
+            _: Option<&[u8; 32]>,
+        ) -> AnyResult<Option<ChannelInfo>> {
+            unimplemented!()
+        }
+        async fn fund_psbt(&self, _: u64, _: &str, _: u32) -> AnyResult<FundPsbtResult> {
+            // Create a minimal valid PSBT with one input
+            use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+            use bitcoin::blockdata::transaction::{Transaction, TxIn};
+            use bitcoin::psbt::{Input as PsbtInput, Psbt};
+            use bitcoin::{absolute, transaction};
+
+            let tx = Transaction {
+                version: transaction::Version(2),
+                lock_time: absolute::LockTime::ZERO,
+                input: vec![TxIn::default()],
+                output: vec![],
+            };
+            let psbt = Psbt {
+                unsigned_tx: tx,
+                version: 0,
+                xpub: Default::default(),
+                proprietary: Default::default(),
+                unknown: Default::default(),
+                inputs: vec![PsbtInput::default()],
+                outputs: vec![],
+            };
+            Ok(FundPsbtResult {
+                psbt: BASE64.encode(&psbt.serialize()),
+                feerate_per_kw: 2500,
+                estimated_final_weight: 800,
+            })
+        }
+        async fn sign_psbt(&self, psbt: &str) -> AnyResult<SignPsbtResult> {
+            // Return the same PSBT as "signed"
+            Ok(SignPsbtResult {
+                signed_psbt: psbt.to_string(),
+            })
+        }
+        async fn unreserve_inputs(&self, _: &str) -> AnyResult<()> {
+            Ok(())
+        }
+        async fn close_channel(&self, _: &[u8; 32]) -> AnyResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_open_channel_withheld_flow() {
+        let htlc_holder = Arc::new(HtlcHolder::new());
+        let provider: Arc<dyn LightningProvider> = Arc::new(OpenChannelMockProvider);
+        let handler = ClnSessionOutputHandler::new(htlc_holder, provider);
+
+        let client_node_id = bitcoin::secp256k1::PublicKey::from_slice(&[
+            2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1,
+        ])
+        .unwrap();
+
         let result = handler
             .execute(SessionOutput::OpenChannel {
-                client_node_id: "02deadbeef".parse().unwrap_or_else(|_| {
-                    // Use a valid test public key
-                    bitcoin::secp256k1::PublicKey::from_slice(&[
-                        2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-                        1, 1, 1, 1, 1, 1, 1, 1,
-                    ])
-                    .unwrap()
-                }),
+                client_node_id,
                 channel_size_sat: 100_000,
             })
             .await;
 
         assert!(result.is_ok());
+        let feedback = result.unwrap();
+        assert!(feedback.is_some());
+
+        // Verify the feedback is a FundingSigned input
+        match feedback.unwrap() {
+            SessionInput::FundingSigned {
+                channel_id,
+                funding_txid,
+                funding_outpoint,
+                funding_psbt,
+            } => {
+                assert_eq!(channel_id, ChannelId([42u8; 32]));
+                // The funding output is the only output (index 0)
+                assert_eq!(funding_outpoint, 0);
+                // Txid should be non-empty
+                assert!(!funding_txid.to_string().is_empty());
+                // The signed PSBT should be non-empty
+                assert!(!funding_psbt.is_empty());
+            }
+            other => panic!("Expected FundingSigned, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_open_channel_fundchannel_start_failure() {
+        /// Mock that fails on fund_channel_start
+        struct FailingStartProvider;
+
+        #[async_trait]
+        impl LightningProvider for FailingStartProvider {
+            async fn fund_jit_channel(
+                &self,
+                _: &PublicKey,
+                _: &Msat,
+            ) -> AnyResult<(Hash, String)> {
+                unimplemented!()
+            }
+            async fn is_channel_ready(&self, _: &PublicKey, _: &Hash) -> AnyResult<bool> {
+                unimplemented!()
+            }
+            async fn fund_channel_start(
+                &self,
+                _: &PublicKey,
+                _: u64,
+                _: bool,
+                _: Option<u32>,
+            ) -> AnyResult<FundChannelStartResult> {
+                anyhow::bail!("peer disconnected")
+            }
+            async fn fund_channel_complete_withheld(
+                &self,
+                _: &PublicKey,
+                _: &str,
+            ) -> AnyResult<FundChannelCompleteResult> {
+                unimplemented!()
+            }
+            async fn broadcast_funding(&self, _: &str) -> AnyResult<SendPsbtResult> {
+                unimplemented!()
+            }
+            async fn get_channel_info(
+                &self,
+                _: &PublicKey,
+                _: Option<&[u8; 32]>,
+            ) -> AnyResult<Option<ChannelInfo>> {
+                unimplemented!()
+            }
+            async fn fund_psbt(&self, _: u64, _: &str, _: u32) -> AnyResult<FundPsbtResult> {
+                unimplemented!()
+            }
+            async fn sign_psbt(&self, _: &str) -> AnyResult<SignPsbtResult> {
+                unimplemented!()
+            }
+            async fn unreserve_inputs(&self, _: &str) -> AnyResult<()> {
+                unimplemented!()
+            }
+            async fn close_channel(&self, _: &[u8; 32]) -> AnyResult<()> {
+                unimplemented!()
+            }
+        }
+
+        let htlc_holder = Arc::new(HtlcHolder::new());
+        let provider: Arc<dyn LightningProvider> = Arc::new(FailingStartProvider);
+        let handler = ClnSessionOutputHandler::new(htlc_holder, provider);
+
+        let client_node_id = bitcoin::secp256k1::PublicKey::from_slice(&[
+            2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1,
+        ])
+        .unwrap();
+
+        let result = handler
+            .execute(SessionOutput::OpenChannel {
+                client_node_id,
+                channel_size_sat: 100_000,
+            })
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("fundchannel_start failed"),
+            "Expected fundchannel_start error, got: {}",
+            err
+        );
     }
 
     #[tokio::test]
     async fn test_broadcast_funding_placeholder() {
         let htlc_holder = Arc::new(HtlcHolder::new());
-        let handler = ClnSessionOutputHandler::new(htlc_holder);
+        let handler = ClnSessionOutputHandler::new(htlc_holder, mock_provider());
 
         // Test that BroadcastFunding doesn't panic (placeholder implementation)
         let result = handler
@@ -365,7 +718,7 @@ mod tests {
     #[tokio::test]
     async fn test_release_channel_placeholder() {
         let htlc_holder = Arc::new(HtlcHolder::new());
-        let handler = ClnSessionOutputHandler::new(htlc_holder);
+        let handler = ClnSessionOutputHandler::new(htlc_holder, mock_provider());
 
         // Test that ReleaseChannel doesn't panic (placeholder implementation)
         let result = handler

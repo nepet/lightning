@@ -80,14 +80,18 @@ impl State {
     pub fn new(rpc_path: PathBuf, promise_secret: &[u8; 32]) -> Self {
         let api = Arc::new(ClnApiRpc::new(rpc_path.clone()));
         let sender = ClnSender::new(rpc_path.clone());
-        let lsps2_handler = Arc::new(Lsps2ServiceHandler::new(api, promise_secret));
+        let lsps2_handler = Arc::new(Lsps2ServiceHandler::new(api.clone(), promise_secret));
         let lsps_service = Arc::new(LspsService::builder().with_protocol(lsps2_handler).build());
 
         // Create HTLC holder for deferred hook responses
         let htlc_holder = Arc::new(HtlcHolder::new());
 
-        // Create session output handler (uses HtlcHolder to release HTLCs)
-        let output_handler = Arc::new(ClnSessionOutputHandler::new(htlc_holder.clone()));
+        // Create session output handler (uses HtlcHolder to release HTLCs,
+        // and provider for channel funding RPC calls)
+        let output_handler = Arc::new(ClnSessionOutputHandler::new(
+            htlc_holder.clone(),
+            api.clone(),
+        ));
 
         // Create session manager with no-op event emitter and CLN output handler
         let session_manager = Arc::new(SessionManager::new(
