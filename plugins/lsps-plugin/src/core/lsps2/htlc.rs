@@ -237,6 +237,9 @@ impl<A: DatastoreProvider + Lsps2OfferProvider + LightningProvider> HtlcAccepted
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::lsps2::provider::{
+        ChannelInfo, FundChannelCompleteResult, FundChannelStartResult, SendPsbtResult,
+    };
     use crate::core::tlv::TlvStream;
     use crate::proto::lsps0::{Msat, Ppm, ShortChannelId};
     use crate::proto::lsps2::{
@@ -461,6 +464,36 @@ mod tests {
         ) -> AnyResult<bool> {
             self.channel_ready_checks.fetch_add(1, Ordering::SeqCst);
             Ok(*self.channel_ready.lock().unwrap())
+        }
+
+        async fn fund_channel_start(
+            &self,
+            _peer_id: &PublicKey,
+            _amount_sat: u64,
+            _announce: bool,
+            _mindepth: Option<u32>,
+        ) -> AnyResult<FundChannelStartResult> {
+            unimplemented!("not needed for HTLC tests")
+        }
+
+        async fn fund_channel_complete_withheld(
+            &self,
+            _peer_id: &PublicKey,
+            _psbt: &str,
+        ) -> AnyResult<FundChannelCompleteResult> {
+            unimplemented!("not needed for HTLC tests")
+        }
+
+        async fn broadcast_funding(&self, _psbt: &str) -> AnyResult<SendPsbtResult> {
+            unimplemented!("not needed for HTLC tests")
+        }
+
+        async fn get_channel_info(
+            &self,
+            _peer_id: &PublicKey,
+            _channel_id: Option<&[u8; 32]>,
+        ) -> AnyResult<Option<ChannelInfo>> {
+            unimplemented!("not needed for HTLC tests")
         }
     }
 

@@ -1,6 +1,8 @@
 use crate::{
     core::lsps2::provider::{
-        Blockheight, BlockheightProvider, DatastoreProvider, LightningProvider, Lsps2OfferProvider,
+        Blockheight, BlockheightProvider, ChannelInfo, DatastoreProvider,
+        FundChannelCompleteResult, FundChannelStartResult, LightningProvider, Lsps2OfferProvider,
+        SendPsbtResult,
     },
     proto::{
         lsps0::Msat,
@@ -97,6 +99,40 @@ impl LightningProvider for ClnApiRpc {
         }
 
         return Ok(false);
+    }
+
+    // -------------------------------------------------------------------------
+    // New methods for MPP flow - to be implemented in Task 6
+    // -------------------------------------------------------------------------
+
+    async fn fund_channel_start(
+        &self,
+        _peer_id: &PublicKey,
+        _amount_sat: u64,
+        _announce: bool,
+        _mindepth: Option<u32>,
+    ) -> Result<FundChannelStartResult> {
+        unimplemented!("fund_channel_start will be implemented in Task 6")
+    }
+
+    async fn fund_channel_complete_withheld(
+        &self,
+        _peer_id: &PublicKey,
+        _psbt: &str,
+    ) -> Result<FundChannelCompleteResult> {
+        unimplemented!("fund_channel_complete_withheld will be implemented in Task 6")
+    }
+
+    async fn broadcast_funding(&self, _psbt: &str) -> Result<SendPsbtResult> {
+        unimplemented!("broadcast_funding will be implemented in Task 6")
+    }
+
+    async fn get_channel_info(
+        &self,
+        _peer_id: &PublicKey,
+        _channel_id: Option<&[u8; 32]>,
+    ) -> Result<Option<ChannelInfo>> {
+        unimplemented!("get_channel_info will be implemented in Task 6")
     }
 }
 
