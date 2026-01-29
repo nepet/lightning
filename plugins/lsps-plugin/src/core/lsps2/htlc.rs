@@ -111,9 +111,10 @@ impl<A: DatastoreProvider + Lsps2OfferProvider + LightningProvider> HtlcAccepted
         // become READY to use.
         // ---
 
-        // Fixme: We only accept no-mpp for now, mpp and other flows will be added later on
-        // Fixme: We continue mpp for now to let the test mock handle the htlc, as we need
-        // to test the client implementation for mpp payments.
+        // MPP payments are handled via the SessionManager in service.rs (handle_mpp_htlc).
+        // This check is a defensive safeguard - if an MPP HTLC somehow reaches this
+        // handler (which should only process no-MPP payments), reject it gracefully
+        // rather than proceeding with incorrect single-part logic.
         if ds_rec.expected_payment_size.is_some() {
             return Ok(HtlcDecision::Reject {
                 reason: RejectReason::MppNotSupported,
@@ -517,8 +518,13 @@ mod tests {
         assert_eq!(result, HtlcDecision::NotOurs);
     }
 
+    /// Test that MPP payments are rejected by this handler.
+    ///
+    /// In production, MPP payments are routed to `handle_mpp_htlc()` in service.rs
+    /// before reaching this handler. This test verifies the defensive safeguard:
+    /// if an MPP HTLC somehow reaches this no-MPP handler, it rejects gracefully.
     #[tokio::test]
-    async fn continues_when_mpp_payment() {
+    async fn rejects_mpp_payment_as_safety_net() {
         let entry = test_datastore_entry(Some(Msat(50_000_000))); // MPP = has expected size
         let api = MockApi::new().with_buy_request(entry);
         let h = handler(api);
