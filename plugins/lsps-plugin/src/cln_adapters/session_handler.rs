@@ -185,7 +185,10 @@ impl SessionOutputHandler for ClnSessionOutputHandler {
                     "Released HTLCs with forward instructions: session_id={:?}, htlc_count={}",
                     session_id, released
                 );
-                Ok(None)
+
+                // Return feedback: ForwardsCommitted transitions Forwarding → WaitingPreimage
+                info!("Returning ForwardsCommitted feedback for session {:?}", session_id);
+                Ok(Some(SessionInput::ForwardsCommitted))
             }
 
             SessionOutput::FailHtlcs {
@@ -242,6 +245,10 @@ impl SessionOutputHandler for ClnSessionOutputHandler {
                 // 2. Unreserve the wallet UTXOs
                 // Errors are logged but not propagated since the session is
                 // already in terminal (Abandoned) state.
+                info!(
+                    "Releasing abandoned channel: channel_id={:?}",
+                    channel_id
+                );
 
                 if let Err(e) = self.provider.close_channel(&channel_id.0).await {
                     warn!("Failed to close withheld channel {:?}: {}", channel_id, e);
@@ -252,6 +259,8 @@ impl SessionOutputHandler for ClnSessionOutputHandler {
                         "Failed to unreserve inputs for channel {:?}: {}",
                         channel_id, e
                     );
+                } else {
+                    info!("UTXOs unreserved for abandoned channel: channel_id={:?}", channel_id);
                 }
 
                 Ok(None)
