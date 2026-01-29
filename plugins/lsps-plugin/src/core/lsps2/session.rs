@@ -4,12 +4,17 @@
 //! state machine. The state machine is pure (no I/O) and testable
 //! in isolation.
 
-use crate::core::tlv::TlvStream;
+use crate::core::tlv::{TlvStream, TLV_FORWARD_AMT};
 use crate::proto::lsps0::{DateTime, Msat, ShortChannelId};
-use crate::proto::lsps2::OpeningFeeParams;
+use crate::proto::lsps2::{compute_opening_fee, OpeningFeeParams};
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::Txid;
+use chrono::Utc;
 use std::time::Instant;
+
+/// TLV type for the opening fee deducted from the forwarded amount.
+/// Per LSPS2 spec, this is type 65537.
+pub const TLV_OPENING_FEE: u64 = 65537;
 
 // ============================================================================
 // Core Types
@@ -586,6 +591,98 @@ pub enum SessionEvent {
 }
 
 // ============================================================================
+// Session Output
+// ============================================================================
+
+/// HTLC failure codes per LSPS2 spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureCode {
+    /// Used for: timeout, client disconnect before funding_signed
+    TemporaryChannelFailure,
+    /// Used for: valid_until passed, too many parts, client rejects channel
+    UnknownNextPeer,
+}
+
+impl FailureCode {
+    /// Returns the wire failure code string for CLN.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FailureCode::TemporaryChannelFailure => "temporary_channel_failure",
+            FailureCode::UnknownNextPeer => "unknown_next_peer",
+        }
+    }
+}
+
+/// Instruction for forwarding a single HTLC.
+#[derive(Debug, Clone)]
+pub struct ForwardInstruction {
+    /// The HTLC ID to forward
+    pub htlc_id: u64,
+    /// The SCID to forward to (the new channel's alias)
+    pub forward_to_scid: ShortChannelId,
+    /// Modified onion payload with adjusted forward amount
+    pub payload: TlvStream,
+    /// Extra TLVs to add (includes opening fee TLV 65537)
+    pub extra_tlvs: TlvStream,
+}
+
+/// Actions that the external handler must execute after a state transition.
+#[derive(Debug, Clone)]
+pub enum SessionOutput {
+    /// Initiate channel opening with the client.
+    OpenChannel {
+        client_node_id: PublicKey,
+        channel_size_sat: u64,
+    },
+
+    /// Forward HTLCs into the newly ready channel.
+    ForwardHtlcs {
+        instructions: Vec<ForwardInstruction>,
+    },
+
+    /// Fail HTLCs back upstream with the given failure code.
+    FailHtlcs {
+        htlc_ids: Vec<u64>,
+        failure_code: FailureCode,
+    },
+
+    /// Broadcast the withheld funding transaction.
+    BroadcastFunding { psbt: String },
+
+    /// Release/close the channel (for abandoned sessions).
+    ReleaseChannel { channel_id: ChannelId },
+}
+
+/// Result of applying an input to the session state machine.
+#[derive(Debug, Clone, Default)]
+pub struct ApplyResult {
+    /// Events to emit for observability
+    pub events: Vec<SessionEvent>,
+    /// Outputs/commands to execute
+    pub outputs: Vec<SessionOutput>,
+}
+
+impl ApplyResult {
+    /// Creates an empty result (no events, no outputs).
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Creates a result with events only.
+    pub fn with_events(events: Vec<SessionEvent>) -> Self {
+        Self {
+            events,
+            outputs: Vec::new(),
+        }
+    }
+
+    /// Creates a result with events and outputs.
+    pub fn new(events: Vec<SessionEvent>, outputs: Vec<SessionOutput>) -> Self {
+        Self { events, outputs }
+    }
+}
+
+// ============================================================================
 // Session Struct
 // ============================================================================
 
@@ -646,6 +743,959 @@ impl Session {
     /// Returns the duration in milliseconds since session creation.
     pub fn duration_ms(&self) -> u64 {
         self.duration().as_millis() as u64
+    }
+
+    // ========================================================================
+    // Helper Methods
+    // ========================================================================
+
+    /// Check if collected parts sum reaches expected payment size.
+    fn check_sum_reached(&self, parts: &[HtlcPart]) -> bool {
+        let sum: u64 = parts.iter().map(|p| p.amount_msat.msat()).sum();
+        match self.config.expected_payment_size {
+            Some(expected) => sum >= expected.msat(),
+            None => true, // no-MPP: first part triggers immediately
+        }
+    }
+
+    /// Compute the opening fee for the given parts.
+    fn compute_fee(&self, parts: &[HtlcPart]) -> u64 {
+        let total_msat: u64 = parts.iter().map(|p| p.amount_msat.msat()).sum();
+        compute_opening_fee(
+            total_msat,
+            self.config.opening_fee_params.min_fee_msat.msat(),
+            self.config.opening_fee_params.proportional.ppm() as u64,
+        )
+        .unwrap_or(0)
+    }
+
+    /// Compute channel size based on parts and fee params.
+    fn compute_channel_size(&self, parts: &[HtlcPart]) -> u64 {
+        let total_msat: u64 = parts.iter().map(|p| p.amount_msat.msat()).sum();
+        let opening_fee = self.compute_fee(parts);
+        let receivable = total_msat.saturating_sub(opening_fee);
+        // Convert to satoshis (floor division)
+        receivable / 1000
+    }
+
+    /// Generate forward instructions for all parts.
+    fn generate_forward_instructions(
+        &self,
+        parts: &[HtlcPart],
+        alias_scid: ShortChannelId,
+    ) -> Vec<ForwardInstruction> {
+        let total_msat: u64 = parts.iter().map(|p| p.amount_msat.msat()).sum();
+        let opening_fee = self.compute_fee(parts);
+
+        // Deduct fee from each part proportionally
+        parts
+            .iter()
+            .map(|part| {
+                // Calculate this part's share of the fee
+                let part_fee = if total_msat > 0 {
+                    (opening_fee as u128 * part.amount_msat.msat() as u128 / total_msat as u128)
+                        as u64
+                } else {
+                    0
+                };
+                let forward_amt = part.amount_msat.msat().saturating_sub(part_fee);
+
+                // Create modified payload with adjusted forward amount
+                let mut payload = part.onion_payload.clone();
+                payload.set_tu64(TLV_FORWARD_AMT, forward_amt);
+
+                // Add opening fee TLV to extra_tlvs
+                let mut extra_tlvs = part.extra_tlvs.clone();
+                extra_tlvs.set_u64(TLV_OPENING_FEE, part_fee);
+
+                ForwardInstruction {
+                    htlc_id: part.htlc_id,
+                    forward_to_scid: alias_scid,
+                    payload,
+                    extra_tlvs,
+                }
+            })
+            .collect()
+    }
+
+    /// Extract payment hash from parts (all should be the same).
+    fn payment_hash(parts: &[HtlcPart]) -> [u8; 32] {
+        parts.first().map(|p| p.payment_hash).unwrap_or([0u8; 32])
+    }
+
+    /// Extract HTLC IDs from parts.
+    fn htlc_ids(parts: &[HtlcPart]) -> Vec<u64> {
+        parts.iter().map(|p| p.htlc_id).collect()
+    }
+
+    // ========================================================================
+    // State Transition Logic
+    // ========================================================================
+
+    /// Apply an input to the state machine, returning events and outputs.
+    ///
+    /// This is the core state machine logic. It is pure (no I/O) and
+    /// deterministic given the same state and input.
+    pub fn apply(&mut self, input: SessionInput) -> ApplyResult {
+        // Take ownership of current state temporarily
+        let current_state = std::mem::replace(
+            &mut self.state,
+            SessionState::Failed {
+                reason: FailureReason::CollectTimeout,
+                phase: SessionPhase::Collecting,
+            },
+        );
+
+        let (new_state, result) = self.apply_to_state(current_state, input);
+        self.state = new_state;
+        result
+    }
+
+    /// Internal method that applies input to a state and returns the new state and result.
+    fn apply_to_state(
+        &self,
+        state: SessionState,
+        input: SessionInput,
+    ) -> (SessionState, ApplyResult) {
+        match (state, input) {
+            // ================================================================
+            // Collecting State Transitions
+            // ================================================================
+            (
+                SessionState::Collecting {
+                    mut parts,
+                    first_part_at,
+                },
+                SessionInput::PartArrived { part },
+            ) => {
+                parts.push(part.clone());
+                let parts_count = parts.len();
+                let parts_sum = parts.iter().map(|p| p.amount_msat.msat()).sum();
+
+                if self.check_sum_reached(&parts) {
+                    // Sum reached -> transition to Opening
+                    let channel_size_sat = self.compute_channel_size(&parts);
+                    let events = vec![SessionEvent::ChannelOpenInitiated {
+                        session_id: self.id,
+                        client_node_id: self.config.client_node_id,
+                        channel_size_sat,
+                    }];
+                    let outputs = vec![SessionOutput::OpenChannel {
+                        client_node_id: self.config.client_node_id,
+                        channel_size_sat,
+                    }];
+                    (
+                        SessionState::Opening { parts },
+                        ApplyResult::new(events, outputs),
+                    )
+                } else {
+                    // Still collecting
+                    let events = vec![SessionEvent::HtlcPartReceived {
+                        session_id: self.id,
+                        htlc_id: part.htlc_id,
+                        amount_msat: part.amount_msat,
+                        cltv_expiry: part.cltv_expiry,
+                        payment_hash: part.payment_hash,
+                        parts_count,
+                        parts_sum_msat: parts_sum,
+                    }];
+                    (
+                        SessionState::Collecting {
+                            parts,
+                            first_part_at,
+                        },
+                        ApplyResult::with_events(events),
+                    )
+                }
+            }
+
+            (
+                SessionState::Collecting {
+                    parts,
+                    first_part_at,
+                },
+                SessionInput::CollectTimeout,
+            ) => {
+                let elapsed_ms = first_part_at.elapsed().as_millis() as u64;
+                let parts_count = parts.len();
+                let parts_sum = parts.iter().map(|p| p.amount_msat.msat()).sum();
+                let htlc_ids = Self::htlc_ids(&parts);
+
+                let events = vec![
+                    SessionEvent::CollectTimeout {
+                        session_id: self.id,
+                        elapsed_ms,
+                        parts_count,
+                        parts_sum_msat: parts_sum,
+                    },
+                    SessionEvent::HtlcsFailedUpstream {
+                        session_id: self.id,
+                        htlc_count: parts_count,
+                        error_code: FailureCode::TemporaryChannelFailure.as_str().to_string(),
+                        reason: "collect_timeout".to_string(),
+                    },
+                ];
+                let outputs = vec![SessionOutput::FailHtlcs {
+                    htlc_ids,
+                    failure_code: FailureCode::TemporaryChannelFailure,
+                }];
+
+                (
+                    SessionState::Failed {
+                        reason: FailureReason::CollectTimeout,
+                        phase: SessionPhase::Collecting,
+                    },
+                    ApplyResult::new(events, outputs),
+                )
+            }
+
+            (SessionState::Collecting { parts, .. }, SessionInput::ValidUntilPassed) => {
+                let htlc_ids = Self::htlc_ids(&parts);
+                let events = vec![
+                    SessionEvent::ValidUntilExpired {
+                        session_id: self.id,
+                        phase: SessionPhase::Collecting,
+                        valid_until: self.config.valid_until(),
+                        current_time: Utc::now(),
+                    },
+                    SessionEvent::HtlcsFailedUpstream {
+                        session_id: self.id,
+                        htlc_count: parts.len(),
+                        error_code: FailureCode::UnknownNextPeer.as_str().to_string(),
+                        reason: "valid_until_expired".to_string(),
+                    },
+                ];
+                let outputs = vec![SessionOutput::FailHtlcs {
+                    htlc_ids,
+                    failure_code: FailureCode::UnknownNextPeer,
+                }];
+
+                (
+                    SessionState::Failed {
+                        reason: FailureReason::ValidUntilExpired,
+                        phase: SessionPhase::Collecting,
+                    },
+                    ApplyResult::new(events, outputs),
+                )
+            }
+
+            (SessionState::Collecting { parts, .. }, SessionInput::TooManyParts { max_parts }) => {
+                let htlc_ids = Self::htlc_ids(&parts);
+                let events = vec![
+                    SessionEvent::TooManyParts {
+                        session_id: self.id,
+                        parts_count: parts.len(),
+                        max_allowed: max_parts,
+                    },
+                    SessionEvent::HtlcsFailedUpstream {
+                        session_id: self.id,
+                        htlc_count: parts.len(),
+                        error_code: FailureCode::UnknownNextPeer.as_str().to_string(),
+                        reason: "too_many_parts".to_string(),
+                    },
+                ];
+                let outputs = vec![SessionOutput::FailHtlcs {
+                    htlc_ids,
+                    failure_code: FailureCode::UnknownNextPeer,
+                }];
+
+                (
+                    SessionState::Failed {
+                        reason: FailureReason::TooManyParts {
+                            count: parts.len(),
+                            max: max_parts,
+                        },
+                        phase: SessionPhase::Collecting,
+                    },
+                    ApplyResult::new(events, outputs),
+                )
+            }
+
+            (
+                SessionState::Collecting { parts, .. },
+                SessionInput::UnsafeHold {
+                    min_cltv_expiry,
+                    current_height,
+                },
+            ) => {
+                let htlc_ids = Self::htlc_ids(&parts);
+                let blocks_remaining = min_cltv_expiry.saturating_sub(current_height);
+                let events = vec![
+                    SessionEvent::UnsafeHoldDetected {
+                        session_id: self.id,
+                        phase: SessionPhase::Collecting,
+                        min_cltv_expiry,
+                        current_height,
+                        blocks_remaining,
+                    },
+                    SessionEvent::HtlcsFailedUpstream {
+                        session_id: self.id,
+                        htlc_count: parts.len(),
+                        error_code: FailureCode::TemporaryChannelFailure.as_str().to_string(),
+                        reason: "unsafe_hold".to_string(),
+                    },
+                ];
+                let outputs = vec![SessionOutput::FailHtlcs {
+                    htlc_ids,
+                    failure_code: FailureCode::TemporaryChannelFailure,
+                }];
+
+                (
+                    SessionState::Failed {
+                        reason: FailureReason::UnsafeHold {
+                            min_cltv: min_cltv_expiry,
+                            current_height,
+                        },
+                        phase: SessionPhase::Collecting,
+                    },
+                    ApplyResult::new(events, outputs),
+                )
+            }
+
+            // ================================================================
+            // Opening State Transitions
+            // ================================================================
+            (
+                SessionState::Opening { parts },
+                SessionInput::FundingSigned {
+                    channel_id,
+                    funding_txid,
+                    funding_outpoint,
+                    funding_psbt,
+                },
+            ) => {
+                let events = vec![SessionEvent::ChannelFundingSigned {
+                    session_id: self.id,
+                    channel_id,
+                    funding_txid,
+                    funding_output_index: funding_outpoint,
+                }];
+
+                (
+                    SessionState::AwaitingChannelReady {
+                        parts,
+                        channel_id,
+                        funding_txid,
+                        funding_outpoint,
+                        funding_psbt,
+                    },
+                    ApplyResult::with_events(events),
+                )
+            }
+
+            (SessionState::Opening { parts }, SessionInput::ClientRejectsChannel { error }) => {
+                let htlc_ids = Self::htlc_ids(&parts);
+                let events = vec![
+                    SessionEvent::ClientRejectedChannel {
+                        session_id: self.id,
+                        client_node_id: self.config.client_node_id,
+                        error_message: error.clone(),
+                    },
+                    SessionEvent::HtlcsFailedUpstream {
+                        session_id: self.id,
+                        htlc_count: parts.len(),
+                        error_code: FailureCode::UnknownNextPeer.as_str().to_string(),
+                        reason: "client_rejected_channel".to_string(),
+                    },
+                ];
+                let outputs = vec![SessionOutput::FailHtlcs {
+                    htlc_ids,
+                    failure_code: FailureCode::UnknownNextPeer,
+                }];
+
+                (
+                    SessionState::Failed {
+                        reason: FailureReason::ClientRejectedChannel { error },
+                        phase: SessionPhase::Opening,
+                    },
+                    ApplyResult::new(events, outputs),
+                )
+            }
+
+            (SessionState::Opening { parts }, SessionInput::ClientDisconnected) => {
+                let htlc_ids = Self::htlc_ids(&parts);
+                let events = vec![
+                    SessionEvent::ClientDisconnected {
+                        session_id: self.id,
+                        client_node_id: self.config.client_node_id,
+                        phase: SessionPhase::Opening,
+                    },
+                    SessionEvent::HtlcsFailedUpstream {
+                        session_id: self.id,
+                        htlc_count: parts.len(),
+                        error_code: FailureCode::TemporaryChannelFailure.as_str().to_string(),
+                        reason: "client_disconnected".to_string(),
+                    },
+                ];
+                let outputs = vec![SessionOutput::FailHtlcs {
+                    htlc_ids,
+                    failure_code: FailureCode::TemporaryChannelFailure,
+                }];
+
+                (
+                    SessionState::Failed {
+                        reason: FailureReason::ClientDisconnected,
+                        phase: SessionPhase::Opening,
+                    },
+                    ApplyResult::new(events, outputs),
+                )
+            }
+
+            (
+                SessionState::Opening { parts },
+                SessionInput::UnsafeHold {
+                    min_cltv_expiry,
+                    current_height,
+                },
+            ) => {
+                let htlc_ids = Self::htlc_ids(&parts);
+                let blocks_remaining = min_cltv_expiry.saturating_sub(current_height);
+                let events = vec![
+                    SessionEvent::UnsafeHoldDetected {
+                        session_id: self.id,
+                        phase: SessionPhase::Opening,
+                        min_cltv_expiry,
+                        current_height,
+                        blocks_remaining,
+                    },
+                    SessionEvent::HtlcsFailedUpstream {
+                        session_id: self.id,
+                        htlc_count: parts.len(),
+                        error_code: FailureCode::TemporaryChannelFailure.as_str().to_string(),
+                        reason: "unsafe_hold".to_string(),
+                    },
+                ];
+                let outputs = vec![SessionOutput::FailHtlcs {
+                    htlc_ids,
+                    failure_code: FailureCode::TemporaryChannelFailure,
+                }];
+
+                (
+                    SessionState::Failed {
+                        reason: FailureReason::UnsafeHold {
+                            min_cltv: min_cltv_expiry,
+                            current_height,
+                        },
+                        phase: SessionPhase::Opening,
+                    },
+                    ApplyResult::new(events, outputs),
+                )
+            }
+
+            // ================================================================
+            // AwaitingChannelReady State Transitions
+            // ================================================================
+            (
+                SessionState::AwaitingChannelReady {
+                    parts,
+                    channel_id,
+                    funding_psbt,
+                    ..
+                },
+                SessionInput::ClientChannelReady { alias_scid },
+            ) => {
+                let instructions = self.generate_forward_instructions(&parts, alias_scid);
+                let events = vec![SessionEvent::ChannelReady {
+                    session_id: self.id,
+                    channel_id,
+                    alias_scid,
+                }];
+                let outputs = vec![SessionOutput::ForwardHtlcs { instructions }];
+
+                (
+                    SessionState::Forwarding {
+                        parts,
+                        channel_id,
+                        alias_scid,
+                        funding_psbt,
+                    },
+                    ApplyResult::new(events, outputs),
+                )
+            }
+
+            (
+                SessionState::AwaitingChannelReady { parts, .. },
+                SessionInput::ClientDisconnected,
+            ) => {
+                let htlc_ids = Self::htlc_ids(&parts);
+                let events = vec![
+                    SessionEvent::ClientDisconnected {
+                        session_id: self.id,
+                        client_node_id: self.config.client_node_id,
+                        phase: SessionPhase::AwaitingChannelReady,
+                    },
+                    SessionEvent::HtlcsFailedUpstream {
+                        session_id: self.id,
+                        htlc_count: parts.len(),
+                        error_code: FailureCode::TemporaryChannelFailure.as_str().to_string(),
+                        reason: "client_disconnected".to_string(),
+                    },
+                ];
+                let outputs = vec![SessionOutput::FailHtlcs {
+                    htlc_ids,
+                    failure_code: FailureCode::TemporaryChannelFailure,
+                }];
+
+                (
+                    SessionState::Failed {
+                        reason: FailureReason::ClientDisconnected,
+                        phase: SessionPhase::AwaitingChannelReady,
+                    },
+                    ApplyResult::new(events, outputs),
+                )
+            }
+
+            (
+                SessionState::AwaitingChannelReady { parts, .. },
+                SessionInput::UnsafeHold {
+                    min_cltv_expiry,
+                    current_height,
+                },
+            ) => {
+                let htlc_ids = Self::htlc_ids(&parts);
+                let blocks_remaining = min_cltv_expiry.saturating_sub(current_height);
+                let events = vec![
+                    SessionEvent::UnsafeHoldDetected {
+                        session_id: self.id,
+                        phase: SessionPhase::AwaitingChannelReady,
+                        min_cltv_expiry,
+                        current_height,
+                        blocks_remaining,
+                    },
+                    SessionEvent::HtlcsFailedUpstream {
+                        session_id: self.id,
+                        htlc_count: parts.len(),
+                        error_code: FailureCode::TemporaryChannelFailure.as_str().to_string(),
+                        reason: "unsafe_hold".to_string(),
+                    },
+                ];
+                let outputs = vec![SessionOutput::FailHtlcs {
+                    htlc_ids,
+                    failure_code: FailureCode::TemporaryChannelFailure,
+                }];
+
+                (
+                    SessionState::Failed {
+                        reason: FailureReason::UnsafeHold {
+                            min_cltv: min_cltv_expiry,
+                            current_height,
+                        },
+                        phase: SessionPhase::AwaitingChannelReady,
+                    },
+                    ApplyResult::new(events, outputs),
+                )
+            }
+
+            // ================================================================
+            // Forwarding State Transitions
+            // ================================================================
+            (
+                SessionState::Forwarding {
+                    parts,
+                    channel_id,
+                    alias_scid,
+                    funding_psbt,
+                },
+                SessionInput::ForwardsCommitted,
+            ) => {
+                let total_msat: u64 = parts.iter().map(|p| p.amount_msat.msat()).sum();
+                let fee = self.compute_fee(&parts);
+                let events = vec![SessionEvent::HtlcsForwarded {
+                    session_id: self.id,
+                    htlc_count: parts.len(),
+                    total_forwarded_msat: total_msat.saturating_sub(fee),
+                    fee_deducted_msat: fee,
+                }];
+
+                (
+                    SessionState::WaitingPreimage {
+                        parts,
+                        channel_id,
+                        alias_scid,
+                        funding_psbt,
+                        forwarded_at: Instant::now(),
+                    },
+                    ApplyResult::with_events(events),
+                )
+            }
+
+            (
+                SessionState::Forwarding { parts, .. },
+                SessionInput::UnsafeHold {
+                    min_cltv_expiry,
+                    current_height,
+                },
+            ) => {
+                let htlc_ids = Self::htlc_ids(&parts);
+                let blocks_remaining = min_cltv_expiry.saturating_sub(current_height);
+                let events = vec![
+                    SessionEvent::UnsafeHoldDetected {
+                        session_id: self.id,
+                        phase: SessionPhase::Forwarding,
+                        min_cltv_expiry,
+                        current_height,
+                        blocks_remaining,
+                    },
+                    SessionEvent::HtlcsFailedUpstream {
+                        session_id: self.id,
+                        htlc_count: parts.len(),
+                        error_code: FailureCode::TemporaryChannelFailure.as_str().to_string(),
+                        reason: "unsafe_hold".to_string(),
+                    },
+                ];
+                let outputs = vec![SessionOutput::FailHtlcs {
+                    htlc_ids,
+                    failure_code: FailureCode::TemporaryChannelFailure,
+                }];
+
+                (
+                    SessionState::Failed {
+                        reason: FailureReason::UnsafeHold {
+                            min_cltv: min_cltv_expiry,
+                            current_height,
+                        },
+                        phase: SessionPhase::Forwarding,
+                    },
+                    ApplyResult::new(events, outputs),
+                )
+            }
+
+            // ================================================================
+            // WaitingPreimage State Transitions
+            // ================================================================
+            (
+                SessionState::WaitingPreimage {
+                    parts,
+                    channel_id,
+                    funding_psbt,
+                    ..
+                },
+                SessionInput::PreimageReceived { preimage },
+            ) => {
+                let payment_hash = Self::payment_hash(&parts);
+                let events = vec![SessionEvent::HtlcsFulfilled {
+                    session_id: self.id,
+                    payment_hash,
+                    preimage,
+                }];
+                let outputs = vec![SessionOutput::BroadcastFunding {
+                    psbt: funding_psbt.clone(),
+                }];
+
+                (
+                    SessionState::Settling {
+                        channel_id,
+                        preimage,
+                        funding_psbt,
+                    },
+                    ApplyResult::new(events, outputs),
+                )
+            }
+
+            (
+                SessionState::WaitingPreimage {
+                    parts,
+                    channel_id,
+                    alias_scid,
+                    funding_psbt,
+                    ..
+                },
+                SessionInput::ClientRejectedPayment,
+            ) => {
+                let payment_hash = Self::payment_hash(&parts);
+                let events = vec![SessionEvent::HtlcsRejectedByClient {
+                    session_id: self.id,
+                    payment_hash,
+                    rejection_type: "client_rejected".to_string(),
+                    retry_count: 1,
+                }];
+
+                (
+                    SessionState::AwaitingRetry {
+                        parts: Vec::new(), // Clear parts for retry
+                        channel_id,
+                        alias_scid,
+                        funding_psbt,
+                        retry_count: 1,
+                        first_part_at: Instant::now(),
+                    },
+                    ApplyResult::with_events(events),
+                )
+            }
+
+            (
+                SessionState::WaitingPreimage { parts, .. },
+                SessionInput::UnsafeHold {
+                    min_cltv_expiry,
+                    current_height,
+                },
+            ) => {
+                let htlc_ids = Self::htlc_ids(&parts);
+                let blocks_remaining = min_cltv_expiry.saturating_sub(current_height);
+                let events = vec![
+                    SessionEvent::UnsafeHoldDetected {
+                        session_id: self.id,
+                        phase: SessionPhase::WaitingPreimage,
+                        min_cltv_expiry,
+                        current_height,
+                        blocks_remaining,
+                    },
+                    SessionEvent::HtlcsFailedUpstream {
+                        session_id: self.id,
+                        htlc_count: parts.len(),
+                        error_code: FailureCode::TemporaryChannelFailure.as_str().to_string(),
+                        reason: "unsafe_hold".to_string(),
+                    },
+                ];
+                let outputs = vec![SessionOutput::FailHtlcs {
+                    htlc_ids,
+                    failure_code: FailureCode::TemporaryChannelFailure,
+                }];
+
+                (
+                    SessionState::Failed {
+                        reason: FailureReason::UnsafeHold {
+                            min_cltv: min_cltv_expiry,
+                            current_height,
+                        },
+                        phase: SessionPhase::WaitingPreimage,
+                    },
+                    ApplyResult::new(events, outputs),
+                )
+            }
+
+            // ================================================================
+            // AwaitingRetry State Transitions
+            // ================================================================
+            (
+                SessionState::AwaitingRetry {
+                    mut parts,
+                    channel_id,
+                    alias_scid,
+                    funding_psbt,
+                    retry_count,
+                    first_part_at,
+                },
+                SessionInput::PartArrived { part },
+            ) => {
+                parts.push(part.clone());
+
+                if self.check_sum_reached(&parts) {
+                    // Sum reached -> transition to Forwarding
+                    let instructions = self.generate_forward_instructions(&parts, alias_scid);
+                    let outputs = vec![SessionOutput::ForwardHtlcs { instructions }];
+
+                    (
+                        SessionState::Forwarding {
+                            parts,
+                            channel_id,
+                            alias_scid,
+                            funding_psbt,
+                        },
+                        ApplyResult::new(Vec::new(), outputs),
+                    )
+                } else {
+                    // Still collecting
+                    let events = vec![SessionEvent::HtlcPartReceivedRetry {
+                        session_id: self.id,
+                        htlc_id: part.htlc_id,
+                        amount_msat: part.amount_msat,
+                        retry_count,
+                    }];
+
+                    (
+                        SessionState::AwaitingRetry {
+                            parts,
+                            channel_id,
+                            alias_scid,
+                            funding_psbt,
+                            retry_count,
+                            first_part_at,
+                        },
+                        ApplyResult::with_events(events),
+                    )
+                }
+            }
+
+            (
+                SessionState::AwaitingRetry {
+                    parts,
+                    channel_id,
+                    retry_count,
+                    ..
+                },
+                SessionInput::ValidUntilPassed,
+            ) => {
+                let htlc_ids = Self::htlc_ids(&parts);
+                let events = vec![
+                    SessionEvent::ValidUntilExpired {
+                        session_id: self.id,
+                        phase: SessionPhase::AwaitingRetry,
+                        valid_until: self.config.valid_until(),
+                        current_time: Utc::now(),
+                    },
+                    SessionEvent::ChannelReleased {
+                        session_id: self.id,
+                        channel_id,
+                        reason: "valid_until_expired".to_string(),
+                    },
+                ];
+                let mut outputs = vec![SessionOutput::ReleaseChannel { channel_id }];
+                if !htlc_ids.is_empty() {
+                    outputs.push(SessionOutput::FailHtlcs {
+                        htlc_ids,
+                        failure_code: FailureCode::UnknownNextPeer,
+                    });
+                }
+
+                (
+                    SessionState::Abandoned {
+                        reason: AbandonReason::ValidUntilExpired,
+                        channel_id,
+                        retry_count,
+                    },
+                    ApplyResult::new(events, outputs),
+                )
+            }
+
+            (
+                SessionState::AwaitingRetry {
+                    parts,
+                    channel_id,
+                    retry_count,
+                    first_part_at,
+                    ..
+                },
+                SessionInput::CollectTimeout,
+            ) => {
+                let htlc_ids = Self::htlc_ids(&parts);
+                let elapsed_ms = first_part_at.elapsed().as_millis() as u64;
+                let events = vec![
+                    SessionEvent::CollectTimeoutRetry {
+                        session_id: self.id,
+                        elapsed_ms,
+                        retry_count,
+                    },
+                    SessionEvent::ChannelReleased {
+                        session_id: self.id,
+                        channel_id,
+                        reason: "collect_timeout".to_string(),
+                    },
+                ];
+                let mut outputs = vec![SessionOutput::ReleaseChannel { channel_id }];
+                if !htlc_ids.is_empty() {
+                    outputs.push(SessionOutput::FailHtlcs {
+                        htlc_ids,
+                        failure_code: FailureCode::TemporaryChannelFailure,
+                    });
+                }
+
+                (
+                    SessionState::Abandoned {
+                        reason: AbandonReason::CollectTimeout,
+                        channel_id,
+                        retry_count,
+                    },
+                    ApplyResult::new(events, outputs),
+                )
+            }
+
+            (
+                SessionState::AwaitingRetry {
+                    parts,
+                    channel_id,
+                    retry_count,
+                    ..
+                },
+                SessionInput::UnsafeHold {
+                    min_cltv_expiry,
+                    current_height,
+                },
+            ) => {
+                let htlc_ids = Self::htlc_ids(&parts);
+                let blocks_remaining = min_cltv_expiry.saturating_sub(current_height);
+                let events = vec![
+                    SessionEvent::UnsafeHoldDetected {
+                        session_id: self.id,
+                        phase: SessionPhase::AwaitingRetry,
+                        min_cltv_expiry,
+                        current_height,
+                        blocks_remaining,
+                    },
+                    SessionEvent::ChannelReleased {
+                        session_id: self.id,
+                        channel_id,
+                        reason: "unsafe_hold".to_string(),
+                    },
+                ];
+                let mut outputs = vec![SessionOutput::ReleaseChannel { channel_id }];
+                if !htlc_ids.is_empty() {
+                    outputs.push(SessionOutput::FailHtlcs {
+                        htlc_ids,
+                        failure_code: FailureCode::TemporaryChannelFailure,
+                    });
+                }
+
+                (
+                    SessionState::Abandoned {
+                        reason: AbandonReason::UnsafeHold {
+                            min_cltv: min_cltv_expiry,
+                            current_height,
+                        },
+                        channel_id,
+                        retry_count,
+                    },
+                    ApplyResult::new(events, outputs),
+                )
+            }
+
+            // ================================================================
+            // Settling State Transitions
+            // ================================================================
+            (
+                SessionState::Settling {
+                    channel_id,
+                    preimage,
+                    ..
+                },
+                SessionInput::FundingBroadcasted { txid },
+            ) => {
+                let events = vec![
+                    SessionEvent::ChannelFundingBroadcast {
+                        session_id: self.id,
+                        channel_id,
+                        funding_txid: txid,
+                    },
+                    SessionEvent::SessionCompleted {
+                        session_id: self.id,
+                        duration_ms: self.duration_ms(),
+                        opening_fee_msat: 0, // TODO: track actual fee
+                        channel_id,
+                        funding_txid: txid,
+                    },
+                ];
+
+                (
+                    SessionState::Done {
+                        channel_id,
+                        funding_txid: txid,
+                        preimage,
+                    },
+                    ApplyResult::with_events(events),
+                )
+            }
+
+            // ================================================================
+            // Invalid/Ignored Transitions
+            // ================================================================
+            // Terminal states ignore all inputs
+            (state @ SessionState::Done { .. }, _)
+            | (state @ SessionState::Failed { .. }, _)
+            | (state @ SessionState::Abandoned { .. }, _) => (state, ApplyResult::empty()),
+
+            // Any other unhandled transition - return state unchanged
+            (state, _) => (state, ApplyResult::empty()),
+        }
     }
 }
 
@@ -795,5 +1845,481 @@ mod tests {
             format!("{}", SessionPhase::AwaitingChannelReady),
             "awaiting_channel_ready"
         );
+    }
+
+    // ========================================================================
+    // State Transition Tests
+    // ========================================================================
+
+    fn test_session() -> Session {
+        let scid = ShortChannelId::from(123u64);
+        let session_id = SessionId::from(scid);
+        let config = SessionConfig::new(
+            test_public_key(),
+            test_opening_fee_params(),
+            Some(Msat::from_msat(100_000)), // MPP: expect 100k msat
+        );
+        Session::new(session_id, config)
+    }
+
+    fn test_htlc_part(htlc_id: u64, amount_msat: u64) -> HtlcPart {
+        HtlcPart {
+            htlc_id,
+            amount_msat: Msat::from_msat(amount_msat),
+            cltv_expiry: 800_000,
+            payment_hash: [1u8; 32],
+            arrived_at: Instant::now(),
+            onion_payload: TlvStream::default(),
+            extra_tlvs: TlvStream::default(),
+            in_channel: ShortChannelId::from(999u64),
+        }
+    }
+
+    fn test_txid() -> Txid {
+        "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_collecting_part_arrived_not_enough() {
+        let mut session = test_session();
+        let part = test_htlc_part(1, 50_000); // Only 50k, need 100k
+
+        let result = session.apply(SessionInput::PartArrived { part });
+
+        assert_eq!(session.phase(), SessionPhase::Collecting);
+        assert_eq!(result.events.len(), 1);
+        assert!(matches!(
+            result.events[0],
+            SessionEvent::HtlcPartReceived { parts_count: 1, .. }
+        ));
+        assert!(result.outputs.is_empty());
+    }
+
+    #[test]
+    fn test_collecting_part_arrived_sum_reached() {
+        let mut session = test_session();
+        let part = test_htlc_part(1, 100_000); // Exactly 100k
+
+        let result = session.apply(SessionInput::PartArrived { part });
+
+        assert_eq!(session.phase(), SessionPhase::Opening);
+        assert_eq!(result.events.len(), 1);
+        assert!(matches!(
+            result.events[0],
+            SessionEvent::ChannelOpenInitiated { .. }
+        ));
+        assert_eq!(result.outputs.len(), 1);
+        assert!(matches!(
+            result.outputs[0],
+            SessionOutput::OpenChannel { .. }
+        ));
+    }
+
+    #[test]
+    fn test_collecting_multiple_parts_sum_reached() {
+        let mut session = test_session();
+
+        // First part: 60k
+        let result1 = session.apply(SessionInput::PartArrived {
+            part: test_htlc_part(1, 60_000),
+        });
+        assert_eq!(session.phase(), SessionPhase::Collecting);
+        assert!(result1.outputs.is_empty());
+
+        // Second part: 50k (total 110k >= 100k)
+        let result2 = session.apply(SessionInput::PartArrived {
+            part: test_htlc_part(2, 50_000),
+        });
+        assert_eq!(session.phase(), SessionPhase::Opening);
+        assert_eq!(result2.outputs.len(), 1);
+    }
+
+    #[test]
+    fn test_collecting_timeout() {
+        let mut session = test_session();
+        session.apply(SessionInput::PartArrived {
+            part: test_htlc_part(1, 50_000),
+        });
+
+        let result = session.apply(SessionInput::CollectTimeout);
+
+        assert_eq!(session.phase(), SessionPhase::Failed);
+        assert!(session.is_terminal());
+        assert_eq!(result.events.len(), 2);
+        assert!(matches!(
+            result.events[0],
+            SessionEvent::CollectTimeout { .. }
+        ));
+        assert_eq!(result.outputs.len(), 1);
+        assert!(matches!(
+            result.outputs[0],
+            SessionOutput::FailHtlcs {
+                failure_code: FailureCode::TemporaryChannelFailure,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_collecting_valid_until_passed() {
+        let mut session = test_session();
+        session.apply(SessionInput::PartArrived {
+            part: test_htlc_part(1, 50_000),
+        });
+
+        let result = session.apply(SessionInput::ValidUntilPassed);
+
+        assert_eq!(session.phase(), SessionPhase::Failed);
+        assert!(matches!(
+            result.outputs[0],
+            SessionOutput::FailHtlcs {
+                failure_code: FailureCode::UnknownNextPeer,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_collecting_unsafe_hold() {
+        let mut session = test_session();
+        session.apply(SessionInput::PartArrived {
+            part: test_htlc_part(1, 50_000),
+        });
+
+        let result = session.apply(SessionInput::UnsafeHold {
+            min_cltv_expiry: 800_000,
+            current_height: 799_998,
+        });
+
+        assert_eq!(session.phase(), SessionPhase::Failed);
+        assert!(matches!(
+            result.events[0],
+            SessionEvent::UnsafeHoldDetected {
+                blocks_remaining: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_opening_funding_signed() {
+        let mut session = test_session();
+        session.apply(SessionInput::PartArrived {
+            part: test_htlc_part(1, 100_000),
+        });
+        assert_eq!(session.phase(), SessionPhase::Opening);
+
+        let result = session.apply(SessionInput::FundingSigned {
+            channel_id: ChannelId([1u8; 32]),
+            funding_txid: test_txid(),
+            funding_outpoint: 0,
+            funding_psbt: "psbt_data".to_string(),
+        });
+
+        assert_eq!(session.phase(), SessionPhase::AwaitingChannelReady);
+        assert_eq!(result.events.len(), 1);
+        assert!(matches!(
+            result.events[0],
+            SessionEvent::ChannelFundingSigned { .. }
+        ));
+    }
+
+    #[test]
+    fn test_opening_client_rejects() {
+        let mut session = test_session();
+        session.apply(SessionInput::PartArrived {
+            part: test_htlc_part(1, 100_000),
+        });
+
+        let result = session.apply(SessionInput::ClientRejectsChannel {
+            error: "nope".to_string(),
+        });
+
+        assert_eq!(session.phase(), SessionPhase::Failed);
+        assert!(matches!(
+            result.outputs[0],
+            SessionOutput::FailHtlcs {
+                failure_code: FailureCode::UnknownNextPeer,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_awaiting_channel_ready_to_forwarding() {
+        let mut session = test_session();
+        session.apply(SessionInput::PartArrived {
+            part: test_htlc_part(1, 100_000),
+        });
+        session.apply(SessionInput::FundingSigned {
+            channel_id: ChannelId([1u8; 32]),
+            funding_txid: test_txid(),
+            funding_outpoint: 0,
+            funding_psbt: "psbt".to_string(),
+        });
+        assert_eq!(session.phase(), SessionPhase::AwaitingChannelReady);
+
+        let result = session.apply(SessionInput::ClientChannelReady {
+            alias_scid: ShortChannelId::from(456u64),
+        });
+
+        assert_eq!(session.phase(), SessionPhase::Forwarding);
+        assert_eq!(result.outputs.len(), 1);
+        assert!(matches!(
+            result.outputs[0],
+            SessionOutput::ForwardHtlcs { .. }
+        ));
+    }
+
+    #[test]
+    fn test_forwarding_commits_to_waiting_preimage() {
+        let mut session = test_session();
+        session.apply(SessionInput::PartArrived {
+            part: test_htlc_part(1, 100_000),
+        });
+        session.apply(SessionInput::FundingSigned {
+            channel_id: ChannelId([1u8; 32]),
+            funding_txid: test_txid(),
+            funding_outpoint: 0,
+            funding_psbt: "psbt".to_string(),
+        });
+        session.apply(SessionInput::ClientChannelReady {
+            alias_scid: ShortChannelId::from(456u64),
+        });
+        assert_eq!(session.phase(), SessionPhase::Forwarding);
+
+        let result = session.apply(SessionInput::ForwardsCommitted);
+
+        assert_eq!(session.phase(), SessionPhase::WaitingPreimage);
+        assert!(matches!(
+            result.events[0],
+            SessionEvent::HtlcsForwarded { .. }
+        ));
+    }
+
+    #[test]
+    fn test_waiting_preimage_received() {
+        let mut session = test_session();
+        session.apply(SessionInput::PartArrived {
+            part: test_htlc_part(1, 100_000),
+        });
+        session.apply(SessionInput::FundingSigned {
+            channel_id: ChannelId([1u8; 32]),
+            funding_txid: test_txid(),
+            funding_outpoint: 0,
+            funding_psbt: "psbt".to_string(),
+        });
+        session.apply(SessionInput::ClientChannelReady {
+            alias_scid: ShortChannelId::from(456u64),
+        });
+        session.apply(SessionInput::ForwardsCommitted);
+        assert_eq!(session.phase(), SessionPhase::WaitingPreimage);
+
+        let result = session.apply(SessionInput::PreimageReceived {
+            preimage: [2u8; 32],
+        });
+
+        assert_eq!(session.phase(), SessionPhase::Settling);
+        assert!(matches!(
+            result.events[0],
+            SessionEvent::HtlcsFulfilled { .. }
+        ));
+        assert!(matches!(
+            result.outputs[0],
+            SessionOutput::BroadcastFunding { .. }
+        ));
+    }
+
+    #[test]
+    fn test_waiting_preimage_client_rejected_to_retry() {
+        let mut session = test_session();
+        session.apply(SessionInput::PartArrived {
+            part: test_htlc_part(1, 100_000),
+        });
+        session.apply(SessionInput::FundingSigned {
+            channel_id: ChannelId([1u8; 32]),
+            funding_txid: test_txid(),
+            funding_outpoint: 0,
+            funding_psbt: "psbt".to_string(),
+        });
+        session.apply(SessionInput::ClientChannelReady {
+            alias_scid: ShortChannelId::from(456u64),
+        });
+        session.apply(SessionInput::ForwardsCommitted);
+
+        let result = session.apply(SessionInput::ClientRejectedPayment);
+
+        assert_eq!(session.phase(), SessionPhase::AwaitingRetry);
+        assert!(matches!(
+            result.events[0],
+            SessionEvent::HtlcsRejectedByClient { retry_count: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn test_awaiting_retry_part_arrived_sum_reached() {
+        let mut session = test_session();
+        // Get to AwaitingRetry state
+        session.apply(SessionInput::PartArrived {
+            part: test_htlc_part(1, 100_000),
+        });
+        session.apply(SessionInput::FundingSigned {
+            channel_id: ChannelId([1u8; 32]),
+            funding_txid: test_txid(),
+            funding_outpoint: 0,
+            funding_psbt: "psbt".to_string(),
+        });
+        session.apply(SessionInput::ClientChannelReady {
+            alias_scid: ShortChannelId::from(456u64),
+        });
+        session.apply(SessionInput::ForwardsCommitted);
+        session.apply(SessionInput::ClientRejectedPayment);
+        assert_eq!(session.phase(), SessionPhase::AwaitingRetry);
+
+        // New payment attempt
+        let result = session.apply(SessionInput::PartArrived {
+            part: test_htlc_part(2, 100_000),
+        });
+
+        assert_eq!(session.phase(), SessionPhase::Forwarding);
+        assert!(matches!(
+            result.outputs[0],
+            SessionOutput::ForwardHtlcs { .. }
+        ));
+    }
+
+    #[test]
+    fn test_awaiting_retry_timeout_abandons() {
+        let mut session = test_session();
+        // Get to AwaitingRetry state
+        session.apply(SessionInput::PartArrived {
+            part: test_htlc_part(1, 100_000),
+        });
+        session.apply(SessionInput::FundingSigned {
+            channel_id: ChannelId([1u8; 32]),
+            funding_txid: test_txid(),
+            funding_outpoint: 0,
+            funding_psbt: "psbt".to_string(),
+        });
+        session.apply(SessionInput::ClientChannelReady {
+            alias_scid: ShortChannelId::from(456u64),
+        });
+        session.apply(SessionInput::ForwardsCommitted);
+        session.apply(SessionInput::ClientRejectedPayment);
+
+        let result = session.apply(SessionInput::CollectTimeout);
+
+        assert_eq!(session.phase(), SessionPhase::Abandoned);
+        assert!(session.is_terminal());
+        assert!(matches!(
+            result.outputs[0],
+            SessionOutput::ReleaseChannel { .. }
+        ));
+    }
+
+    #[test]
+    fn test_settling_funding_broadcasted() {
+        let mut session = test_session();
+        session.apply(SessionInput::PartArrived {
+            part: test_htlc_part(1, 100_000),
+        });
+        session.apply(SessionInput::FundingSigned {
+            channel_id: ChannelId([1u8; 32]),
+            funding_txid: test_txid(),
+            funding_outpoint: 0,
+            funding_psbt: "psbt".to_string(),
+        });
+        session.apply(SessionInput::ClientChannelReady {
+            alias_scid: ShortChannelId::from(456u64),
+        });
+        session.apply(SessionInput::ForwardsCommitted);
+        session.apply(SessionInput::PreimageReceived {
+            preimage: [2u8; 32],
+        });
+        assert_eq!(session.phase(), SessionPhase::Settling);
+
+        let result = session.apply(SessionInput::FundingBroadcasted { txid: test_txid() });
+
+        assert_eq!(session.phase(), SessionPhase::Done);
+        assert!(session.is_terminal());
+        assert!(matches!(
+            result.events[1],
+            SessionEvent::SessionCompleted { .. }
+        ));
+    }
+
+    #[test]
+    fn test_terminal_states_ignore_inputs() {
+        let mut session = test_session();
+        session.apply(SessionInput::PartArrived {
+            part: test_htlc_part(1, 50_000),
+        });
+        session.apply(SessionInput::CollectTimeout);
+        assert_eq!(session.phase(), SessionPhase::Failed);
+
+        // Any input should be ignored
+        let result = session.apply(SessionInput::PartArrived {
+            part: test_htlc_part(2, 50_000),
+        });
+
+        assert_eq!(session.phase(), SessionPhase::Failed);
+        assert!(result.events.is_empty());
+        assert!(result.outputs.is_empty());
+    }
+
+    #[test]
+    fn test_no_mpp_single_part_triggers_immediately() {
+        let scid = ShortChannelId::from(123u64);
+        let session_id = SessionId::from(scid);
+        let config = SessionConfig::new(
+            test_public_key(),
+            test_opening_fee_params(),
+            None, // No MPP - no expected_payment_size
+        );
+        let mut session = Session::new(session_id, config);
+
+        // Any single part should trigger Opening immediately
+        let result = session.apply(SessionInput::PartArrived {
+            part: test_htlc_part(1, 50_000),
+        });
+
+        assert_eq!(session.phase(), SessionPhase::Opening);
+        assert!(matches!(
+            result.outputs[0],
+            SessionOutput::OpenChannel { .. }
+        ));
+    }
+
+    #[test]
+    fn test_forward_instructions_include_fee_deduction() {
+        let mut session = test_session();
+        session.apply(SessionInput::PartArrived {
+            part: test_htlc_part(1, 100_000),
+        });
+        session.apply(SessionInput::FundingSigned {
+            channel_id: ChannelId([1u8; 32]),
+            funding_txid: test_txid(),
+            funding_outpoint: 0,
+            funding_psbt: "psbt".to_string(),
+        });
+
+        let result = session.apply(SessionInput::ClientChannelReady {
+            alias_scid: ShortChannelId::from(456u64),
+        });
+
+        if let SessionOutput::ForwardHtlcs { instructions } = &result.outputs[0] {
+            assert_eq!(instructions.len(), 1);
+            assert_eq!(instructions[0].htlc_id, 1);
+            assert_eq!(
+                instructions[0].forward_to_scid,
+                ShortChannelId::from(456u64)
+            );
+            // Verify extra_tlvs contains opening fee
+            assert!(instructions[0].extra_tlvs.get(TLV_OPENING_FEE).is_some());
+        } else {
+            panic!("Expected ForwardHtlcs output");
+        }
     }
 }
