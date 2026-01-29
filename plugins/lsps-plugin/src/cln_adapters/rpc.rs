@@ -1,8 +1,8 @@
 use crate::{
     core::lsps2::provider::{
-        Blockheight, BlockheightProvider, ChannelInfo, DatastoreProvider,
-        FundChannelCompleteResult, FundChannelStartResult, LightningProvider, Lsps2OfferProvider,
-        SendPsbtResult,
+        Blockheight, BlockheightProvider, ChannelInfo, ChannelState as ProviderChannelState,
+        DatastoreProvider, FundChannelCompleteResult, FundChannelStartResult, LightningProvider,
+        Lsps2OfferProvider, SendPsbtResult,
     },
     proto::{
         lsps0::Msat,
@@ -15,12 +15,15 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::PublicKey;
+use bitcoin::Txid;
 use cln_rpc::{
     model::{
         requests::{
-            DatastoreMode, DatastoreRequest, DeldatastoreRequest, FundchannelRequest,
-            GetinfoRequest, ListdatastoreRequest, ListpeerchannelsRequest,
+            DatastoreMode, DatastoreRequest, DeldatastoreRequest, FundchannelCompleteRequest,
+            FundchannelRequest, FundchannelStartRequest, GetinfoRequest, ListdatastoreRequest,
+            ListpeerchannelsRequest, SendpsbtRequest,
         },
         responses::ListdatastoreResponse,
     },
@@ -30,6 +33,7 @@ use cln_rpc::{
 use core::fmt;
 use serde::Serialize;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 pub const DS_MAIN_KEY: &'static str = "lsps";
 pub const DS_SUB_KEY: &'static str = "lsps2";
@@ -102,37 +106,153 @@ impl LightningProvider for ClnApiRpc {
     }
 
     // -------------------------------------------------------------------------
-    // New methods for MPP flow - to be implemented in Task 6
+    // New methods for MPP flow with withheld funding
     // -------------------------------------------------------------------------
 
     async fn fund_channel_start(
         &self,
-        _peer_id: &PublicKey,
-        _amount_sat: u64,
-        _announce: bool,
-        _mindepth: Option<u32>,
+        peer_id: &PublicKey,
+        amount_sat: u64,
+        announce: bool,
+        mindepth: Option<u32>,
     ) -> Result<FundChannelStartResult> {
-        unimplemented!("fund_channel_start will be implemented in Task 6")
+        let mut rpc = self.create_rpc().await?;
+        let res = rpc
+            .call_typed(&FundchannelStartRequest {
+                id: peer_id.to_owned(),
+                amount: Amount::from_sat(amount_sat),
+                announce: Some(announce),
+                mindepth,
+                feerate: None,
+                close_to: None,
+                push_msat: None,
+                reserve: None,
+                // Request anchors + static_remotekey channel type
+                channel_type: Some(vec![12, 22, 50]),
+            })
+            .await
+            .with_context(|| "calling fundchannel_start")?;
+
+        Ok(FundChannelStartResult {
+            funding_address: res.funding_address,
+            scriptpubkey: res.scriptpubkey,
+            mindepth: res.mindepth,
+        })
     }
 
     async fn fund_channel_complete_withheld(
         &self,
-        _peer_id: &PublicKey,
-        _psbt: &str,
+        peer_id: &PublicKey,
+        psbt: &str,
     ) -> Result<FundChannelCompleteResult> {
-        unimplemented!("fund_channel_complete_withheld will be implemented in Task 6")
+        let mut rpc = self.create_rpc().await?;
+        let res = rpc
+            .call_typed(&FundchannelCompleteRequest {
+                id: peer_id.to_owned(),
+                psbt: psbt.to_string(),
+                // CRITICAL: withhold=true means don't broadcast the funding tx
+                withhold: Some(true),
+            })
+            .await
+            .with_context(|| "calling fundchannel_complete with withhold=true")?;
+
+        // Convert Sha256 to [u8; 32]
+        let channel_id: [u8; 32] = *res.channel_id.as_byte_array();
+
+        Ok(FundChannelCompleteResult {
+            channel_id,
+            commitments_secured: res.commitments_secured,
+        })
     }
 
-    async fn broadcast_funding(&self, _psbt: &str) -> Result<SendPsbtResult> {
-        unimplemented!("broadcast_funding will be implemented in Task 6")
+    async fn broadcast_funding(&self, psbt: &str) -> Result<SendPsbtResult> {
+        let mut rpc = self.create_rpc().await?;
+        let res = rpc
+            .call_typed(&SendpsbtRequest {
+                psbt: psbt.to_string(),
+                reserve: None,
+            })
+            .await
+            .with_context(|| "calling sendpsbt")?;
+
+        // Parse txid string into bitcoin::Txid
+        let txid = Txid::from_str(&res.txid)
+            .with_context(|| format!("parsing txid '{}' from sendpsbt response", res.txid))?;
+
+        Ok(SendPsbtResult { tx: res.tx, txid })
     }
 
     async fn get_channel_info(
         &self,
-        _peer_id: &PublicKey,
-        _channel_id: Option<&[u8; 32]>,
+        peer_id: &PublicKey,
+        channel_id: Option<&[u8; 32]>,
     ) -> Result<Option<ChannelInfo>> {
-        unimplemented!("get_channel_info will be implemented in Task 6")
+        let mut rpc = self.create_rpc().await?;
+        let res = rpc
+            .call_typed(&ListpeerchannelsRequest {
+                id: Some(peer_id.to_owned()),
+                short_channel_id: None,
+            })
+            .await
+            .with_context(|| "calling listpeerchannels")?;
+
+        // Find matching channel
+        let channel = if let Some(cid) = channel_id {
+            res.channels.iter().find(|ch| {
+                ch.channel_id
+                    .as_ref()
+                    .map(|id| *id.as_byte_array() == *cid)
+                    .unwrap_or(false)
+            })
+        } else {
+            // Return first channel if no channel_id specified
+            res.channels.first()
+        };
+
+        let Some(ch) = channel else {
+            return Ok(None);
+        };
+
+        // Convert CLN ChannelState to our ChannelState
+        let state = convert_channel_state(ch.state);
+
+        // Extract channel_id as [u8; 32]
+        let channel_id = ch.channel_id.as_ref().map(|id| *id.as_byte_array());
+
+        // Extract alias SCID (local alias for forwarding before confirmation)
+        let alias_scid = ch.alias.as_ref().and_then(|a| a.local);
+
+        // Extract withheld flag from funding info
+        let withheld = ch.funding.as_ref().and_then(|f| f.withheld);
+
+        Ok(Some(ChannelInfo {
+            state,
+            peer_connected: ch.peer_connected,
+            channel_id,
+            short_channel_id: ch.short_channel_id,
+            alias_scid,
+            withheld,
+        }))
+    }
+}
+
+/// Convert CLN's ChannelState enum to our provider ChannelState.
+fn convert_channel_state(state: ChannelState) -> ProviderChannelState {
+    match state {
+        ChannelState::OPENINGD => ProviderChannelState::Openingd,
+        ChannelState::CHANNELD_AWAITING_LOCKIN => ProviderChannelState::ChanneldAwaitingLockin,
+        ChannelState::CHANNELD_NORMAL => ProviderChannelState::ChanneldNormal,
+        ChannelState::CHANNELD_SHUTTING_DOWN => ProviderChannelState::ChanneldShuttingDown,
+        ChannelState::CLOSINGD_SIGEXCHANGE => ProviderChannelState::ClosingdSigexchange,
+        ChannelState::CLOSINGD_COMPLETE => ProviderChannelState::ClosingdComplete,
+        ChannelState::AWAITING_UNILATERAL => ProviderChannelState::AwaitingUnilateral,
+        ChannelState::FUNDING_SPEND_SEEN => ProviderChannelState::FundingSpendSeen,
+        ChannelState::ONCHAIN => ProviderChannelState::Onchain,
+        ChannelState::DUALOPEND_OPEN_INIT => ProviderChannelState::DualopendOpenInit,
+        ChannelState::DUALOPEND_AWAITING_LOCKIN => ProviderChannelState::DualopendAwaitingLockin,
+        ChannelState::DUALOPEND_OPEN_COMMITTED => ProviderChannelState::DualopendOpenCommitted,
+        ChannelState::DUALOPEND_OPEN_COMMIT_READY => ProviderChannelState::DualopendOpenCommitReady,
+        ChannelState::CHANNELD_AWAITING_SPLICE => ProviderChannelState::ChanneldAwaitingSplice,
     }
 }
 
