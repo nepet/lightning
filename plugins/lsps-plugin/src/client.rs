@@ -526,13 +526,37 @@ async fn on_invoice_payment(
     let mut cln_client = ok_or_continue!(cln_rpc::ClnRpc::new(rpc_path.clone())
         .await
         .context("failed to connect to core-lightning"));
+
+    // First, look up the invoice entry to get the lsp_id
+    let invoice_key = vec!["lsps".to_string(), "invoice".to_string(), hash.to_string()];
+    let lsp_data = ok_or_continue!(cln_client
+        .call_typed(&ListdatastoreRequest {
+            key: Some(invoice_key.clone()),
+        })
+        .await
+        .context("failed to fetch invoice datastore record"));
+
+    // Extract lsp_id and delete client entry if present
+    if let Some(entry) = lsp_data.datastore.first() {
+        if let Some(lsp_id) = entry.string.as_ref() {
+            // Delete the client datastore entry
+            let _ = cln_client
+                .call_typed(&DeldatastoreRequest {
+                    key: vec!["lsps".to_string(), "client".to_string(), lsp_id.clone()],
+                    generation: None,
+                })
+                .await;
+        }
+    }
+
+    // Delete the invoice datastore entry
     ok_or_continue!(cln_client
         .call_typed(&DeldatastoreRequest {
-            key: vec!["lsps".to_string(), "invoice".to_string(), hash.to_string()],
+            key: invoice_key,
             generation: None,
         })
         .await
-        .context("failed to delete datastore record"));
+        .context("failed to delete invoice datastore record"));
 
     Ok(serde_json::json!({"result": "continue"}))
 }
@@ -705,7 +729,10 @@ async fn on_htlc_accepted(
         hex::encode(&req.htlc.payment_hash)
     );
 
-    let total_amt = invoice.amount_msat.unwrap_or(htlc_amt).msat();
+    // For fixed-amount invoices, use the invoice amount (which is already reduced by the fee).
+    // For variable-amount invoices, use the actual HTLC amount since the fee is deducted
+    // from each part by the LSP.
+    let total_amt = invoice.amount_msat.map(|a| a.msat()).unwrap_or_else(|| htlc_amt.msat());
 
     let mut payload = req.onion.payload.clone();
     payload.set_tu64(TLV_FORWARD_AMT, htlc_amt.msat());
@@ -765,19 +792,9 @@ async fn on_openchannel(
             "Allowing zero-conf channel from LSP {}",
             &req.openchannel.id
         );
-        let ds_req = DeldatastoreRequest {
-            generation: None,
-            key: vec![
-                "lsps".to_string(),
-                "client".to_string(),
-                req.openchannel.id.clone(),
-            ],
-        };
-        if let Some(err) = cln_client.call_typed(&ds_req).await.err() {
-            // We can do nothing but report that there was an issue deleting the
-            // datastore record.
-            warn!("Failed to delete LSP record from datastore: {}", err);
-        }
+        // Note: Don't delete the datastore record here - it's still needed by
+        // htlc_accepted to validate extra_fee and process the payment.
+        // Cleanup happens in on_invoice_payment after payment is complete.
         // Fixme: Check that we actually use client-trusts-LSP mode - can be
         // found in the ds record.
         return Ok(serde_json::json!({
