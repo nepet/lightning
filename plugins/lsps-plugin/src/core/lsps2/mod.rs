@@ -3,6 +3,7 @@ pub mod htlc_holder;
 pub mod manager;
 pub mod persistence;
 pub mod provider;
+pub mod psbt;
 pub mod service;
 pub mod session;
 pub mod timeouts;
