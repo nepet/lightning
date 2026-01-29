@@ -264,18 +264,44 @@ where
     where
         F: FnOnce() -> SessionConfig,
     {
-        // Check if session exists
-        {
-            let sessions = self.sessions.lock().await;
+        // Check and create atomically under a single lock to avoid TOCTOU race.
+        // We hold the lock while calling config_fn() to prevent race conditions
+        // where two concurrent calls both see "session doesn't exist" and then
+        // both try to create it.
+        let event_data = {
+            let mut sessions = self.sessions.lock().await;
             if sessions.contains_key(&id) {
-                return Ok(false);
-            }
-        }
+                None // Session already exists
+            } else {
+                // Session doesn't exist - create config and session while holding lock
+                let config = config_fn();
+                let scid = id.0;
+                let client_node_id = config.client_node_id;
+                let payment_size_msat = config.expected_payment_size;
+                let valid_until = config.valid_until();
 
-        // Session doesn't exist, create it
-        let config = config_fn();
-        self.create_session(id, config).await?;
-        Ok(true)
+                let session = Session::new(id, config);
+                sessions.insert(id, session);
+
+                Some((scid, client_node_id, payment_size_msat, valid_until))
+            }
+        }; // Lock released
+
+        // Emit creation event if we created a new session
+        if let Some((scid, client_node_id, payment_size_msat, valid_until)) = event_data {
+            self.event_emitter
+                .emit(SessionEvent::SessionCreated {
+                    session_id: id,
+                    scid,
+                    client_node_id,
+                    payment_size_msat,
+                    valid_until,
+                })
+                .await;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Returns the number of active (non-terminal) sessions.
