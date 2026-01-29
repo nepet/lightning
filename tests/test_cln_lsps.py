@@ -1381,15 +1381,16 @@ def test_lsps2_mpp_withheld_funding_happy_path(node_factory, bitcoind):
         os.path.dirname(__file__), "plugins/hold_htlcs.py"
     )
 
-    # Client uses hold_htlcs to pause preimage delivery for 3 seconds
-    # This gives us time to check mempool state during WaitingPreimage
+    # Client uses hold_htlcs to pause preimage delivery briefly.
+    # Note: hold_htlcs processes HTLCs sequentially, so with 10 HTLCs,
+    # total delay is 10 * hold_time. Using 1 second = 10 seconds total.
     l1, l2, l3 = node_factory.get_nodes(
         3,
         opts=[
             {
                 "experimental-lsps-client": None,
                 "plugin": hold_plugin,
-                "hold-time": 3,
+                "hold-time": 1,
                 "hold-result": "continue",
             },
             {
@@ -1463,7 +1464,7 @@ def test_lsps2_mpp_withheld_funding_happy_path(node_factory, bitcoind):
 
     # Wait for HTLCs to be forwarded to client (client will hold them)
     # The hold_htlcs plugin holds for 3 seconds before continuing
-    l1.daemon.wait_for_log("Holding onto an incoming htlc for 3 seconds")
+    l1.daemon.wait_for_log("Holding onto an incoming htlc for 1 seconds")
 
     # CRITICAL CHECK: During hold, funding tx should NOT be in mempool
     # The withheld flow means we wait for preimage before broadcasting
