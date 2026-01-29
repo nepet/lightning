@@ -1069,3 +1069,129 @@ def test_lsps2_mpp_withheld_funding_happy_path(node_factory, bitcoind):
 
     # Verify client datastore is cleaned up
     verify_cleanup(l1)
+
+
+@unittest.skipUnless(RUST, "RUST is not enabled")
+def test_lsps2_mpp_withheld_funding_client_holds_unsafe(node_factory, bitcoind):
+    """Tests that funding tx is NOT broadcast when client holds HTLC past CLTV.
+
+    This test verifies that with the withheld funding flow, if the client
+    holds the forwarded HTLC without resolving it and the CLTV expiry
+    approaches the safety margin, the funding transaction is never broadcast.
+
+    Setup: 3-node topology with hold_htlcs.py on client (very long hold)
+    Action: Send payment with short CLTV, client holds, mine blocks
+    Expected: Session fails, funding tx never appears in mempool
+    """
+    policy_plugin = os.path.join(
+        os.path.dirname(__file__), "plugins/lsps2_policy.py"
+    )
+    hold_plugin = os.path.join(
+        os.path.dirname(__file__), "plugins/hold_htlcs.py"
+    )
+
+    # Client uses hold_htlcs with very long hold time (won't release)
+    l1, l2, l3 = node_factory.get_nodes(
+        3,
+        opts=[
+            {
+                "experimental-lsps-client": None,
+                "plugin": hold_plugin,
+                "hold-time": 300,  # 5 minutes - effectively forever for this test
+                "hold-result": "continue",
+            },
+            {
+                "experimental-lsps2-service": None,
+                "experimental-lsps2-promise-secret": "0" * 64,
+                "plugin": policy_plugin,
+                "fee-base": 0,
+                "fee-per-satoshi": 0,
+            },
+            {},
+        ],
+    )
+
+    # Give the LSP funds to open JIT channels
+    l2.fundwallet(1_000_000)
+
+    # Create channel between payer and LSP
+    node_factory.join_nodes([l3, l2], fundchannel=True, wait_for_announce=True)
+
+    # Connect client to LSP (no funded channel yet)
+    node_factory.join_nodes([l1, l2], fundchannel=False)
+
+    # Get the channel ID between l3 and l2
+    chanid = only_one(l3.rpc.listpeerchannels(l2.info["id"])["channels"])[
+        "short_channel_id"
+    ]
+
+    # Payment amount
+    amount_msat = 10_000_000
+
+    # Buy JIT channel and create invoice
+    invoice_data = buy_and_create_invoice(l1, l2, amount_msat)
+
+    routehint = invoice_data["routehint"]
+    payment_hash = invoice_data["payment_hash"]
+    payment_secret = invoice_data["payment_secret"]
+    bolt11 = invoice_data["bolt11"]
+
+    # Record initial mempool state
+    initial_mempool_size = bitcoind.rpc.getmempoolinfo()["size"]
+
+    # Send MPP payment with SHORT CLTV delay
+    # The short CLTV means blocks will approach expiry quickly
+    num_parts = 10
+    amount_per_part = amount_msat // num_parts
+
+    route_part = [
+        {
+            "amount_msat": amount_per_part,
+            "id": l2.info["id"],
+            "delay": 15,  # Short CLTV delay
+            "channel": chanid,
+        },
+        {
+            "amount_msat": amount_per_part,
+            "id": l1.info["id"],
+            "delay": 6,
+            "channel": routehint["short_channel_id"],
+        },
+    ]
+
+    for partid in range(1, num_parts + 1):
+        l3.rpc.sendpay(
+            route_part,
+            payment_hash,
+            payment_secret=payment_secret,
+            bolt11=bolt11,
+            amount_msat=f"{amount_msat}msat",
+            groupid=1,
+            partid=partid,
+        )
+
+    # Wait for HTLCs to be forwarded to client (client will hold them)
+    l1.daemon.wait_for_log("Holding onto an incoming htlc for 300 seconds")
+
+    # Mine blocks to bring CLTV close to expiry
+    # With delay=15, cltv_expiry = send_height + 15
+    # Mining 14 blocks means blocks_remaining = 1, which is below margin of 2
+    bitcoind.generate_block(14)
+    sync_blockheight(bitcoind, [l2])
+
+    # The timeout manager should detect unsafe hold and fail the session
+    # The upstream HTLCs will fail via CLTV timeout
+    # Wait for the payment to fail
+    with pytest.raises(RpcError) as exc_info:
+        l3.rpc.waitsendpay(payment_hash, partid=1, groupid=1, timeout=30)
+
+    # Payment should fail (either temporary_channel_failure or CLTV timeout)
+    assert exc_info.value.error["code"] == 204, "Payment should fail"
+
+    # CRITICAL CHECK: Funding tx should NEVER have been broadcast
+    # With withheld flow, we don't broadcast until preimage is received
+    mempool_after_failure = bitcoind.rpc.getmempoolinfo()["size"]
+    assert mempool_after_failure == initial_mempool_size, (
+        f"Funding tx should NOT be in mempool after unsafe hold failure "
+        f"(expected {initial_mempool_size}, got {mempool_after_failure})"
+    )
