@@ -618,8 +618,8 @@ impl FailureCode {
 pub struct ForwardInstruction {
     /// The HTLC ID to forward
     pub htlc_id: u64,
-    /// The SCID to forward to (the new channel's alias)
-    pub forward_to_scid: ShortChannelId,
+    /// The channel_id to forward to (32-byte channel identifier)
+    pub forward_to_channel_id: ChannelId,
     /// Modified onion payload with adjusted forward amount
     pub payload: TlvStream,
     /// Extra TLVs to add (includes opening fee TLV 65537)
@@ -636,12 +636,20 @@ pub enum SessionOutput {
     },
 
     /// Forward HTLCs into the newly ready channel.
+    ///
+    /// The output handler should call `HtlcHolder::release_forward` with
+    /// the given session_id and instructions.
     ForwardHtlcs {
+        session_id: SessionId,
         instructions: Vec<ForwardInstruction>,
     },
 
     /// Fail HTLCs back upstream with the given failure code.
+    ///
+    /// The output handler should call `HtlcHolder::release_fail` with
+    /// the given session_id and failure_code.
     FailHtlcs {
+        session_id: SessionId,
         htlc_ids: Vec<u64>,
         failure_code: FailureCode,
     },
@@ -819,7 +827,7 @@ impl Session {
     fn generate_forward_instructions(
         &self,
         parts: &[HtlcPart],
-        alias_scid: ShortChannelId,
+        channel_id: ChannelId,
     ) -> Vec<ForwardInstruction> {
         let total_msat: u64 = parts.iter().map(|p| p.amount_msat.msat()).sum();
         let opening_fee = self.compute_fee(parts);
@@ -847,7 +855,7 @@ impl Session {
 
                 ForwardInstruction {
                     htlc_id: part.htlc_id,
-                    forward_to_scid: alias_scid,
+                    forward_to_channel_id: channel_id,
                     payload,
                     extra_tlvs,
                 }
@@ -973,6 +981,7 @@ impl Session {
                     },
                 ];
                 let outputs = vec![SessionOutput::FailHtlcs {
+                    session_id: self.id,
                     htlc_ids,
                     failure_code: FailureCode::TemporaryChannelFailure,
                 }];
@@ -1003,6 +1012,7 @@ impl Session {
                     },
                 ];
                 let outputs = vec![SessionOutput::FailHtlcs {
+                    session_id: self.id,
                     htlc_ids,
                     failure_code: FailureCode::UnknownNextPeer,
                 }];
@@ -1032,6 +1042,7 @@ impl Session {
                     },
                 ];
                 let outputs = vec![SessionOutput::FailHtlcs {
+                    session_id: self.id,
                     htlc_ids,
                     failure_code: FailureCode::UnknownNextPeer,
                 }];
@@ -1073,6 +1084,7 @@ impl Session {
                     },
                 ];
                 let outputs = vec![SessionOutput::FailHtlcs {
+                    session_id: self.id,
                     htlc_ids,
                     failure_code: FailureCode::TemporaryChannelFailure,
                 }];
@@ -1136,6 +1148,7 @@ impl Session {
                     },
                 ];
                 let outputs = vec![SessionOutput::FailHtlcs {
+                    session_id: self.id,
                     htlc_ids,
                     failure_code: FailureCode::UnknownNextPeer,
                 }];
@@ -1165,6 +1178,7 @@ impl Session {
                     },
                 ];
                 let outputs = vec![SessionOutput::FailHtlcs {
+                    session_id: self.id,
                     htlc_ids,
                     failure_code: FailureCode::TemporaryChannelFailure,
                 }];
@@ -1203,6 +1217,7 @@ impl Session {
                     },
                 ];
                 let outputs = vec![SessionOutput::FailHtlcs {
+                    session_id: self.id,
                     htlc_ids,
                     failure_code: FailureCode::TemporaryChannelFailure,
                 }];
@@ -1231,13 +1246,16 @@ impl Session {
                 },
                 SessionInput::ClientChannelReady { alias_scid },
             ) => {
-                let instructions = self.generate_forward_instructions(&parts, alias_scid);
+                let instructions = self.generate_forward_instructions(&parts, channel_id);
                 let events = vec![SessionEvent::ChannelReady {
                     session_id: self.id,
                     channel_id,
                     alias_scid,
                 }];
-                let outputs = vec![SessionOutput::ForwardHtlcs { instructions }];
+                let outputs = vec![SessionOutput::ForwardHtlcs {
+                    session_id: self.id,
+                    instructions,
+                }];
 
                 (
                     SessionState::Forwarding {
@@ -1269,6 +1287,7 @@ impl Session {
                     },
                 ];
                 let outputs = vec![SessionOutput::FailHtlcs {
+                    session_id: self.id,
                     htlc_ids,
                     failure_code: FailureCode::TemporaryChannelFailure,
                 }];
@@ -1307,6 +1326,7 @@ impl Session {
                     },
                 ];
                 let outputs = vec![SessionOutput::FailHtlcs {
+                    session_id: self.id,
                     htlc_ids,
                     failure_code: FailureCode::TemporaryChannelFailure,
                 }];
@@ -1381,6 +1401,7 @@ impl Session {
                     },
                 ];
                 let outputs = vec![SessionOutput::FailHtlcs {
+                    session_id: self.id,
                     htlc_ids,
                     failure_code: FailureCode::TemporaryChannelFailure,
                 }];
@@ -1485,6 +1506,7 @@ impl Session {
                     },
                 ];
                 let outputs = vec![SessionOutput::FailHtlcs {
+                    session_id: self.id,
                     htlc_ids,
                     failure_code: FailureCode::TemporaryChannelFailure,
                 }];
@@ -1519,8 +1541,11 @@ impl Session {
 
                 if self.check_sum_reached(&parts) {
                     // Sum reached -> transition to Forwarding
-                    let instructions = self.generate_forward_instructions(&parts, alias_scid);
-                    let outputs = vec![SessionOutput::ForwardHtlcs { instructions }];
+                    let instructions = self.generate_forward_instructions(&parts, channel_id);
+                    let outputs = vec![SessionOutput::ForwardHtlcs {
+                        session_id: self.id,
+                        instructions,
+                    }];
 
                     (
                         SessionState::Forwarding {
@@ -1580,6 +1605,7 @@ impl Session {
                 let mut outputs = vec![SessionOutput::ReleaseChannel { channel_id }];
                 if !htlc_ids.is_empty() {
                     outputs.push(SessionOutput::FailHtlcs {
+                        session_id: self.id,
                         htlc_ids,
                         failure_code: FailureCode::UnknownNextPeer,
                     });
@@ -1622,6 +1648,7 @@ impl Session {
                 let mut outputs = vec![SessionOutput::ReleaseChannel { channel_id }];
                 if !htlc_ids.is_empty() {
                     outputs.push(SessionOutput::FailHtlcs {
+                        session_id: self.id,
                         htlc_ids,
                         failure_code: FailureCode::TemporaryChannelFailure,
                     });
@@ -1668,6 +1695,7 @@ impl Session {
                 let mut outputs = vec![SessionOutput::ReleaseChannel { channel_id }];
                 if !htlc_ids.is_empty() {
                     outputs.push(SessionOutput::FailHtlcs {
+                        session_id: self.id,
                         htlc_ids,
                         failure_code: FailureCode::TemporaryChannelFailure,
                     });
@@ -2417,12 +2445,12 @@ mod tests {
             alias_scid: ShortChannelId::from(456u64),
         });
 
-        if let SessionOutput::ForwardHtlcs { instructions } = &result.outputs[0] {
+        if let SessionOutput::ForwardHtlcs { instructions, .. } = &result.outputs[0] {
             assert_eq!(instructions.len(), 1);
             assert_eq!(instructions[0].htlc_id, 1);
             assert_eq!(
-                instructions[0].forward_to_scid,
-                ShortChannelId::from(456u64)
+                instructions[0].forward_to_channel_id,
+                ChannelId([1u8; 32])
             );
             // Verify extra_tlvs contains opening fee
             assert!(instructions[0].extra_tlvs.get(TLV_OPENING_FEE).is_some());
@@ -2486,6 +2514,7 @@ mod tests {
 
         handler
             .execute(SessionOutput::FailHtlcs {
+                session_id: SessionId::from(ShortChannelId::from(123u64)),
                 htlc_ids: vec![1, 2, 3],
                 failure_code: FailureCode::TemporaryChannelFailure,
             })
@@ -3310,7 +3339,7 @@ mod tests {
             alias_scid: ShortChannelId::from(456u64),
         });
 
-        if let Some(SessionOutput::ForwardHtlcs { instructions }) = result.outputs.first() {
+        if let Some(SessionOutput::ForwardHtlcs { instructions, .. }) = result.outputs.first() {
             assert_eq!(instructions.len(), 3);
             let htlc_ids: Vec<u64> = instructions.iter().map(|i| i.htlc_id).collect();
             assert!(htlc_ids.contains(&1));

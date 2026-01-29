@@ -18,9 +18,9 @@ use std::collections::HashMap;
 
 use tokio::sync::oneshot;
 
-use crate::core::lsps2::session::{FailureCode, ForwardInstruction, SessionId};
+use crate::core::lsps2::session::{ChannelId, FailureCode, ForwardInstruction, SessionId};
 use crate::core::tlv::TlvStream;
-use crate::proto::lsps0::{Msat, ShortChannelId};
+use crate::proto::lsps0::Msat;
 
 // ============================================================================
 // HTLC Response Types
@@ -31,8 +31,8 @@ use crate::proto::lsps0::{Msat, ShortChannelId};
 pub enum HtlcResponse {
     /// Continue forwarding the HTLC with modified payload.
     Continue {
-        /// The short_channel_id to forward to (the new channel's alias)
-        forward_to: ShortChannelId,
+        /// The channel_id to forward to (32-byte channel identifier)
+        forward_to: ChannelId,
         /// The modified onion payload
         payload: TlvStream,
         /// Extra TLVs to add (e.g., opening fee TLV 65537)
@@ -175,7 +175,7 @@ impl HtlcHolder {
         for htlc in htlcs {
             let response = if let Some(instruction) = instruction_map.get(&htlc.info.htlc_id) {
                 HtlcResponse::Continue {
-                    forward_to: instruction.forward_to_scid,
+                    forward_to: instruction.forward_to_channel_id,
                     payload: instruction.payload.clone(),
                     extra_tlvs: instruction.extra_tlvs.clone(),
                 }
@@ -269,6 +269,7 @@ impl HtlcHolder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::lsps0::ShortChannelId;
 
     fn test_session_id() -> SessionId {
         SessionId::from(ShortChannelId::from(123u64))
@@ -315,13 +316,13 @@ mod tests {
         let instructions = vec![
             ForwardInstruction {
                 htlc_id: 1,
-                forward_to_scid: ShortChannelId::from(456u64),
+                forward_to_channel_id: ChannelId([0u8; 32]),
                 payload: TlvStream(vec![]),
                 extra_tlvs: TlvStream(vec![]),
             },
             ForwardInstruction {
                 htlc_id: 2,
-                forward_to_scid: ShortChannelId::from(456u64),
+                forward_to_channel_id: ChannelId([0u8; 32]),
                 payload: TlvStream(vec![]),
                 extra_tlvs: TlvStream(vec![]),
             },
@@ -353,7 +354,7 @@ mod tests {
         // Only provide instruction for htlc_id 1
         let instructions = vec![ForwardInstruction {
             htlc_id: 1,
-            forward_to_scid: ShortChannelId::from(456u64),
+            forward_to_channel_id: ChannelId([0u8; 32]),
             payload: TlvStream(vec![]),
             extra_tlvs: TlvStream(vec![]),
         }];
@@ -496,7 +497,7 @@ mod tests {
         // Release session2
         let instructions = vec![ForwardInstruction {
             htlc_id: 3,
-            forward_to_scid: ShortChannelId::from(456u64),
+            forward_to_channel_id: ChannelId([0u8; 32]),
             payload: TlvStream(vec![]),
             extra_tlvs: TlvStream(vec![]),
         }];
