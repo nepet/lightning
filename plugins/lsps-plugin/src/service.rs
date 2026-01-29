@@ -1050,3 +1050,156 @@ async fn on_disconnect(p: Plugin<State>, v: serde_json::Value) -> Result<(), any
 
     Ok(())
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // JSON Helper Function Tests
+    // ========================================================================
+
+    #[test]
+    fn test_json_continue_format() {
+        let result = json_continue();
+        assert_eq!(result["result"], "continue");
+        assert!(result.get("payload").is_none());
+        assert!(result.get("forward_to").is_none());
+    }
+
+    #[test]
+    fn test_json_continue_forward_format() {
+        let payload = vec![0x01, 0x02, 0x03];
+        let forward_to = vec![0xaa, 0xbb, 0xcc];
+        let extra_tlvs = vec![0xff];
+
+        let result = json_continue_forward(payload, forward_to, extra_tlvs);
+
+        assert_eq!(result["result"], "continue");
+        assert_eq!(result["payload"], "010203");
+        assert_eq!(result["forward_to"], "aabbcc");
+        assert_eq!(result["extra_tlvs"], "ff");
+    }
+
+    #[test]
+    fn test_json_fail_format() {
+        let result = json_fail("1007");
+        assert_eq!(result["result"], "fail");
+        assert_eq!(result["failure_message"], "1007");
+    }
+
+    // ========================================================================
+    // Routing Logic Documentation Tests
+    //
+    // These tests document the expected routing behavior:
+    //
+    // HTLC Routing Decision Tree (in handle_htlc_inner):
+    // ┌────────────────────────────────────────────────────────────────────┐
+    // │ 1. No short_channel_id in onion?                                   │
+    // │    └─ YES → json_continue() [We are final destination]             │
+    // │                                                                    │
+    // │ 2. SCID not in datastore?                                          │
+    // │    └─ YES → json_continue() [Not a JIT session]                    │
+    // │                                                                    │
+    // │ 3. expected_payment_size is Some(_)?                               │
+    // │    └─ YES → handle_mpp_htlc() [MPP session flow]                   │
+    // │    └─ NO  → HtlcAcceptedHookHandler.handle() [No-MPP fast path]    │
+    // └────────────────────────────────────────────────────────────────────┘
+    //
+    // The actual routing logic tests are in:
+    // - htlc.rs tests: Test HtlcAcceptedHookHandler (no-MPP path)
+    // - session.rs tests: Test Session state machine (MPP path)
+    // - manager.rs tests: Test SessionManager (MPP session management)
+    // ========================================================================
+
+    /// This test documents that the no-MPP path produces a forward response.
+    ///
+    /// When `expected_payment_size` is `None`, the HTLC is handled by
+    /// `HtlcAcceptedHookHandler` which produces an `HtlcDecision::Forward`
+    /// for valid HTLCs. This decision is converted to a JSON response with
+    /// `payload`, `forward_to`, and `extra_tlvs` fields.
+    #[test]
+    fn no_mpp_path_produces_forward_response() {
+        // The no-MPP path (HtlcAcceptedHookHandler) produces HtlcDecision::Forward
+        // for valid payments, which gets converted to this JSON structure:
+        let decision = HtlcDecision::Forward {
+            payload: cln_lsps::core::tlv::TlvStream::default(),
+            forward_to: bitcoin::hashes::sha256::Hash::from_byte_array([1u8; 32]),
+            extra_tlvs: cln_lsps::core::tlv::TlvStream::default(),
+        };
+
+        let result = decision_to_response(decision).unwrap();
+
+        assert_eq!(result["result"], "continue");
+        assert!(result.get("forward_to").is_some());
+        // payload and extra_tlvs may be empty but present
+    }
+
+    /// This test documents that the no-MPP path rejects with failure codes.
+    ///
+    /// When validation fails (expired offer, amount out of bounds, etc.),
+    /// `HtlcAcceptedHookHandler` produces `HtlcDecision::Reject` which
+    /// gets converted to a fail response.
+    #[test]
+    fn no_mpp_path_produces_fail_response_on_rejection() {
+        // Test various rejection reasons produce correct failure codes
+        let cases = vec![
+            (
+                RejectReason::OfferExpired {
+                    valid_until: chrono::Utc::now(),
+                },
+                "1007", // TEMPORARY_CHANNEL_FAILURE
+            ),
+            (
+                RejectReason::AmountBelowMinimum {
+                    minimum: Msat::from_msat(1000),
+                },
+                "4010", // UNKNOWN_NEXT_PEER
+            ),
+            (RejectReason::PolicyDenied, "4010"),
+            (RejectReason::FundingFailed, "4010"),
+        ];
+
+        for (reason, expected_code) in cases {
+            let decision = HtlcDecision::Reject { reason };
+            let result = decision_to_response(decision).unwrap();
+
+            assert_eq!(result["result"], "fail");
+            assert_eq!(result["failure_message"], expected_code);
+        }
+    }
+
+    /// This test documents that MppNotSupported rejection continues.
+    ///
+    /// If an MPP HTLC somehow reaches the no-MPP handler (shouldn't happen
+    /// in normal operation), the rejection is converted to a continue
+    /// response to avoid breaking the payment - the sender will retry.
+    #[test]
+    fn mpp_not_supported_rejection_continues() {
+        let decision = HtlcDecision::Reject {
+            reason: RejectReason::MppNotSupported,
+        };
+
+        let result = decision_to_response(decision).unwrap();
+
+        // MppNotSupported converts to continue, not fail
+        assert_eq!(result["result"], "continue");
+        assert!(result.get("failure_message").is_none());
+    }
+
+    /// This test documents that NotOurs decision continues.
+    ///
+    /// When the SCID is not found in the datastore, the handler returns
+    /// `HtlcDecision::NotOurs` which is converted to a continue response.
+    #[test]
+    fn not_ours_decision_continues() {
+        let decision = HtlcDecision::NotOurs;
+        let result = decision_to_response(decision).unwrap();
+
+        assert_eq!(result["result"], "continue");
+    }
+}
