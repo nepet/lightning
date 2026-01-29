@@ -58,6 +58,7 @@ impl SessionOutputHandler for ClnSessionOutputHandler {
         &self,
         output: SessionOutput,
     ) -> Result<Option<SessionInput>, SessionOutputError> {
+        debug!("ClnSessionOutputHandler::execute called with output: {:?}", std::mem::discriminant(&output));
         match output {
             SessionOutput::OpenChannel {
                 client_node_id,

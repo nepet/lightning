@@ -180,7 +180,19 @@ where
 
         // Execute outputs (no lock held)
         // Some outputs produce feedback inputs (e.g., OpenChannel → FundingSigned)
+        log::debug!(
+            "SessionManager::apply_input: executing {} outputs for session {:?}",
+            result.outputs.len(),
+            id
+        );
+        for output in &result.outputs {
+            log::debug!("  Output: {:?}", std::mem::discriminant(output));
+        }
         let feedbacks = self.output_handler.execute_all(result.outputs).await?;
+        log::debug!(
+            "SessionManager::apply_input: execute_all returned {} feedbacks",
+            feedbacks.len()
+        );
 
         // Apply feedback inputs to the same session
         let mut final_phase = new_phase;

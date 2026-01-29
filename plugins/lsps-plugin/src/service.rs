@@ -701,8 +701,16 @@ async fn on_channel_state_changed(
     p: Plugin<State>,
     v: serde_json::Value,
 ) -> Result<(), anyhow::Error> {
-    // Parse the notification
-    let notif: ChannelStateChangedNotification = match serde_json::from_value(v) {
+    // Parse the notification - the value is wrapped in {"channel_state_changed": {...}}
+    let inner = match v.get("channel_state_changed") {
+        Some(inner) => inner.clone(),
+        None => {
+            debug!("Missing 'channel_state_changed' key in notification params");
+            return Ok(());
+        }
+    };
+
+    let notif: ChannelStateChangedNotification = match serde_json::from_value(inner) {
         Ok(n) => n,
         Err(e) => {
             debug!("Failed to parse channel_state_changed notification: {}", e);
@@ -735,21 +743,65 @@ async fn on_channel_state_changed(
         session_id, notif.old_state, notif.new_state
     );
 
-    // Get alias SCID from the notification's short_channel_id field
-    // For zero-conf channels, this should be the alias SCID
-    let alias_scid = notif.short_channel_id;
+    // Get alias SCID from the notification's short_channel_id field.
+    // For zero-conf/withheld channels, the notification may not include the
+    // short_channel_id, so we query the channel info to get the alias SCID.
+    let alias_scid = match notif.short_channel_id {
+        Some(scid) => Some(scid),
+        None => {
+            // Query channel info to get the alias SCID
+            let rpc = ClnApiRpc::new(state.rpc_path.clone());
+            match rpc.get_channel_info(&notif.peer_id, Some(&channel_id)).await {
+                Ok(Some(info)) => {
+                    debug!(
+                        "Got channel info for {}: alias_scid={:?}",
+                        hex::encode(channel_id),
+                        info.alias_scid
+                    );
+                    info.alias_scid
+                }
+                Ok(None) => {
+                    debug!(
+                        "Channel {} not found in listpeerchannels",
+                        hex::encode(channel_id)
+                    );
+                    None
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to get channel info for {}: {}",
+                        hex::encode(channel_id),
+                        e
+                    );
+                    None
+                }
+            }
+        }
+    };
 
     // Map to SessionInput
-    let input = match map_channel_state_changed(notif.new_state, alias_scid) {
+    let input = match map_channel_state_changed(notif.new_state.clone(), alias_scid) {
         Some(input) => input,
         None => {
             trace!(
-                "Channel state {:?} does not trigger session transition",
-                notif.new_state
+                "Channel state {:?} does not trigger session transition (alias_scid={:?})",
+                notif.new_state,
+                alias_scid
             );
             return Ok(());
         }
     };
+
+    // For CHANNELD_NORMAL, add a delay to ensure CLN's internal channel
+    // state is fully ready for HTLC forwarding. This addresses a race condition
+    // where forwards attempted immediately after CHANNELD_NORMAL may fail because
+    // CLN hasn't completed internal setup (channel_update exchange, etc.).
+    // 500ms gives CLN time to exchange channel_updates and register the channel
+    // for forwarding in its internal routing tables.
+    if matches!(notif.new_state, cln_rpc::primitives::ChannelState::CHANNELD_NORMAL) {
+        debug!("Waiting 500ms for channel internal setup before forwarding");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 
     // Apply input to session
     match state.session_manager.apply_input(session_id, input).await {
@@ -870,8 +922,16 @@ async fn on_forward_event(p: Plugin<State>, v: serde_json::Value) -> Result<(), 
 /// client disconnection during channel opening, which should fail the session.
 async fn on_disconnect(p: Plugin<State>, v: serde_json::Value) -> Result<(), anyhow::Error> {
     // Parse the peer_id from the notification
-    // The disconnect notification has format: {"id": "pubkey_hex"}
-    let peer_id: bitcoin::secp256k1::PublicKey = match v.get("id") {
+    // The disconnect notification has format: {"disconnect": {"id": "pubkey_hex"}}
+    let inner = match v.get("disconnect") {
+        Some(inner) => inner,
+        None => {
+            debug!("Missing 'disconnect' key in notification params");
+            return Ok(());
+        }
+    };
+
+    let peer_id: bitcoin::secp256k1::PublicKey = match inner.get("id") {
         Some(serde_json::Value::String(s)) => match s.parse() {
             Ok(pk) => pk,
             Err(e) => {

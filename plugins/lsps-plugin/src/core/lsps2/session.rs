@@ -28,6 +28,14 @@ pub const TLV_OPENING_FEE: u64 = 65537;
 /// Reference: <https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#the-open_channel-message>
 pub const MAX_PARTS: usize = 483;
 
+/// Minimum channel size in satoshis.
+///
+/// CLN requires channels to have at least 10000sat effective capacity after
+/// accounting for reserves. With typical dust limits (546sat per side) plus
+/// anchor reserves, we need a larger funding amount to ensure the effective
+/// capacity meets CLN's minimum. Using 20000sat as a safe minimum.
+pub const MIN_CHANNEL_SIZE_SAT: u64 = 20000;
+
 // ============================================================================
 // Core Types
 // ============================================================================
@@ -850,12 +858,17 @@ impl Session {
     }
 
     /// Compute channel size based on parts and fee params.
+    ///
+    /// Ensures the channel size is at least `MIN_CHANNEL_SIZE_SAT` to meet
+    /// CLN's minimum effective capacity requirements after reserves.
     fn compute_channel_size(&self, parts: &[HtlcPart]) -> u64 {
         let total_msat: u64 = parts.iter().map(|p| p.amount_msat.msat()).sum();
         let opening_fee = self.compute_fee(parts);
         let receivable = total_msat.saturating_sub(opening_fee);
         // Convert to satoshis (floor division)
-        receivable / 1000
+        let size_sat = receivable / 1000;
+        // Ensure minimum channel size for CLN's reserve requirements
+        std::cmp::max(size_sat, MIN_CHANNEL_SIZE_SAT)
     }
 
     /// Generate forward instructions for all parts.

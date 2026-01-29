@@ -455,6 +455,7 @@ def test_lsps2_buyjitchannel_no_mpp_var_invoice(node_factory, bitcoind):
     assert l1.rpc.listdatastore(["lsps"]) == {"datastore": []}
 
 
+@pytest.mark.skip(reason="Mock plugin conflicts with Rust MPP service; use test_lsps2_mpp_* tests instead")
 def test_lsps2_buyjitchannel_mpp_fixed_invoice(node_factory, bitcoind):
     """Tests MPP JIT channel using the Python mock service plugin.
 
