@@ -931,6 +931,427 @@ def test_lsps2_mpp_unsafe_cltv(node_factory, bitcoind):
     assert len(channels) == 0, "No channel should be created on unsafe CLTV hold"
 
 
+@unittest.skipUnless(RUST, "RUST is not enabled")
+def test_lsps2_mpp_delayed_parts(node_factory, bitcoind):
+    """Tests that parts arriving with small delays still complete successfully.
+
+    Verifies that the state machine correctly handles parts that arrive with
+    1-2 second delays between them, staying in Collecting until sum is reached.
+
+    Setup: 3-node topology with l1 (client), l2 (LSP), l3 (payer)
+    Action: Send 5 MPP parts with 1 second delay between each
+    Expected: All parts collected, channel created, payment succeeds
+    """
+    l1, l2, l3, chanid = setup_lsps2_mpp_topology(node_factory, bitcoind)
+
+    amount_msat = 10_000_000
+
+    # Buy JIT channel and create invoice
+    invoice_data = buy_and_create_invoice(l1, l2, amount_msat)
+
+    routehint = invoice_data["routehint"]
+    payment_hash = invoice_data["payment_hash"]
+    payment_secret = invoice_data["payment_secret"]
+    bolt11 = invoice_data["bolt11"]
+
+    # Send 5 parts with 1 second delay between each
+    num_parts = 5
+    amount_per_part = amount_msat // num_parts
+
+    route_part = [
+        {
+            "amount_msat": amount_per_part,
+            "id": l2.info["id"],
+            "delay": routehint["cltv_expiry_delta"] + 6,
+            "channel": chanid,
+        },
+        {
+            "amount_msat": amount_per_part,
+            "id": l1.info["id"],
+            "delay": 6,
+            "channel": routehint["short_channel_id"],
+        },
+    ]
+
+    for partid in range(1, num_parts + 1):
+        l3.rpc.sendpay(
+            route_part,
+            payment_hash,
+            payment_secret=payment_secret,
+            bolt11=bolt11,
+            amount_msat=f"{amount_msat}msat",
+            groupid=1,
+            partid=partid,
+        )
+        if partid < num_parts:
+            time.sleep(1)  # 1 second delay between parts
+
+    # Wait for payment to complete
+    result = l3.rpc.waitsendpay(payment_hash, partid=num_parts, groupid=1, timeout=60)
+
+    # Verify payment succeeded
+    assert result["payment_preimage"], "Payment should have a preimage"
+
+    # Verify JIT channel was created
+    channel = wait_for_jit_channel(l1)
+    assert channel, "JIT channel should exist"
+
+    # Verify client datastore is cleaned up
+    verify_cleanup(l1)
+
+
+@unittest.skipUnless(RUST, "RUST is not enabled")
+def test_lsps2_mpp_client_disconnect_collecting(node_factory, bitcoind):
+    """Tests that HTLCs fail when client disconnects during Collecting phase.
+
+    When the client disconnects while HTLCs are being collected (before sum
+    is reached), the session should fail and all held HTLCs should be failed
+    back to the payer.
+
+    Setup: 3-node topology
+    Action: Send partial payment (5 of 10 parts), then disconnect client
+    Expected: HTLCs fail with temporary_channel_failure, no channel created
+    """
+    l1, l2, l3, chanid = setup_lsps2_mpp_topology(node_factory, bitcoind)
+
+    amount_msat = 10_000_000
+
+    # Buy JIT channel and create invoice
+    invoice_data = buy_and_create_invoice(l1, l2, amount_msat)
+
+    routehint = invoice_data["routehint"]
+    payment_hash = invoice_data["payment_hash"]
+    payment_secret = invoice_data["payment_secret"]
+    bolt11 = invoice_data["bolt11"]
+
+    # Send only 5 of 10 parts (partial - won't trigger channel open)
+    total_parts = 10
+    send_parts = 5
+    amount_per_part = amount_msat // total_parts
+
+    route_part = [
+        {
+            "amount_msat": amount_per_part,
+            "id": l2.info["id"],
+            "delay": routehint["cltv_expiry_delta"] + 6,
+            "channel": chanid,
+        },
+        {
+            "amount_msat": amount_per_part,
+            "id": l1.info["id"],
+            "delay": 6,
+            "channel": routehint["short_channel_id"],
+        },
+    ]
+
+    for partid in range(1, send_parts + 1):
+        l3.rpc.sendpay(
+            route_part,
+            payment_hash,
+            payment_secret=payment_secret,
+            bolt11=bolt11,
+            amount_msat=f"{amount_msat}msat",
+            groupid=1,
+            partid=partid,
+        )
+
+    # Give HTLCs time to be held
+    time.sleep(1)
+
+    # Disconnect client from LSP
+    l1.rpc.disconnect(l2.info["id"], force=True)
+
+    # Wait for HTLCs to fail
+    with pytest.raises(RpcError) as exc_info:
+        l3.rpc.waitsendpay(payment_hash, partid=1, groupid=1, timeout=15)
+
+    # Verify payment failed with temporary_channel_failure (4103)
+    assert exc_info.value.error["code"] == 204
+    assert exc_info.value.error["data"]["failcode"] == 4103
+
+    # Verify no JIT channel was created
+    channels = l1.rpc.listpeerchannels()["channels"]
+    assert len(channels) == 0, "No channel should be created on client disconnect"
+
+
+@unittest.skipUnless(RUST, "RUST is not enabled")
+def test_lsps2_mpp_client_disconnect_awaiting_ready(node_factory, bitcoind):
+    """Tests that HTLCs fail when client disconnects in AwaitingChannelReady.
+
+    When the client disconnects after funding is signed but before channel_ready,
+    the session should fail and all held HTLCs should be failed back.
+
+    Setup: 3-node topology
+    Action: Send full payment to trigger channel open, disconnect during negotiation
+    Expected: HTLCs fail, session cleaned up
+
+    Note: This test relies on timing - we disconnect as soon as we see the
+    channel appear but before it reaches CHANNELD_NORMAL state.
+    """
+    l1, l2, l3, chanid = setup_lsps2_mpp_topology(node_factory, bitcoind)
+
+    amount_msat = 10_000_000
+
+    # Buy JIT channel and create invoice
+    invoice_data = buy_and_create_invoice(l1, l2, amount_msat)
+
+    routehint = invoice_data["routehint"]
+    payment_hash = invoice_data["payment_hash"]
+    payment_secret = invoice_data["payment_secret"]
+    bolt11 = invoice_data["bolt11"]
+
+    # Send full payment to trigger channel open
+    num_parts = 10
+    amount_per_part = amount_msat // num_parts
+
+    route_part = [
+        {
+            "amount_msat": amount_per_part,
+            "id": l2.info["id"],
+            "delay": routehint["cltv_expiry_delta"] + 6,
+            "channel": chanid,
+        },
+        {
+            "amount_msat": amount_per_part,
+            "id": l1.info["id"],
+            "delay": 6,
+            "channel": routehint["short_channel_id"],
+        },
+    ]
+
+    for partid in range(1, num_parts + 1):
+        l3.rpc.sendpay(
+            route_part,
+            payment_hash,
+            payment_secret=payment_secret,
+            bolt11=bolt11,
+            amount_msat=f"{amount_msat}msat",
+            groupid=1,
+            partid=partid,
+        )
+
+    # Wait for channel to start opening (fundchannel_start called)
+    # We look for the LSP log indicating channel open initiated
+    l2.daemon.wait_for_log(r"Executing OpenChannel output for session", timeout=30)
+
+    # Disconnect client immediately to catch it during negotiation
+    l1.rpc.disconnect(l2.info["id"], force=True)
+
+    # Wait for HTLCs to fail
+    with pytest.raises(RpcError) as exc_info:
+        l3.rpc.waitsendpay(payment_hash, partid=1, groupid=1, timeout=30)
+
+    # Verify payment failed
+    assert exc_info.value.error["code"] == 204
+
+
+@unittest.skipUnless(RUST, "RUST is not enabled")
+def test_lsps2_mpp_too_many_parts(node_factory, bitcoind):
+    """Tests that sessions fail when too many HTLC parts arrive.
+
+    The state machine has a MAX_PARTS limit to prevent resource exhaustion.
+    When more parts than allowed arrive, the session should fail with
+    unknown_next_peer error.
+
+    Setup: 3-node topology
+    Action: Send many small parts exceeding MAX_PARTS limit
+    Expected: Session fails with unknown_next_peer (16394), no channel created
+
+    Note: MAX_PARTS is currently 483 in the Rust implementation. We send
+    enough parts to exceed this limit.
+    """
+    l1, l2, l3, chanid = setup_lsps2_mpp_topology(node_factory, bitcoind)
+
+    # Use a large payment amount that we'll split into many tiny parts
+    amount_msat = 100_000_000  # 100,000 sats
+
+    # Buy JIT channel and create invoice
+    invoice_data = buy_and_create_invoice(l1, l2, amount_msat)
+
+    routehint = invoice_data["routehint"]
+    payment_hash = invoice_data["payment_hash"]
+    payment_secret = invoice_data["payment_secret"]
+    bolt11 = invoice_data["bolt11"]
+
+    # Send 500 parts (exceeds MAX_PARTS of 483)
+    # Each part is tiny: 100_000_000 / 500 = 200_000 msat
+    num_parts = 500
+    amount_per_part = amount_msat // num_parts
+
+    route_part = [
+        {
+            "amount_msat": amount_per_part,
+            "id": l2.info["id"],
+            "delay": routehint["cltv_expiry_delta"] + 6,
+            "channel": chanid,
+        },
+        {
+            "amount_msat": amount_per_part,
+            "id": l1.info["id"],
+            "delay": 6,
+            "channel": routehint["short_channel_id"],
+        },
+    ]
+
+    # Send parts until we hit the limit
+    for partid in range(1, num_parts + 1):
+        try:
+            l3.rpc.sendpay(
+                route_part,
+                payment_hash,
+                payment_secret=payment_secret,
+                bolt11=bolt11,
+                amount_msat=f"{amount_msat}msat",
+                groupid=1,
+                partid=partid,
+            )
+        except RpcError:
+            # Some parts may fail immediately if limit already hit
+            break
+
+    # Wait for payment to fail
+    with pytest.raises(RpcError) as exc_info:
+        l3.rpc.waitsendpay(payment_hash, partid=1, groupid=1, timeout=30)
+
+    # Verify payment failed with unknown_next_peer (16394)
+    assert exc_info.value.error["code"] == 204
+    assert exc_info.value.error["data"]["failcode"] == 16394
+
+    # Verify no JIT channel was created
+    channels = l1.rpc.listpeerchannels()["channels"]
+    assert len(channels) == 0, "No channel should be created with too many parts"
+
+
+@unittest.skipUnless(RUST, "RUST is not enabled")
+def test_lsps2_mpp_retry_after_rejection(node_factory, bitcoind):
+    """Tests the retry flow when client rejects the forwarded payment.
+
+    When the client rejects the first payment attempt (e.g., wrong payment
+    details), the session should move to AwaitingRetry state. A second
+    payment attempt should succeed using the same already-opened channel.
+
+    Setup: 3-node topology, client configured to fail first HTLC then accept
+    Action: First payment attempt fails, second attempt succeeds
+    Expected: Same channel is reused, second payment succeeds
+    """
+    policy_plugin = os.path.join(
+        os.path.dirname(__file__), "plugins/lsps2_policy.py"
+    )
+    hold_plugin = os.path.join(
+        os.path.dirname(__file__), "plugins/hold_htlcs.py"
+    )
+
+    # Client will fail the first HTLC attempt
+    l1, l2, l3 = node_factory.get_nodes(
+        3,
+        opts=[
+            {
+                "experimental-lsps-client": None,
+                "plugin": hold_plugin,
+                "hold-time": 1,
+                "hold-result": "fail",  # Fail the first attempt
+            },
+            {
+                "experimental-lsps2-service": None,
+                "experimental-lsps2-promise-secret": "0" * 64,
+                "plugin": policy_plugin,
+                "fee-base": 0,
+                "fee-per-satoshi": 0,
+            },
+            {},
+        ],
+    )
+
+    l2.fundwallet(1_000_000)
+    node_factory.join_nodes([l3, l2], fundchannel=True, wait_for_announce=True)
+    node_factory.join_nodes([l1, l2], fundchannel=False)
+
+    chanid = only_one(l3.rpc.listpeerchannels(l2.info["id"])["channels"])[
+        "short_channel_id"
+    ]
+
+    amount_msat = 10_000_000
+
+    # Buy JIT channel and create invoice
+    invoice_data = buy_and_create_invoice(l1, l2, amount_msat)
+
+    routehint = invoice_data["routehint"]
+    payment_hash = invoice_data["payment_hash"]
+    payment_secret = invoice_data["payment_secret"]
+    bolt11 = invoice_data["bolt11"]
+
+    num_parts = 10
+    amount_per_part = amount_msat // num_parts
+
+    route_part = [
+        {
+            "amount_msat": amount_per_part,
+            "id": l2.info["id"],
+            "delay": routehint["cltv_expiry_delta"] + 6,
+            "channel": chanid,
+        },
+        {
+            "amount_msat": amount_per_part,
+            "id": l1.info["id"],
+            "delay": 6,
+            "channel": routehint["short_channel_id"],
+        },
+    ]
+
+    # First attempt - will be rejected by client
+    for partid in range(1, num_parts + 1):
+        l3.rpc.sendpay(
+            route_part,
+            payment_hash,
+            payment_secret=payment_secret,
+            bolt11=bolt11,
+            amount_msat=f"{amount_msat}msat",
+            groupid=1,
+            partid=partid,
+        )
+
+    # Wait for first attempt to fail
+    with pytest.raises(RpcError):
+        l3.rpc.waitsendpay(payment_hash, partid=1, groupid=1, timeout=30)
+
+    # Channel should exist (opened during first attempt)
+    channels = l1.rpc.listpeerchannels()["channels"]
+    assert len(channels) == 1, "JIT channel should exist after first attempt"
+    channel_id = channels[0]["channel_id"]
+
+    # Reconfigure client to accept HTLCs (restart with different hold-result)
+    l1.stop()
+    l1.daemon.opts["hold-result"] = "continue"
+    l1.start()
+
+    # Reconnect to LSP
+    l1.rpc.connect(l2.info["id"], "localhost", l2.port)
+
+    # Wait for channel to be usable again
+    time.sleep(2)
+
+    # Second attempt - should succeed
+    for partid in range(1, num_parts + 1):
+        l3.rpc.sendpay(
+            route_part,
+            payment_hash,
+            payment_secret=payment_secret,
+            bolt11=bolt11,
+            amount_msat=f"{amount_msat}msat",
+            groupid=2,  # New groupid for retry
+            partid=partid,
+        )
+
+    # Wait for second attempt to succeed
+    result = l3.rpc.waitsendpay(payment_hash, partid=num_parts, groupid=2, timeout=60)
+    assert result["payment_preimage"], "Second attempt should succeed"
+
+    # Verify same channel was used
+    channels = l1.rpc.listpeerchannels()["channels"]
+    assert len(channels) == 1, "Should still have exactly one channel"
+    assert channels[0]["channel_id"] == channel_id, "Same channel should be reused"
+
+
 # ============================================================================
 # Withheld Funding Flow Tests (Task 23)
 # ============================================================================
