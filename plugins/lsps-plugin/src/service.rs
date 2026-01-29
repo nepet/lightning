@@ -1,6 +1,5 @@
 use anyhow::bail;
 use bitcoin::hashes::Hash;
-use std::str::FromStr;
 use cln_lsps::{
     cln_adapters::{
         hooks::service_custommsg_hook,
@@ -21,19 +20,15 @@ use cln_lsps::{
             manager::SessionManager,
             persistence::PersistedPhase,
             provider::{
-                DatastoreProvider, LightningProvider, Lsps2OfferProvider, NoOpEventEmitter,
-                SessionPersistenceProvider,
+                DatastoreProvider, LightningProvider, NoOpEventEmitter, SessionPersistenceProvider,
             },
             service::Lsps2ServiceHandler,
-            session::{ChannelId, HtlcPart, SessionConfig, SessionId, SessionInput, SessionPhase},
+            session::{HtlcPart, SessionConfig, SessionId, SessionInput},
             timeouts::{TimeoutConfig, TimeoutManager},
         },
         server::LspsService,
     },
-    proto::{
-        lsps0::{Msat, ShortChannelId},
-        lsps2::Lsps2PolicyGetChannelCapacityRequest,
-    },
+    proto::lsps0::{Msat, ShortChannelId},
 };
 use cln_plugin::{options, Plugin};
 use cln_rpc::notifications::ChannelStateChangedNotification;
@@ -125,13 +120,12 @@ impl State {
             2,
         );
 
-        let timeout_manager = TimeoutManager::new(
-            session_manager,
-            blockheight_provider,
-            config,
-        );
+        let timeout_manager = TimeoutManager::new(session_manager, blockheight_provider, config);
 
-        debug!("Spawning timeout manager for JIT channel sessions (collect_timeout={}s)", collect_timeout_secs);
+        debug!(
+            "Spawning timeout manager for JIT channel sessions (collect_timeout={}s)",
+            collect_timeout_secs
+        );
         timeout_manager.spawn()
     }
 
@@ -166,7 +160,10 @@ impl State {
             return Ok(());
         }
 
-        debug!("Recovering {} persisted JIT channel session(s)", sessions.len());
+        debug!(
+            "Recovering {} persisted JIT channel session(s)",
+            sessions.len()
+        );
 
         for session in sessions {
             let session_id = session.id();
@@ -480,10 +477,9 @@ async fn handle_mpp_htlc(
 
     // Submit the part to the session
     let input = SessionInput::PartArrived { part };
-    let phase = match state.session_manager.apply_input(session_id, input).await {
+    match state.session_manager.apply_input(session_id, input).await {
         Ok(phase) => {
             debug!("Session {} transitioned to phase: {:?}", session_id, phase);
-            phase
         }
         Err(e) => {
             warn!("Failed to apply input to session {}: {}", session_id, e);
@@ -497,164 +493,6 @@ async fn handle_mpp_htlc(
                 .await;
             return Ok(json_continue());
         }
-    };
-
-    // If the session just transitioned to Opening, spawn the channel opening task
-    if phase == SessionPhase::Opening {
-        let rpc_path = state.rpc_path.clone();
-        let session_manager = Arc::clone(&state.session_manager);
-        let peer_id = ds_entry.peer_id;
-        let opening_fee_params = ds_entry.opening_fee_params.clone();
-
-        tokio::spawn(async move {
-            debug!("Spawning channel opening task for session {}", session_id);
-            let api = ClnApiRpc::new(rpc_path);
-
-            // Compute channel size from expected payment size and fee params
-            let expected_payment_msat = match ds_entry.expected_payment_size {
-                Some(msat) => msat,
-                None => {
-                    warn!("Session {} has no expected_payment_size in Opening", session_id);
-                    return;
-                }
-            };
-
-            // Ask the policy plugin for the channel capacity
-            let ch_cap_req = Lsps2PolicyGetChannelCapacityRequest {
-                opening_fee_params,
-                init_payment_size: expected_payment_msat,
-                scid: jit_scid,
-            };
-            let channel_capacity = match api.get_channel_capacity(&ch_cap_req).await {
-                Ok(resp) => match resp.channel_capacity_msat {
-                    Some(cap) => Msat::from_msat(cap),
-                    None => {
-                        warn!("Policy rejected channel for session {}", session_id);
-                        return;
-                    }
-                },
-                Err(e) => {
-                    warn!("Failed to get channel capacity for session {}: {}", session_id, e);
-                    return;
-                }
-            };
-
-            debug!(
-                "Channel capacity for session {}: {} msat",
-                session_id, channel_capacity.msat()
-            );
-
-            // Use fund_jit_channel (broadcasts immediately - acceptable for now)
-            let (channel_id_hash, txid_str) = match api.fund_jit_channel(&peer_id, &channel_capacity).await {
-                Ok(result) => result,
-                Err(e) => {
-                    warn!("Failed to fund channel for session {}: {:#}", session_id, e);
-                    // TODO: Transition session to Failed state
-                    return;
-                }
-            };
-
-            debug!(
-                "Channel funded for session {}: channel_id={}, txid={}",
-                session_id, channel_id_hash, txid_str
-            );
-
-            let channel_id = ChannelId(*channel_id_hash.as_byte_array());
-            let funding_txid = match bitcoin::Txid::from_str(&txid_str) {
-                Ok(txid) => txid,
-                Err(e) => {
-                    warn!("Failed to parse txid for session {}: {}", session_id, e);
-                    return;
-                }
-            };
-
-            // Apply FundingSigned to transition Opening → AwaitingChannelReady
-            let input = SessionInput::FundingSigned {
-                channel_id,
-                funding_txid,
-                funding_outpoint: 0, // Not needed for non-withheld flow
-                funding_psbt: String::new(), // Not needed for non-withheld flow
-            };
-
-            match session_manager.apply_input(session_id, input).await {
-                Ok(new_phase) => {
-                    debug!(
-                        "Session {} transitioned to {:?} after FundingSigned",
-                        session_id, new_phase
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to apply FundingSigned to session {}: {}",
-                        session_id, e
-                    );
-                    return;
-                }
-            }
-
-            // Poll for channel_ready (CHANNELD_NORMAL state)
-            let channel_id_bytes = *channel_id_hash.as_byte_array();
-            loop {
-                match api.get_channel_info(&peer_id, Some(&channel_id_bytes)).await {
-                    Ok(Some(info)) => {
-                        if info.state == cln_lsps::core::lsps2::provider::ChannelState::ChanneldNormal {
-                            // Channel is ready - get alias SCID for forwarding
-                            let alias_scid = info.alias_scid
-                                .or(info.short_channel_id)
-                                .unwrap_or_else(|| ShortChannelId::from(0u64));
-
-                            debug!(
-                                "Channel ready for session {}, alias_scid={}",
-                                session_id, alias_scid
-                            );
-
-                            // Apply ClientChannelReady to transition AwaitingChannelReady → Forwarding
-                            // This also produces ForwardHtlcs output which releases held HTLCs
-                            let input = SessionInput::ClientChannelReady { alias_scid };
-                            match session_manager.apply_input(session_id, input).await {
-                                Ok(new_phase) => {
-                                    debug!(
-                                        "Session {} transitioned to {:?} after ClientChannelReady",
-                                        session_id, new_phase
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to apply ClientChannelReady to session {}: {}",
-                                        session_id, e
-                                    );
-                                    break;
-                                }
-                            }
-
-                            // Apply ForwardsCommitted to transition Forwarding → WaitingPreimage
-                            match session_manager.apply_input(session_id, SessionInput::ForwardsCommitted).await {
-                                Ok(new_phase) => {
-                                    debug!(
-                                        "Session {} transitioned to {:?} after ForwardsCommitted",
-                                        session_id, new_phase
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to apply ForwardsCommitted to session {}: {}",
-                                        session_id, e
-                                    );
-                                }
-                            }
-                            break;
-                        }
-                    }
-                    Ok(None) => {
-                        debug!("Channel not found yet for session {}", session_id);
-                    }
-                    Err(e) => {
-                        warn!("Error checking channel state for session {}: {}", session_id, e);
-                    }
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-            }
-        });
     }
 
     // Await the response from the HTLC holder
