@@ -1252,6 +1252,7 @@ def test_lsps2_mpp_retry_after_rejection(node_factory, bitcoind):
                 "plugin": hold_plugin,
                 "hold-time": 1,
                 "hold-result": "fail",  # Fail the first attempt
+                "may_reconnect": True,  # Test restarts l1 and reconnects
             },
             {
                 "experimental-lsps2-service": None,
@@ -1259,6 +1260,7 @@ def test_lsps2_mpp_retry_after_rejection(node_factory, bitcoind):
                 "plugin": policy_plugin,
                 "fee-base": 0,
                 "fee-per-satoshi": 0,
+                "may_reconnect": True,  # Test reconnects l1 to l2
             },
             {},
         ],
@@ -1312,9 +1314,11 @@ def test_lsps2_mpp_retry_after_rejection(node_factory, bitcoind):
             partid=partid,
         )
 
-    # Wait for first attempt to fail
-    with pytest.raises(RpcError):
-        l3.rpc.waitsendpay(payment_hash, partid=1, groupid=1, timeout=30)
+    # Wait for ALL parts of first attempt to fail
+    # CLN requires all parts of a groupid to complete before starting a new group
+    for partid in range(1, num_parts + 1):
+        with pytest.raises(RpcError):
+            l3.rpc.waitsendpay(payment_hash, partid=partid, groupid=1, timeout=30)
 
     # Channel should exist (opened during first attempt)
     channels = l1.rpc.listpeerchannels()["channels"]
