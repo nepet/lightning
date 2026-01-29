@@ -117,6 +117,107 @@ impl State {
         debug!("Spawning timeout manager for JIT channel sessions");
         timeout_manager.spawn()
     }
+
+    /// Recover persisted sessions after a restart.
+    ///
+    /// This should be called after the plugin starts to handle sessions
+    /// that were in progress when CLN was shut down or crashed.
+    ///
+    /// # Critical Recovery
+    ///
+    /// Sessions in `Settling` phase have received the preimage but haven't
+    /// broadcast the funding transaction. This is a CRITICAL state - we MUST
+    /// broadcast the funding transaction to secure the channel. Failing to do
+    /// so means the client can claim the payment but the LSP loses the channel.
+    ///
+    /// # Non-Critical Recovery
+    ///
+    /// Sessions in other phases (Opening, AwaitingChannelReady, Forwarding,
+    /// WaitingPreimage, AwaitingRetry) cannot be fully recovered because:
+    /// - HTLCs held in hooks are lost on restart (CLN fails them)
+    /// - The sender will retry when their HTLCs timeout
+    ///
+    /// For these sessions, we log a warning and delete the persisted state.
+    pub async fn recover_sessions(&self) -> Result<(), anyhow::Error> {
+        let rpc = ClnApiRpc::new(self.rpc_path.clone());
+
+        // Load all persisted sessions
+        let sessions = rpc.load_all_sessions().await?;
+
+        if sessions.is_empty() {
+            debug!("No persisted JIT channel sessions to recover");
+            return Ok(());
+        }
+
+        debug!("Recovering {} persisted JIT channel session(s)", sessions.len());
+
+        for session in sessions {
+            let session_id = session.id();
+            let phase_name = session.phase.name();
+
+            if session.phase.requires_broadcast() {
+                // CRITICAL: Session in Settling phase - must broadcast funding!
+                if let PersistedPhase::Settling {
+                    funding_psbt,
+                    preimage,
+                    channel_id,
+                } = &session.phase
+                {
+                    warn!(
+                        "Recovering session {:?} in Settling phase - broadcasting funding transaction",
+                        session_id
+                    );
+
+                    match rpc.broadcast_funding(funding_psbt).await {
+                        Ok(result) => {
+                            debug!(
+                                "Successfully broadcast funding for recovered session {:?}: txid={}",
+                                session_id, result.txid
+                            );
+
+                            // Delete the persisted session - recovery complete
+                            if let Err(e) = rpc.delete_session(session_id).await {
+                                warn!(
+                                    "Failed to delete recovered session {:?} from datastore: {}",
+                                    session_id, e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            // This is a critical error - log prominently
+                            error!(
+                                "CRITICAL: Failed to broadcast funding for session {:?}: {} \
+                                 (channel_id={}, preimage={}). \
+                                 Manual intervention may be required!",
+                                session_id,
+                                e,
+                                hex::encode(channel_id),
+                                hex::encode(preimage)
+                            );
+                            // Don't delete - keep for retry on next restart
+                        }
+                    }
+                }
+            } else {
+                // Non-critical phases - HTLCs are lost, sender will retry
+                warn!(
+                    "Session {:?} in phase '{}' cannot be fully recovered - \
+                     held HTLCs were lost on restart, sender will retry",
+                    session_id, phase_name
+                );
+
+                // Delete the persisted session - can't recover it
+                if let Err(e) = rpc.delete_session(session_id).await {
+                    warn!(
+                        "Failed to delete unrecoverable session {:?} from datastore: {}",
+                        session_id, e
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl ServiceState for State {
@@ -192,6 +293,13 @@ async fn main() -> Result<(), anyhow::Error> {
                 // Clone state before moving into plugin so we can use it to spawn background tasks
                 let state_for_tasks = state.clone();
                 let plugin = plugin.start(state).await?;
+
+                // Recover any persisted sessions from previous runs
+                // This is critical for sessions in Settling phase that need to broadcast funding
+                if let Err(e) = state_for_tasks.recover_sessions().await {
+                    error!("Failed to recover persisted sessions: {}", e);
+                    // Continue anyway - don't fail startup due to recovery errors
+                }
 
                 // Spawn timeout manager background task
                 let _timeout_handle = state_for_tasks.spawn_timeout_manager();
