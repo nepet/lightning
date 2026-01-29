@@ -1768,3 +1768,226 @@ def test_lsps2_mpp_abandoned_session_releases_utxos(node_factory, bitcoind):
         f"Funding tx should NOT be in mempool after session abandoned "
         f"(expected {initial_mempool_size}, got {mempool_after_abandon})"
     )
+
+
+# ============================================================================
+# LSPS2 Client Security Tests
+# ============================================================================
+# These tests verify that the LSPS2 client properly validates extra_fee TLVs
+# to prevent malicious LSPs from stealing funds.
+
+
+@pytest.mark.xfail(reason="Client doesn't validate extra_fee TLV - vulnerability to be fixed")
+def test_lsps2_client_rejects_inflated_extra_fee(node_factory, bitcoind):
+    """Test that client rejects extra_fee TLV exceeding agreed opening_fee.
+
+    Attack: Malicious LSP sends extra_fee=10M when opening_fee=1M.
+    Expected: Client MUST reject the HTLC with temporary_channel_failure.
+
+    Per LSPS2 spec: "client MUST check that sum of all extra_fees <= opening_fee"
+    """
+    # Use the malicious mock plugin
+    malicious_plugin = os.path.join(
+        os.path.dirname(__file__), "plugins/lsps2_malicious_mock.py"
+    )
+
+    l1, l2, l3 = node_factory.get_nodes(
+        3,
+        opts=[
+            {"experimental-lsps-client": None},
+            {
+                "experimental-lsps2-service": None,
+                "experimental-lsps2-promise-secret": "0" * 64,
+                "plugin": malicious_plugin,
+                "fee-base": 0,
+                "fee-per-satoshi": 0,
+            },
+            {},
+        ],
+    )
+
+    # Give the LSP funds to open JIT channels
+    l2.fundwallet(1_000_000)
+
+    # Create channels
+    node_factory.join_nodes([l3, l2], fundchannel=True, wait_for_announce=True)
+    node_factory.join_nodes([l1, l2], fundchannel=False)
+
+    chanid = only_one(l3.rpc.listpeerchannels(l2.info["id"])["channels"])[
+        "short_channel_id"
+    ]
+
+    # Create invoice with 10M msat amount (opening fee will be 1M msat)
+    amt = 10_000_000
+    inv = l1.rpc.lsps_lsps2_invoice(
+        lsp_id=l2.info["id"],
+        amount_msat=f"{amt}msat",
+        description="security-test-inflated-fee",
+        label="security-test-inflated-fee",
+    )
+    dec = l3.rpc.decode(inv["bolt11"])
+    routehint = only_one(only_one(dec["routes"]))
+
+    # Setup malicious LSP: actual opening_fee is 1M, but send 10M in TLV
+    opening_fee_msat = 1_000_000
+    malicious_extra_fee_msat = 10_000_000  # 10x the agreed fee!
+
+    l2.rpc.setuplsps2service(
+        peer_id=l1.info["id"],
+        channel_cap=100_000,
+        opening_fee_msat=opening_fee_msat,
+        malicious_extra_fee_msat=malicious_extra_fee_msat,
+    )
+
+    # Send single-part payment
+    route = [
+        {
+            "amount_msat": amt,
+            "id": l2.info["id"],
+            "delay": routehint["cltv_expiry_delta"] + 6,
+            "channel": chanid,
+        },
+        {
+            "amount_msat": amt,
+            "id": l1.info["id"],
+            "delay": 6,
+            "channel": routehint["short_channel_id"],
+        },
+    ]
+
+    l3.rpc.sendpay(
+        route,
+        dec["payment_hash"],
+        payment_secret=inv["payment_secret"],
+        bolt11=inv["bolt11"],
+        amount_msat=f"{amt}msat",
+        groupid=1,
+        partid=1,
+    )
+
+    # Client MUST reject the HTLC because extra_fee (10M) > opening_fee (1M)
+    # The payment should fail with a temporary_channel_failure or similar
+    with pytest.raises(RpcError) as exc_info:
+        l3.rpc.waitsendpay(dec["payment_hash"], partid=1, groupid=1, timeout=30)
+
+    # Verify the failure is from the client rejecting the malicious TLV
+    # (not from some other cause like channel not ready)
+    assert "WIRE_TEMPORARY_CHANNEL_FAILURE" in str(exc_info.value) or \
+           "WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS" in str(exc_info.value), \
+           f"Expected client to reject malicious extra_fee, got: {exc_info.value}"
+
+
+@pytest.mark.xfail(reason="Client doesn't track cumulative extra_fee - vulnerability to be fixed")
+def test_lsps2_client_rejects_cumulative_extra_fee_overflow(node_factory, bitcoind):
+    """Test that client tracks cumulative extra_fee across MPP parts.
+
+    Attack: Malicious LSP sends extra_fee=600K on each of 10 parts.
+    Total claimed: 6M msat, but agreed opening_fee is only 1M msat.
+    Expected: Client MUST reject when cumulative extra_fee exceeds opening_fee.
+
+    Per LSPS2 spec: "client MUST check that sum of all extra_fees <= opening_fee"
+    """
+    # Use the malicious mock plugin
+    malicious_plugin = os.path.join(
+        os.path.dirname(__file__), "plugins/lsps2_malicious_mock.py"
+    )
+
+    l1, l2, l3 = node_factory.get_nodes(
+        3,
+        opts=[
+            {"experimental-lsps-client": None},
+            {
+                "experimental-lsps2-service": None,
+                "experimental-lsps2-promise-secret": "0" * 64,
+                "plugin": malicious_plugin,
+                "fee-base": 0,
+                "fee-per-satoshi": 0,
+            },
+            {},
+        ],
+    )
+
+    # Give the LSP funds
+    l2.fundwallet(1_000_000)
+
+    # Create channels
+    node_factory.join_nodes([l3, l2], fundchannel=True, wait_for_announce=True)
+    node_factory.join_nodes([l1, l2], fundchannel=False)
+
+    chanid = only_one(l3.rpc.listpeerchannels(l2.info["id"])["channels"])[
+        "short_channel_id"
+    ]
+
+    # Create invoice
+    amt = 10_000_000
+    inv = l1.rpc.lsps_lsps2_invoice(
+        lsp_id=l2.info["id"],
+        amount_msat=f"{amt}msat",
+        description="security-test-cumulative-fee",
+        label="security-test-cumulative-fee",
+    )
+    dec = l3.rpc.decode(inv["bolt11"])
+    routehint = only_one(only_one(dec["routes"]))
+
+    # Setup malicious LSP: opening_fee is 1M, but each part claims 600K
+    # With 10 parts, total claimed fee would be 6M (6x the agreed fee!)
+    opening_fee_msat = 1_000_000
+    malicious_per_part_fee_msat = 600_000  # Each part claims 600K
+
+    l2.rpc.setuplsps2service(
+        peer_id=l1.info["id"],
+        channel_cap=100_000,
+        opening_fee_msat=opening_fee_msat,
+        malicious_per_part_fee_msat=malicious_per_part_fee_msat,
+    )
+
+    # Send 10-part MPP payment
+    parts = 10
+    route_part = [
+        {
+            "amount_msat": amt // parts,
+            "id": l2.info["id"],
+            "delay": routehint["cltv_expiry_delta"] + 6,
+            "channel": chanid,
+        },
+        {
+            "amount_msat": amt // parts,
+            "id": l1.info["id"],
+            "delay": 6,
+            "channel": routehint["short_channel_id"],
+        },
+    ]
+
+    # Send all parts - client should reject at some point when cumulative
+    # extra_fee exceeds opening_fee (after 2nd part: 1.2M > 1M)
+    payment_failed = False
+    for partid in range(1, parts + 1):
+        try:
+            l3.rpc.sendpay(
+                route_part,
+                dec["payment_hash"],
+                payment_secret=inv["payment_secret"],
+                bolt11=inv["bolt11"],
+                amount_msat=f"{amt}msat",
+                groupid=1,
+                partid=partid,
+            )
+        except RpcError:
+            payment_failed = True
+            break
+
+    # If sendpay didn't fail, wait for the payment to complete/fail
+    if not payment_failed:
+        try:
+            l3.rpc.waitsendpay(dec["payment_hash"], partid=parts, groupid=1, timeout=30)
+            # If we get here, the payment succeeded - vulnerability exists!
+            pytest.fail(
+                "Payment should have failed: client accepted cumulative extra_fee "
+                f"of {parts * malicious_per_part_fee_msat} msat but opening_fee was "
+                f"only {opening_fee_msat} msat"
+            )
+        except RpcError as e:
+            # Payment failed - this is expected if client properly validates
+            assert "WIRE_TEMPORARY_CHANNEL_FAILURE" in str(e) or \
+                   "WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS" in str(e), \
+                   f"Unexpected error type: {e}"
