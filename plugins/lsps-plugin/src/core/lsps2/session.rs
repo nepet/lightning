@@ -10,6 +10,7 @@ use crate::proto::lsps2::{compute_opening_fee, OpeningFeeParams};
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::Txid;
 use chrono::Utc;
+use log::debug;
 use std::time::Instant;
 
 /// TLV type for the opening fee deducted from the forwarded amount.
@@ -708,6 +709,10 @@ pub struct Session {
 impl Session {
     /// Creates a new session in the Collecting state.
     pub fn new(id: SessionId, config: SessionConfig) -> Self {
+        debug!(
+            "Session::new: id={}, expected_payment_size={:?}",
+            id, config.expected_payment_size
+        );
         Self {
             id,
             config,
@@ -797,8 +802,23 @@ impl Session {
     /// Check if collected parts sum reaches expected payment size.
     fn check_sum_reached(&self, parts: &[HtlcPart]) -> bool {
         let sum: u64 = parts.iter().map(|p| p.amount_msat.msat()).sum();
+        debug!(
+            "check_sum_reached: sum={}, expected={:?}, parts_count={}",
+            sum,
+            self.config.expected_payment_size,
+            parts.len()
+        );
         match self.config.expected_payment_size {
-            Some(expected) => sum >= expected.msat(),
+            Some(expected) => {
+                let result = sum >= expected.msat();
+                debug!(
+                    "check_sum_reached: {} >= {} = {}",
+                    sum,
+                    expected.msat(),
+                    result
+                );
+                result
+            }
             None => true, // no-MPP: first part triggers immediately
         }
     }

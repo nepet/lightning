@@ -63,7 +63,12 @@ impl LightningProvider for ClnApiRpc {
         peer_id: &PublicKey,
         amount: &Msat,
     ) -> Result<(Sha256, String)> {
+        log::debug!(
+            "fund_jit_channel: connecting to RPC socket at {:?}, peer={}, amount={}",
+            self.rpc_path, peer_id, amount.msat()
+        );
         let mut rpc = self.create_rpc().await?;
+        log::debug!("fund_jit_channel: RPC connected, calling fundchannel");
         let res = rpc
             .call_typed(&FundchannelRequest {
                 announce: Some(false),
@@ -82,6 +87,10 @@ impl LightningProvider for ClnApiRpc {
             })
             .await
             .with_context(|| "calling fundchannel")?;
+        log::debug!(
+            "fund_jit_channel: fundchannel returned channel_id={}, txid={}",
+            res.channel_id, res.txid
+        );
         Ok((res.channel_id, res.txid))
     }
 
