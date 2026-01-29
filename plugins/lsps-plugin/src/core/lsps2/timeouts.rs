@@ -356,7 +356,6 @@ fn input_description(input: &SessionInput) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::lsps2::provider::{NoOpEventEmitter, NoOpOutputHandler};
     use crate::core::lsps2::session::{HtlcPart, SessionConfig, SessionId, SessionPhase};
     use crate::core::tlv::TlvStream;
     use crate::proto::lsps0::{Msat, Ppm, ShortChannelId};
@@ -382,6 +381,7 @@ mod tests {
             }
         }
 
+        #[allow(dead_code)]
         fn set_height(&self, height: u32) {
             self.height.store(height, Ordering::SeqCst);
         }
