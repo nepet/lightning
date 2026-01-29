@@ -2,8 +2,9 @@ use crate::{
     core::lsps2::persistence::PersistedSession,
     core::lsps2::provider::{
         Blockheight, BlockheightProvider, ChannelInfo, ChannelState as ProviderChannelState,
-        DatastoreProvider, FundChannelCompleteResult, FundChannelStartResult, LightningProvider,
-        Lsps2OfferProvider, SendPsbtResult, SessionPersistenceProvider,
+        DatastoreProvider, FundChannelCompleteResult, FundChannelStartResult, FundPsbtResult,
+        LightningProvider, Lsps2OfferProvider, SendPsbtResult, SessionPersistenceProvider,
+        SignPsbtResult,
     },
     core::lsps2::session::SessionId,
     proto::{
@@ -23,13 +24,14 @@ use bitcoin::Txid;
 use cln_rpc::{
     model::{
         requests::{
-            DatastoreMode, DatastoreRequest, DeldatastoreRequest, FundchannelCompleteRequest,
-            FundchannelRequest, FundchannelStartRequest, GetinfoRequest, ListdatastoreRequest,
-            ListpeerchannelsRequest, SendpsbtRequest,
+            CloseRequest, DatastoreMode, DatastoreRequest, DeldatastoreRequest,
+            FundchannelCompleteRequest, FundchannelRequest, FundchannelStartRequest,
+            FundpsbtRequest, GetinfoRequest, ListdatastoreRequest, ListpeerchannelsRequest,
+            SendpsbtRequest, SignpsbtRequest, UnreserveinputsRequest,
         },
         responses::ListdatastoreResponse,
     },
-    primitives::{Amount, AmountOrAll, ChannelState, Sha256, ShortChannelId},
+    primitives::{Amount, AmountOrAll, ChannelState, Feerate, Sha256, ShortChannelId},
     ClnRpc,
 };
 use core::fmt;
@@ -245,6 +247,84 @@ impl LightningProvider for ClnApiRpc {
             alias_scid,
             withheld,
         }))
+    }
+
+    async fn fund_psbt(
+        &self,
+        amount_sat: u64,
+        feerate: &str,
+        startweight: u32,
+    ) -> Result<FundPsbtResult> {
+        let feerate_parsed = Feerate::try_from(feerate)
+            .with_context(|| format!("parsing feerate '{}'", feerate))?;
+
+        let mut rpc = self.create_rpc().await?;
+        let res = rpc
+            .call_typed(&FundpsbtRequest {
+                satoshi: AmountOrAll::Amount(Amount::from_sat(amount_sat)),
+                feerate: feerate_parsed,
+                startweight,
+                excess_as_change: Some(true),
+                opening_anchor_channel: Some(true),
+                reserve: Some(2016),
+                minconf: None,
+                locktime: None,
+                min_witness_weight: None,
+                nonwrapped: None,
+            })
+            .await
+            .with_context(|| "calling fundpsbt")?;
+
+        Ok(FundPsbtResult {
+            psbt: res.psbt,
+            feerate_per_kw: res.feerate_per_kw,
+            estimated_final_weight: res.estimated_final_weight,
+        })
+    }
+
+    async fn sign_psbt(&self, psbt: &str) -> Result<SignPsbtResult> {
+        let mut rpc = self.create_rpc().await?;
+        let res = rpc
+            .call_typed(&SignpsbtRequest {
+                psbt: psbt.to_string(),
+                signonly: None,
+            })
+            .await
+            .with_context(|| "calling signpsbt")?;
+
+        Ok(SignPsbtResult {
+            signed_psbt: res.signed_psbt,
+        })
+    }
+
+    async fn unreserve_inputs(&self, psbt: &str) -> Result<()> {
+        let mut rpc = self.create_rpc().await?;
+        rpc.call_typed(&UnreserveinputsRequest {
+            psbt: psbt.to_string(),
+            reserve: None,
+        })
+        .await
+        .with_context(|| "calling unreserveinputs")?;
+
+        Ok(())
+    }
+
+    async fn close_channel(&self, channel_id: &[u8; 32]) -> Result<()> {
+        let channel_id_hex = hex::encode(channel_id);
+        let mut rpc = self.create_rpc().await?;
+        rpc.call_typed(&CloseRequest {
+            id: channel_id_hex,
+            unilateraltimeout: Some(1),
+            destination: None,
+            fee_negotiation_step: None,
+            force_lease_closed: None,
+            wrong_funding: None,
+            feerange: None,
+        })
+        .await
+        .with_context(|| "calling close on withheld channel")?;
+
+        Ok(())
     }
 }
 

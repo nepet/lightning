@@ -49,6 +49,24 @@ pub struct SendPsbtResult {
     pub txid: Txid,
 }
 
+/// Result from `fundpsbt` RPC call.
+#[derive(Debug, Clone)]
+pub struct FundPsbtResult {
+    /// The base64-encoded PSBT with wallet inputs (no funding output yet).
+    pub psbt: String,
+    /// The feerate used (sat/kW).
+    pub feerate_per_kw: u32,
+    /// The estimated final transaction weight after signing.
+    pub estimated_final_weight: u32,
+}
+
+/// Result from `signpsbt` RPC call.
+#[derive(Debug, Clone)]
+pub struct SignPsbtResult {
+    /// The base64-encoded signed PSBT.
+    pub signed_psbt: String,
+}
+
 /// Channel state from CLN's `listpeerchannels`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelState {
@@ -291,6 +309,58 @@ pub trait LightningProvider: Send + Sync {
             .await?
             .map(|info| info.state))
     }
+
+    // -------------------------------------------------------------------------
+    // PSBT and channel lifecycle methods for withheld funding flow
+    // -------------------------------------------------------------------------
+
+    /// Create a funded PSBT with wallet inputs.
+    ///
+    /// Calls `fundpsbt` RPC to select and reserve UTXOs from the wallet.
+    /// The returned PSBT has **inputs only** — no funding output.
+    /// The caller must add the funding output before passing to
+    /// `fund_channel_complete_withheld`.
+    ///
+    /// # Arguments
+    /// * `amount_sat` - Total amount needed for the funding output
+    /// * `feerate` - Target feerate (e.g. "normal", "urgent", "10000perkw")
+    /// * `startweight` - Estimated weight of the transaction outputs (for fee calculation)
+    async fn fund_psbt(
+        &self,
+        amount_sat: u64,
+        feerate: &str,
+        startweight: u32,
+    ) -> Result<FundPsbtResult>;
+
+    /// Sign a PSBT with the wallet's keys.
+    ///
+    /// Calls `signpsbt` RPC to sign all wallet-owned inputs in the PSBT.
+    /// This must be called after `fund_channel_complete_withheld` (which needs
+    /// the unsigned PSBT to compute the txid for commitment transactions).
+    ///
+    /// # Arguments
+    /// * `psbt` - The base64-encoded PSBT to sign
+    async fn sign_psbt(&self, psbt: &str) -> Result<SignPsbtResult>;
+
+    /// Release reserved UTXOs in a PSBT.
+    ///
+    /// Calls `unreserveinputs` RPC to release UTXOs that were previously
+    /// reserved by `fund_psbt`. Used when abandoning a withheld channel.
+    ///
+    /// # Arguments
+    /// * `psbt` - The base64-encoded PSBT whose inputs should be unreserved
+    async fn unreserve_inputs(&self, psbt: &str) -> Result<()>;
+
+    /// Close a channel.
+    ///
+    /// Calls `close` RPC. For withheld channels, CLN will:
+    /// - NOT broadcast any closing transaction
+    /// - Free all in-flight HTLCs (cascading failure to payer)
+    /// - Delete the channel from state immediately
+    ///
+    /// # Arguments
+    /// * `channel_id` - The 32-byte channel identifier
+    async fn close_channel(&self, channel_id: &[u8; 32]) -> Result<()>;
 }
 
 #[async_trait]

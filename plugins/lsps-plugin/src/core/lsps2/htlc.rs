@@ -239,7 +239,8 @@ impl<A: DatastoreProvider + Lsps2OfferProvider + LightningProvider> HtlcAccepted
 mod tests {
     use super::*;
     use crate::core::lsps2::provider::{
-        ChannelInfo, FundChannelCompleteResult, FundChannelStartResult, SendPsbtResult,
+        ChannelInfo, FundChannelCompleteResult, FundChannelStartResult, FundPsbtResult,
+        SendPsbtResult, SignPsbtResult,
     };
     use crate::core::tlv::TlvStream;
     use crate::proto::lsps0::{Msat, Ppm, ShortChannelId};
@@ -494,6 +495,27 @@ mod tests {
             _peer_id: &PublicKey,
             _channel_id: Option<&[u8; 32]>,
         ) -> AnyResult<Option<ChannelInfo>> {
+            unimplemented!("not needed for HTLC tests")
+        }
+
+        async fn fund_psbt(
+            &self,
+            _amount_sat: u64,
+            _feerate: &str,
+            _startweight: u32,
+        ) -> AnyResult<FundPsbtResult> {
+            unimplemented!("not needed for HTLC tests")
+        }
+
+        async fn sign_psbt(&self, _psbt: &str) -> AnyResult<SignPsbtResult> {
+            unimplemented!("not needed for HTLC tests")
+        }
+
+        async fn unreserve_inputs(&self, _psbt: &str) -> AnyResult<()> {
+            unimplemented!("not needed for HTLC tests")
+        }
+
+        async fn close_channel(&self, _channel_id: &[u8; 32]) -> AnyResult<()> {
             unimplemented!("not needed for HTLC tests")
         }
     }
