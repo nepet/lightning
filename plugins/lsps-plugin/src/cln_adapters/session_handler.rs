@@ -11,7 +11,7 @@ use log::{debug, warn};
 
 use crate::core::lsps2::htlc_holder::HtlcHolder;
 use crate::core::lsps2::provider::{SessionOutputError, SessionOutputHandler};
-use crate::core::lsps2::session::SessionOutput;
+use crate::core::lsps2::session::{SessionInput, SessionOutput};
 
 // ============================================================================
 // CLN Session Output Handler
@@ -46,7 +46,10 @@ impl ClnSessionOutputHandler {
 
 #[async_trait]
 impl SessionOutputHandler for ClnSessionOutputHandler {
-    async fn execute(&self, output: SessionOutput) -> Result<(), SessionOutputError> {
+    async fn execute(
+        &self,
+        output: SessionOutput,
+    ) -> Result<Option<SessionInput>, SessionOutputError> {
         match output {
             SessionOutput::OpenChannel {
                 client_node_id,
@@ -55,8 +58,11 @@ impl SessionOutputHandler for ClnSessionOutputHandler {
                 // TODO: Implement channel opening via fundchannel_start/fundchannel_complete
                 // This requires:
                 // 1. Call fundchannel_start with the client_node_id and channel_size_sat
-                // 2. Wait for the client to accept the channel
-                // 3. Call fundchannel_complete with withheld=true
+                // 2. Call fundpsbt to get wallet inputs
+                // 3. Add funding output to PSBT
+                // 4. Call fundchannel_complete with withheld=true
+                // 5. Sign the PSBT
+                // 6. Return FundingSigned feedback
                 //
                 // For now, log and return success (placeholder)
                 debug!(
@@ -64,7 +70,7 @@ impl SessionOutputHandler for ClnSessionOutputHandler {
                     client_node_id,
                     channel_size_sat
                 );
-                Ok(())
+                Ok(None)
             }
 
             SessionOutput::ForwardHtlcs {
@@ -90,7 +96,7 @@ impl SessionOutputHandler for ClnSessionOutputHandler {
                     "Released HTLCs with forward instructions: session_id={:?}, htlc_count={}",
                     session_id, released
                 );
-                Ok(())
+                Ok(None)
             }
 
             SessionOutput::FailHtlcs {
@@ -119,7 +125,7 @@ impl SessionOutputHandler for ClnSessionOutputHandler {
                     released,
                     failure_code
                 );
-                Ok(())
+                Ok(None)
             }
 
             SessionOutput::BroadcastFunding { psbt } => {
@@ -131,7 +137,7 @@ impl SessionOutputHandler for ClnSessionOutputHandler {
                     "BroadcastFunding output received (not yet implemented): psbt_len={}",
                     psbt.len()
                 );
-                Ok(())
+                Ok(None)
             }
 
             SessionOutput::ReleaseChannel { channel_id } => {
@@ -144,7 +150,7 @@ impl SessionOutputHandler for ClnSessionOutputHandler {
                     "ReleaseChannel output received (not yet implemented): channel_id={:?}",
                     channel_id
                 );
-                Ok(())
+                Ok(None)
             }
         }
     }

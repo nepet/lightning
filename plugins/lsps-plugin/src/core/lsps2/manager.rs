@@ -179,9 +179,30 @@ where
         self.event_emitter.emit_all(result.events).await;
 
         // Execute outputs (no lock held)
-        self.output_handler.execute_all(result.outputs).await?;
+        // Some outputs produce feedback inputs (e.g., OpenChannel → FundingSigned)
+        let feedbacks = self.output_handler.execute_all(result.outputs).await?;
 
-        Ok(new_phase)
+        // Apply feedback inputs to the same session
+        let mut final_phase = new_phase;
+        for feedback in feedbacks {
+            let sub_result = {
+                let mut sessions = self.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(&id) {
+                    let result = session.apply(feedback);
+                    final_phase = session.phase();
+                    Some(result)
+                } else {
+                    None
+                }
+            };
+            if let Some(sub_result) = sub_result {
+                self.event_emitter.emit_all(sub_result.events).await;
+                // Feedback transitions (FundingSigned, FundingBroadcasted) produce
+                // no further outputs, so we don't recurse.
+            }
+        }
+
+        Ok(final_phase)
     }
 
     /// Returns a clone of the session with the given ID, if it exists.
@@ -454,9 +475,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SessionOutputHandler for CapturingOutputHandler {
-        async fn execute(&self, output: SessionOutput) -> Result<(), SessionOutputError> {
+        async fn execute(
+            &self,
+            output: SessionOutput,
+        ) -> Result<Option<SessionInput>, SessionOutputError> {
             self.outputs.lock().unwrap().push(output);
-            Ok(())
+            Ok(None)
         }
     }
 

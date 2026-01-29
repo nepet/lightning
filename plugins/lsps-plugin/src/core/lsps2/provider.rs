@@ -4,7 +4,7 @@ use bitcoin::hashes::sha256::Hash;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::Txid;
 
-use crate::core::lsps2::session::{SessionEvent, SessionOutput};
+use crate::core::lsps2::session::{SessionEvent, SessionInput, SessionOutput};
 use crate::proto::{
     lsps0::{Msat, ShortChannelId},
     lsps2::{
@@ -427,17 +427,35 @@ pub trait SessionEventEmitter: Send + Sync {
 ///
 /// Implementations translate `SessionOutput` commands into actual
 /// CLN RPC calls, hook responses, etc.
+///
+/// Some outputs (e.g., `OpenChannel`, `BroadcastFunding`) produce feedback
+/// that should be applied back to the session as a `SessionInput`. Returning
+/// `Some(input)` signals the caller to apply that input to the same session.
 #[async_trait]
 pub trait SessionOutputHandler: Send + Sync {
     /// Execute a session output command.
-    async fn execute(&self, output: SessionOutput) -> Result<(), SessionOutputError>;
+    ///
+    /// Returns `Some(SessionInput)` if the output produced feedback that
+    /// should be applied back to the session (e.g., `FundingSigned` after
+    /// a successful channel open).
+    async fn execute(
+        &self,
+        output: SessionOutput,
+    ) -> Result<Option<SessionInput>, SessionOutputError>;
 
     /// Execute multiple outputs in order. Stops on first error.
-    async fn execute_all(&self, outputs: Vec<SessionOutput>) -> Result<(), SessionOutputError> {
+    /// Returns all feedback inputs that should be applied back.
+    async fn execute_all(
+        &self,
+        outputs: Vec<SessionOutput>,
+    ) -> Result<Vec<SessionInput>, SessionOutputError> {
+        let mut feedbacks = Vec::new();
         for output in outputs {
-            self.execute(output).await?;
+            if let Some(input) = self.execute(output).await? {
+                feedbacks.push(input);
+            }
         }
-        Ok(())
+        Ok(feedbacks)
     }
 }
 
@@ -462,8 +480,11 @@ pub struct NoOpOutputHandler;
 
 #[async_trait]
 impl SessionOutputHandler for NoOpOutputHandler {
-    async fn execute(&self, _output: SessionOutput) -> Result<(), SessionOutputError> {
-        Ok(())
+    async fn execute(
+        &self,
+        _output: SessionOutput,
+    ) -> Result<Option<SessionInput>, SessionOutputError> {
+        Ok(None)
     }
 }
 

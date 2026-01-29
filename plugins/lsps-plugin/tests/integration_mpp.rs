@@ -171,7 +171,10 @@ impl SimulatingOutputHandler {
 
 #[async_trait]
 impl SessionOutputHandler for SimulatingOutputHandler {
-    async fn execute(&self, output: SessionOutput) -> Result<(), SessionOutputError> {
+    async fn execute(
+        &self,
+        output: SessionOutput,
+    ) -> Result<Option<SessionInput>, SessionOutputError> {
         // Capture the output first
         self.outputs.lock().unwrap().push(output.clone());
 
@@ -185,7 +188,7 @@ impl SessionOutputHandler for SimulatingOutputHandler {
                 // In real implementation, this would call fundchannel_start/complete
                 // For tests, we just record the output and the test will inject
                 // FundingSigned input to continue the flow
-                Ok(())
+                Ok(None)
             }
 
             SessionOutput::ForwardHtlcs {
@@ -197,7 +200,7 @@ impl SessionOutputHandler for SimulatingOutputHandler {
                 self.htlc_holder
                     .release_forward(session_id, instructions)
                     .await;
-                Ok(())
+                Ok(None)
             }
 
             SessionOutput::FailHtlcs {
@@ -207,17 +210,17 @@ impl SessionOutputHandler for SimulatingOutputHandler {
             } => {
                 // Release HTLCs with failure
                 self.htlc_holder.release_fail(session_id, failure_code).await;
-                Ok(())
+                Ok(None)
             }
 
             SessionOutput::BroadcastFunding { .. } => {
                 // Just record, no action needed in tests
-                Ok(())
+                Ok(None)
             }
 
             SessionOutput::ReleaseChannel { .. } => {
                 // Just record, no action needed in tests
-                Ok(())
+                Ok(None)
             }
         }
     }

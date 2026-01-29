@@ -1856,9 +1856,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SessionOutputHandler for CapturingOutputHandler {
-        async fn execute(&self, output: SessionOutput) -> Result<(), SessionOutputError> {
+        async fn execute(
+            &self,
+            output: SessionOutput,
+        ) -> Result<Option<SessionInput>, SessionOutputError> {
             self.outputs.lock().unwrap().push(output);
-            Ok(())
+            Ok(None)
         }
     }
 
