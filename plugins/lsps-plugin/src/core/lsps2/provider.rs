@@ -396,3 +396,75 @@ impl SessionOutputHandler for NoOpOutputHandler {
         Ok(())
     }
 }
+
+// ============================================================================
+// Session Persistence
+// ============================================================================
+
+use crate::core::lsps2::persistence::PersistedSession;
+use crate::core::lsps2::session::SessionId;
+
+/// Trait for persisting and recovering session state.
+///
+/// Implementations store session checkpoints in a persistent store
+/// (e.g., CLN datastore) to enable recovery after restarts.
+///
+/// # Checkpoint Strategy
+///
+/// Sessions should be persisted at critical state transitions:
+/// - `Opening`: After fundchannel_start succeeds
+/// - `AwaitingChannelReady`: After fundchannel_complete with channel_id and PSBT
+/// - `Settling`: After receiving preimage (most critical!)
+///
+/// Sessions in `Collecting` or terminal states (`Done`, `Failed`, `Abandoned`)
+/// do not need to be persisted.
+#[async_trait]
+pub trait SessionPersistenceProvider: Send + Sync {
+    /// Save or update a session checkpoint.
+    ///
+    /// If a session with the same ID already exists, it is replaced.
+    /// This should be called when the session transitions to a new phase.
+    async fn save_session(&self, session: &PersistedSession) -> Result<()>;
+
+    /// Load a session by its ID.
+    ///
+    /// Returns `None` if no session with the given ID exists.
+    async fn load_session(&self, session_id: SessionId) -> Result<Option<PersistedSession>>;
+
+    /// Delete a session from the store.
+    ///
+    /// This should be called when a session reaches a terminal state
+    /// (`Done`, `Failed`, or `Abandoned`) to clean up the datastore.
+    async fn delete_session(&self, session_id: SessionId) -> Result<()>;
+
+    /// Load all persisted sessions.
+    ///
+    /// This is used during startup to recover sessions that were in progress
+    /// when CLN was shut down or crashed.
+    async fn load_all_sessions(&self) -> Result<Vec<PersistedSession>>;
+}
+
+/// No-op persistence provider that doesn't persist anything.
+///
+/// Useful for testing when persistence is not needed.
+#[derive(Debug, Clone, Default)]
+pub struct NoOpPersistenceProvider;
+
+#[async_trait]
+impl SessionPersistenceProvider for NoOpPersistenceProvider {
+    async fn save_session(&self, _session: &PersistedSession) -> Result<()> {
+        Ok(())
+    }
+
+    async fn load_session(&self, _session_id: SessionId) -> Result<Option<PersistedSession>> {
+        Ok(None)
+    }
+
+    async fn delete_session(&self, _session_id: SessionId) -> Result<()> {
+        Ok(())
+    }
+
+    async fn load_all_sessions(&self) -> Result<Vec<PersistedSession>> {
+        Ok(Vec::new())
+    }
+}

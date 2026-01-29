@@ -1,9 +1,11 @@
 use crate::{
+    core::lsps2::persistence::PersistedSession,
     core::lsps2::provider::{
         Blockheight, BlockheightProvider, ChannelInfo, ChannelState as ProviderChannelState,
         DatastoreProvider, FundChannelCompleteResult, FundChannelStartResult, LightningProvider,
-        Lsps2OfferProvider, SendPsbtResult,
+        Lsps2OfferProvider, SendPsbtResult, SessionPersistenceProvider,
     },
+    core::lsps2::session::SessionId,
     proto::{
         lsps0::Msat,
         lsps2::{
@@ -35,8 +37,9 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-pub const DS_MAIN_KEY: &'static str = "lsps";
-pub const DS_SUB_KEY: &'static str = "lsps2";
+pub const DS_MAIN_KEY: &str = "lsps";
+pub const DS_SUB_KEY: &str = "lsps2";
+pub const DS_SESSION_KEY: &str = "session";
 
 #[derive(Clone)]
 pub struct ClnApiRpc {
@@ -457,4 +460,160 @@ where
     Err(DsError::MissingValue {
         key: ds.key.clone(),
     })
+}
+
+// ============================================================================
+// Session Persistence Implementation
+// ============================================================================
+
+impl ClnApiRpc {
+    /// Helper to build the datastore key for a session.
+    fn session_key(session_id: SessionId) -> Vec<String> {
+        vec![
+            DS_MAIN_KEY.to_string(),
+            DS_SUB_KEY.to_string(),
+            DS_SESSION_KEY.to_string(),
+            session_id.0.to_string(),
+        ]
+    }
+
+    /// Helper to build the prefix key for listing all sessions.
+    fn session_prefix_key() -> Vec<String> {
+        vec![
+            DS_MAIN_KEY.to_string(),
+            DS_SUB_KEY.to_string(),
+            DS_SESSION_KEY.to_string(),
+        ]
+    }
+}
+
+#[async_trait]
+impl SessionPersistenceProvider for ClnApiRpc {
+    async fn save_session(&self, session: &PersistedSession) -> Result<()> {
+        let mut rpc = self.create_rpc().await?;
+
+        let json_str = serde_json::to_string(session)
+            .with_context(|| "serializing session for persistence")?;
+
+        let key = Self::session_key(session.id());
+
+        // Use MUST_REPLACE to create or update
+        // Note: CLN datastore doesn't have a direct "upsert" mode,
+        // so we try CREATE_OR_REPLACE which handles both cases
+        let request = DatastoreRequest {
+            key: key.clone(),
+            string: Some(json_str),
+            hex: None,
+            mode: Some(DatastoreMode::CREATE_OR_REPLACE),
+            generation: None,
+        };
+
+        rpc.call_typed(&request)
+            .await
+            .with_context(|| format!("saving session to datastore: {:?}", key))?;
+
+        Ok(())
+    }
+
+    async fn load_session(&self, session_id: SessionId) -> Result<Option<PersistedSession>> {
+        let mut rpc = self.create_rpc().await?;
+
+        let key = Self::session_key(session_id);
+
+        let res = rpc
+            .call_typed(&ListdatastoreRequest {
+                key: Some(key.clone()),
+            })
+            .await
+            .with_context(|| "listing datastore for session")?;
+
+        // Check if the session exists
+        if res.datastore.is_empty() {
+            return Ok(None);
+        }
+
+        // Find the exact key match
+        let ds = res.datastore.iter().find(|d| d.key == key);
+        let Some(ds) = ds else {
+            return Ok(None);
+        };
+
+        // Parse the session from JSON
+        let session = if let Some(s) = &ds.string {
+            serde_json::from_str::<PersistedSession>(s)
+                .with_context(|| "parsing persisted session JSON")?
+        } else if let Some(hx) = &ds.hex {
+            let bytes = hex::decode(hx).with_context(|| "decoding persisted session hex")?;
+            serde_json::from_slice::<PersistedSession>(&bytes)
+                .with_context(|| "parsing persisted session from hex")?
+        } else {
+            return Ok(None);
+        };
+
+        Ok(Some(session))
+    }
+
+    async fn delete_session(&self, session_id: SessionId) -> Result<()> {
+        let mut rpc = self.create_rpc().await?;
+
+        let key = Self::session_key(session_id);
+
+        // Delete the session - ignore if not found
+        let _ = rpc
+            .call_typed(&DeldatastoreRequest {
+                key,
+                generation: None,
+            })
+            .await;
+
+        Ok(())
+    }
+
+    async fn load_all_sessions(&self) -> Result<Vec<PersistedSession>> {
+        let mut rpc = self.create_rpc().await?;
+
+        let prefix = Self::session_prefix_key();
+
+        let res = rpc
+            .call_typed(&ListdatastoreRequest {
+                key: Some(prefix.clone()),
+            })
+            .await
+            .with_context(|| "listing all sessions from datastore")?;
+
+        let mut sessions = Vec::new();
+
+        for ds in &res.datastore {
+            // Only process entries that match our prefix (4 components: lsps/lsps2/session/scid)
+            if ds.key.len() != 4 {
+                continue;
+            }
+
+            // Parse the session
+            let session_result = if let Some(s) = &ds.string {
+                serde_json::from_str::<PersistedSession>(s)
+            } else if let Some(hx) = &ds.hex {
+                match hex::decode(hx) {
+                    Ok(bytes) => serde_json::from_slice::<PersistedSession>(&bytes),
+                    Err(_) => continue, // Skip invalid entries
+                }
+            } else {
+                continue; // Skip entries without data
+            };
+
+            match session_result {
+                Ok(session) => sessions.push(session),
+                Err(e) => {
+                    // Log warning but continue - don't fail recovery due to one bad entry
+                    log::warn!(
+                        "Failed to parse persisted session at key {:?}: {}",
+                        ds.key,
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(sessions)
+    }
 }
