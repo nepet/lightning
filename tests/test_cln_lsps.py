@@ -602,3 +602,37 @@ def test_lsps2_mpp_happy_path_fixed_invoice(node_factory, bitcoind):
 
     # Verify client datastore is cleaned up
     verify_cleanup(l1)
+
+
+@unittest.skipUnless(RUST, "RUST is not enabled")
+def test_lsps2_mpp_many_parts(node_factory, bitcoind):
+    """Tests MPP JIT channel with many HTLC parts (20 parts).
+
+    Verifies that the state machine handles a large number of concurrent HTLC
+    parts correctly: all parts are collected, channel opens after sum is
+    reached, and all HTLCs are forwarded and settle.
+
+    Setup: 3-node topology with l1 (client), l2 (LSP), l3 (payer)
+    Action: Client buys JIT channel, payer sends 20-part MPP payment
+    Expected: All parts collected, channel created, payment succeeds
+    """
+    l1, l2, l3, chanid = setup_lsps2_mpp_topology(node_factory, bitcoind)
+
+    # Payment amount: 10,000,000 msat split into 20 parts (500,000 msat each)
+    amount_msat = 10_000_000
+
+    # Buy JIT channel and create invoice
+    invoice_data = buy_and_create_invoice(l1, l2, amount_msat)
+
+    # Send MPP payment with 20 parts
+    result = send_mpp_parts(l3, l2, l1, chanid, invoice_data, num_parts=20)
+
+    # Verify payment succeeded
+    assert result["payment_preimage"], "Payment should have a preimage"
+
+    # Verify JIT channel was created
+    channel = wait_for_jit_channel(l1)
+    assert channel, "JIT channel should exist"
+
+    # Verify client datastore is cleaned up
+    verify_cleanup(l1)
