@@ -269,6 +269,7 @@ async fn on_lsps_lsps2_approve(
         jit_channel_scid: req.jit_channel_scid.clone(),
         client_trusts_lsp: req.client_trusts_lsp.unwrap_or_default(),
         opening_fee_msat: req.opening_fee_msat,
+        cumulative_extra_fee_msat: 0,
     };
     let ds_rec_json = serde_json::to_string(&ds_rec)?;
 
@@ -615,21 +616,28 @@ async fn on_htlc_accepted(
         .flatten()
         .unwrap_or_default();
 
+    // Calculate proposed cumulative extra_fee for MPP validation
+    let proposed_cumulative = ds_record.cumulative_extra_fee_msat.saturating_add(extra_fee_msat);
+
     debug!(
-        "incoming jit-channel htlc with htlc_amt={}, onion_amt={}, extra_fee={}, opening_fee={:?}",
+        "incoming jit-channel htlc with htlc_amt={}, onion_amt={}, extra_fee={}, \
+         cumulative={}, proposed_cumulative={}, opening_fee={:?}",
         htlc_amt.msat(),
         onion_amt.msat(),
         extra_fee_msat,
+        ds_record.cumulative_extra_fee_msat,
+        proposed_cumulative,
         ds_record.opening_fee_msat
     );
 
-    // SECURITY CHECK: Validate extra_fee does not exceed opening_fee
+    // SECURITY CHECK: Validate cumulative extra_fee does not exceed opening_fee
     // Per LSPS2 spec: "client MUST check that sum of all extra_fees <= opening_fee"
     if let Some(opening_fee) = ds_record.opening_fee_msat {
-        if extra_fee_msat > opening_fee {
+        if proposed_cumulative > opening_fee {
             warn!(
-                "SECURITY: Rejecting HTLC - extra_fee {} exceeds opening_fee {}",
-                extra_fee_msat, opening_fee
+                "SECURITY: Rejecting HTLC - cumulative extra_fee {} (current {} + new {}) \
+                 exceeds opening_fee {}",
+                proposed_cumulative, ds_record.cumulative_extra_fee_msat, extra_fee_msat, opening_fee
             );
             let value = serde_json::to_value(HtlcAcceptedResponse::fail(
                 Some("2002".to_string()), // WIRE_TEMPORARY_CHANNEL_FAILURE
@@ -637,6 +645,31 @@ async fn on_htlc_accepted(
             ))?;
             return Ok(value);
         }
+    }
+
+    // Update datastore with new cumulative extra_fee
+    if extra_fee_msat > 0 {
+        let updated_record = DatastoreRecord {
+            cumulative_extra_fee_msat: proposed_cumulative,
+            ..ds_record
+        };
+        let updated_json = ok_or_continue!(serde_json::to_string(&updated_record)
+            .context("failed to serialize updated DatastoreRecord"));
+
+        ok_or_continue!(cln_client
+            .call_typed(&DatastoreRequest {
+                generation: None,
+                hex: None,
+                mode: Some(DatastoreMode::CREATE_OR_REPLACE),
+                string: Some(updated_json),
+                key: vec![
+                    "lsps".to_string(),
+                    "client".to_string(),
+                    lsp_id.clone(),
+                ],
+            })
+            .await
+            .context("failed to update cumulative extra_fee in datastore"));
     }
 
     if htlc_amt.msat() + extra_fee_msat != onion_amt.msat() {
@@ -962,4 +995,7 @@ struct DatastoreRecord {
     /// The opening fee agreed upon during lsps2.buy, used to validate extra_fee TLVs
     #[serde(default)]
     opening_fee_msat: Option<u64>,
+    /// Cumulative extra_fee received across all HTLC parts (for MPP validation)
+    #[serde(default)]
+    cumulative_extra_fee_msat: u64,
 }
