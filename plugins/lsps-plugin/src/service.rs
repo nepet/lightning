@@ -53,6 +53,13 @@ pub const OPTION_PROMISE_SECRET: options::StringConfigOption =
         "A 64-character hex string that is the secret for promises",
     );
 
+pub const OPTION_COLLECT_TIMEOUT: options::DefaultIntegerConfigOption =
+    options::ConfigOption::new_i64_with_default(
+        "lsps2-collect-timeout",
+        90,
+        "Timeout in seconds for collecting MPP HTLC parts (default: 90)",
+    );
+
 /// Type alias for the SessionManager with CLN-specific handlers.
 type ClnSessionManager = SessionManager<NoOpEventEmitter, ClnSessionOutputHandler>;
 
@@ -102,19 +109,25 @@ impl State {
     ///
     /// This should be called after the plugin starts to begin monitoring
     /// sessions for timeout conditions.
-    pub fn spawn_timeout_manager(&self) -> tokio::task::JoinHandle<()> {
+    pub fn spawn_timeout_manager(&self, collect_timeout_secs: u64) -> tokio::task::JoinHandle<()> {
         let blockheight_provider = Arc::new(ClnApiRpc::new(self.rpc_path.clone()));
 
         // Clone the session manager (Arc internally, so cheap)
         let session_manager = (*self.session_manager).clone();
 
+        let config = TimeoutConfig::new(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(collect_timeout_secs),
+            2,
+        );
+
         let timeout_manager = TimeoutManager::new(
             session_manager,
             blockheight_provider,
-            TimeoutConfig::default(),
+            config,
         );
 
-        debug!("Spawning timeout manager for JIT channel sessions");
+        debug!("Spawning timeout manager for JIT channel sessions (collect_timeout={}s)", collect_timeout_secs);
         timeout_manager.spawn()
     }
 
@@ -235,6 +248,7 @@ async fn main() -> Result<(), anyhow::Error> {
     if let Some(plugin) = cln_plugin::Builder::new(tokio::io::stdin(), tokio::io::stdout())
         .option(OPTION_ENABLED)
         .option(OPTION_PROMISE_SECRET)
+        .option(OPTION_COLLECT_TIMEOUT)
         // FIXME: Temporarily disabled lsp feature to please test cases, this is
         // ok as the feature is optional per spec.
         // We need to ensure that `connectd` only starts after all plugins have
@@ -288,6 +302,8 @@ async fn main() -> Result<(), anyhow::Error> {
                     }
                 };
 
+                let collect_timeout_secs = plugin.option(&OPTION_COLLECT_TIMEOUT)? as u64;
+
                 let state = State::new(rpc_path, &secret);
 
                 // Clone state before moving into plugin so we can use it to spawn background tasks
@@ -302,7 +318,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 }
 
                 // Spawn timeout manager background task
-                let _timeout_handle = state_for_tasks.spawn_timeout_manager();
+                let _timeout_handle = state_for_tasks.spawn_timeout_manager(collect_timeout_secs);
 
                 plugin.join().await
             } else {
