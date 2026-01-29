@@ -929,3 +929,143 @@ def test_lsps2_mpp_unsafe_cltv(node_factory, bitcoind):
     # Verify no JIT channel was created
     channels = l1.rpc.listpeerchannels()["channels"]
     assert len(channels) == 0, "No channel should be created on unsafe CLTV hold"
+
+
+# ============================================================================
+# Withheld Funding Flow Tests (Task 23)
+# ============================================================================
+
+
+@unittest.skipUnless(RUST, "RUST is not enabled")
+def test_lsps2_mpp_withheld_funding_happy_path(node_factory, bitcoind):
+    """Tests that funding tx is broadcast only after preimage is received.
+
+    This test verifies the withheld funding flow:
+    1. LSP opens channel with withheld=true (funding tx not broadcast)
+    2. HTLCs are forwarded to client
+    3. Client holds HTLCs briefly (using hold_htlcs plugin)
+    4. During hold: funding tx should NOT be in mempool
+    5. After preimage received: funding tx SHOULD be in mempool
+
+    Setup: 3-node topology with hold_htlcs.py on client (l1)
+    Action: Client buys JIT channel, payer sends MPP, client holds briefly
+    Expected: Funding tx appears in mempool only after preimage
+    """
+    policy_plugin = os.path.join(
+        os.path.dirname(__file__), "plugins/lsps2_policy.py"
+    )
+    hold_plugin = os.path.join(
+        os.path.dirname(__file__), "plugins/hold_htlcs.py"
+    )
+
+    # Client uses hold_htlcs to pause preimage delivery for 3 seconds
+    # This gives us time to check mempool state during WaitingPreimage
+    l1, l2, l3 = node_factory.get_nodes(
+        3,
+        opts=[
+            {
+                "experimental-lsps-client": None,
+                "plugin": hold_plugin,
+                "hold-time": 3,
+                "hold-result": "continue",
+            },
+            {
+                "experimental-lsps2-service": None,
+                "experimental-lsps2-promise-secret": "0" * 64,
+                "plugin": policy_plugin,
+                "fee-base": 0,
+                "fee-per-satoshi": 0,
+            },
+            {},
+        ],
+    )
+
+    # Give the LSP funds to open JIT channels
+    l2.fundwallet(1_000_000)
+
+    # Create channel between payer and LSP
+    node_factory.join_nodes([l3, l2], fundchannel=True, wait_for_announce=True)
+
+    # Connect client to LSP (no funded channel yet)
+    node_factory.join_nodes([l1, l2], fundchannel=False)
+
+    # Get the channel ID between l3 and l2
+    chanid = only_one(l3.rpc.listpeerchannels(l2.info["id"])["channels"])[
+        "short_channel_id"
+    ]
+
+    # Payment amount
+    amount_msat = 10_000_000
+
+    # Buy JIT channel and create invoice
+    invoice_data = buy_and_create_invoice(l1, l2, amount_msat)
+
+    routehint = invoice_data["routehint"]
+    payment_hash = invoice_data["payment_hash"]
+    payment_secret = invoice_data["payment_secret"]
+    bolt11 = invoice_data["bolt11"]
+
+    # Record initial mempool state
+    initial_mempool_size = bitcoind.rpc.getmempoolinfo()["size"]
+
+    # Send MPP payment (10 parts)
+    num_parts = 10
+    amount_per_part = amount_msat // num_parts
+
+    route_part = [
+        {
+            "amount_msat": amount_per_part,
+            "id": l2.info["id"],
+            "delay": routehint["cltv_expiry_delta"] + 6,
+            "channel": chanid,
+        },
+        {
+            "amount_msat": amount_per_part,
+            "id": l1.info["id"],
+            "delay": 6,
+            "channel": routehint["short_channel_id"],
+        },
+    ]
+
+    for partid in range(1, num_parts + 1):
+        l3.rpc.sendpay(
+            route_part,
+            payment_hash,
+            payment_secret=payment_secret,
+            bolt11=bolt11,
+            amount_msat=f"{amount_msat}msat",
+            groupid=1,
+            partid=partid,
+        )
+
+    # Wait for HTLCs to be forwarded to client (client will hold them)
+    # The hold_htlcs plugin holds for 3 seconds before continuing
+    l1.daemon.wait_for_log("Holding onto an incoming htlc for 3 seconds")
+
+    # CRITICAL CHECK: During hold, funding tx should NOT be in mempool
+    # The withheld flow means we wait for preimage before broadcasting
+    mempool_during_hold = bitcoind.rpc.getmempoolinfo()["size"]
+    assert mempool_during_hold == initial_mempool_size, (
+        f"Funding tx should NOT be in mempool during hold "
+        f"(expected {initial_mempool_size}, got {mempool_during_hold})"
+    )
+
+    # Now wait for payment to complete (client will release after hold time)
+    result = l3.rpc.waitsendpay(payment_hash, partid=num_parts, groupid=1, timeout=30)
+    assert result["payment_preimage"], "Payment should have a preimage"
+
+    # CRITICAL CHECK: After preimage, funding tx SHOULD be in mempool
+    # Give a moment for the broadcast to happen
+    time.sleep(0.5)
+    mempool_after_preimage = bitcoind.rpc.getmempoolinfo()["size"]
+    assert mempool_after_preimage > initial_mempool_size, (
+        f"Funding tx should be in mempool after preimage "
+        f"(expected > {initial_mempool_size}, got {mempool_after_preimage})"
+    )
+
+    # Verify JIT channel was created
+    channels = l1.rpc.listpeerchannels()["channels"]
+    assert len(channels) == 1, "JIT channel should exist"
+
+    # Verify client datastore is cleaned up
+    verify_cleanup(l1)
