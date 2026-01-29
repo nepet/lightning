@@ -175,10 +175,17 @@ pub fn map_channel_state_changed(
 pub fn map_forward_event(notif: &ForwardEventNotification) -> Option<SessionInput> {
     match notif.status {
         ForwardStatus::Settled => {
-            // Need preimage to continue
-            notif.preimage.as_ref().and_then(|p| {
-                parse_preimage(p).map(|preimage| SessionInput::PreimageReceived { preimage })
-            })
+            // For "settled" forward events, we need to trigger PreimageReceived.
+            // CLN's forward_event notification may not include the preimage field,
+            // even though the forward has been settled. In that case, we use a
+            // placeholder preimage since we don't actually need it for the
+            // withheld funding flow - CLN handles HTLC claiming automatically.
+            let preimage = notif
+                .preimage
+                .as_ref()
+                .and_then(|p| parse_preimage(p))
+                .unwrap_or([0u8; 32]); // Placeholder if not provided
+            Some(SessionInput::PreimageReceived { preimage })
         }
         ForwardStatus::Failed | ForwardStatus::LocalFailed => {
             // Client rejected - will retry
@@ -394,14 +401,17 @@ mod tests {
             status: ForwardStatus::Settled,
             received_time: 0.0,
             resolved_time: None,
-            preimage: None, // No preimage available
+            preimage: None, // No preimage available - use placeholder
             failcode: None,
             failreason: None,
         };
 
-        // Can't proceed without preimage
+        // CLN forward_event may not include preimage, so we use placeholder
         let input = map_forward_event(&notif);
-        assert!(input.is_none());
+        assert!(matches!(
+            input,
+            Some(SessionInput::PreimageReceived { preimage }) if preimage == [0u8; 32]
+        ));
     }
 
     #[test]
