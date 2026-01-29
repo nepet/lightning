@@ -17,6 +17,17 @@ use std::time::Instant;
 /// Per LSPS2 spec, this is type 65537.
 pub const TLV_OPENING_FEE: u64 = 65537;
 
+/// Maximum number of HTLC parts allowed in a single MPP payment.
+///
+/// This limit is derived from BOLT #2's `max_accepted_htlcs` which caps
+/// concurrent HTLCs at 483 per channel. The limit exists because each HTLC
+/// adds weight to the commitment transaction, and the commitment transaction
+/// has a maximum standard size (100KB). 483 HTLCs is the maximum that fits
+/// within this constraint.
+///
+/// Reference: <https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#the-open_channel-message>
+pub const MAX_PARTS: usize = 483;
+
 // ============================================================================
 // Core Types
 // ============================================================================
