@@ -456,23 +456,17 @@ def test_lsps2_buyjitchannel_no_mpp_var_invoice(node_factory, bitcoind):
 
 
 def test_lsps2_buyjitchannel_mpp_fixed_invoice(node_factory, bitcoind):
-    """Tests the creation of a "Just-In-Time-Channel" (jit-channel).
+    """Tests MPP JIT channel using the Python mock service plugin.
 
-    At the beginning we have the following situation where l2 acts as the LSP
-         (LSP)
-    l1    l2----l3
+    NOTE: This test uses lsps2_service_mock.py which bypasses the Rust
+    MPP implementation. The mock handles HTLC collection and channel
+    funding directly in Python. For tests of the actual Rust service
+    implementation, see the test_lsps2_mpp_* tests below.
 
-    l1 now wants to get a channel from l2 via the lsps2 jit-channel protocol:
-    - l1 requests a new jit channel form l2
-    - l1 creates an invoice based on the opening fee parameters it got from l2
-    - l3 pays the invoice
-    - l2 opens a channel to l1 and forwards the payment (deducted by a fee)
-
-    eventualy this will result in the following situation
-         (LSP)
-    l1----l2----l3
+    Topology: l1 (client) -- l2 (LSP with mock) -- l3 (payer)
+    Flow: l1 buys JIT channel, l3 sends 10-part MPP, mock opens channel
     """
-    # A mock for lsps2 mpp payments, contains the policy plugin as well.
+    # Python mock for lsps2 mpp payments (bypasses Rust service implementation).
     plugin = os.path.join(os.path.dirname(__file__), "plugins/lsps2_service_mock.py")
 
     l1, l2, l3 = node_factory.get_nodes(
