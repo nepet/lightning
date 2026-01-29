@@ -1133,7 +1133,7 @@ def test_lsps2_mpp_client_disconnect_awaiting_ready(node_factory, bitcoind):
 
     # Wait for channel to start opening (fundchannel_start called)
     # We look for the LSP log indicating channel open initiated
-    l2.daemon.wait_for_log(r"Executing OpenChannel output for session", timeout=30)
+    l2.daemon.wait_for_log(r"Opening withheld channel", timeout=30)
 
     # Disconnect client immediately to catch it during negotiation
     l1.rpc.disconnect(l2.info["id"], force=True)
