@@ -3,9 +3,213 @@ from pyln.testing.utils import RUST
 from utils import only_one
 import os
 import pytest
+import time
 import unittest
 
 RUST_PROFILE = os.environ.get("RUST_PROFILE", "debug")
+
+
+# ============================================================================
+# MPP Test Helper Functions
+# ============================================================================
+
+
+def setup_lsps2_mpp_topology(node_factory, bitcoind, policy_plugin=None):
+    """Create a 3-node topology for LSPS2 MPP testing.
+
+    Topology:
+             (LSP)
+        l1    l2----l3
+      client  LSP   payer
+
+    Args:
+        node_factory: pytest node factory fixture
+        bitcoind: pytest bitcoind fixture
+        policy_plugin: path to policy plugin (defaults to lsps2_policy.py)
+
+    Returns:
+        tuple: (l1, l2, l3, chanid) where chanid is the l3<->l2 channel
+    """
+    if policy_plugin is None:
+        policy_plugin = os.path.join(
+            os.path.dirname(__file__), "plugins/lsps2_policy.py"
+        )
+
+    l1, l2, l3 = node_factory.get_nodes(
+        3,
+        opts=[
+            {"experimental-lsps-client": None},
+            {
+                "experimental-lsps2-service": None,
+                "experimental-lsps2-promise-secret": "0" * 64,
+                "plugin": policy_plugin,
+                "fee-base": 0,
+                "fee-per-satoshi": 0,
+            },
+            {},
+        ],
+    )
+
+    # Give the LSP funds to open JIT channels
+    l2.fundwallet(1_000_000)
+
+    # Create channel between payer and LSP
+    node_factory.join_nodes([l3, l2], fundchannel=True, wait_for_announce=True)
+
+    # Connect client to LSP (no funded channel yet)
+    node_factory.join_nodes([l1, l2], fundchannel=False)
+
+    # Get the channel ID between l3 and l2
+    chanid = only_one(l3.rpc.listpeerchannels(l2.info["id"])["channels"])[
+        "short_channel_id"
+    ]
+
+    return l1, l2, l3, chanid
+
+
+def buy_and_create_invoice(client, lsp, amount_msat):
+    """Buy JIT channel and create invoice with route hint.
+
+    Args:
+        client: LSPS2 client node (l1)
+        lsp: LSP node (l2)
+        amount_msat: Payment amount in millisatoshis (int)
+
+    Returns:
+        dict with keys:
+            - invoice: raw invoice response
+            - bolt11: bolt11 string
+            - decoded: decoded invoice
+            - routehint: extracted route hint for the JIT channel
+            - payment_hash: payment hash
+            - payment_secret: payment secret
+            - opening_fee_params: the fee params used
+    """
+    # Get fee parameters from LSP
+    info = client.rpc.lsps_lsps2_getinfo(lsp_id=lsp.info["id"])
+    opening_fee_params = info["opening_fee_params_menu"][0]
+
+    # Buy JIT channel with expected payment size
+    client.rpc.lsps_lsps2_buy(
+        lsp_id=lsp.info["id"],
+        opening_fee_params=opening_fee_params,
+        payment_size_msat=f"{amount_msat}msat",
+    )
+
+    # Create invoice with route hint to JIT channel
+    invoice = client.rpc.lsps_lsps2_invoice(
+        lsp_id=lsp.info["id"],
+        amount_msat=f"{amount_msat}msat",
+        description="mpp-test-invoice",
+        label=f"mpp-test-{amount_msat}-{time.time()}",
+    )
+
+    # Decode the invoice
+    decoded = client.rpc.decode(invoice["bolt11"])
+
+    # Extract route hint (should be exactly one route with one hop)
+    routehint = only_one(only_one(decoded["routes"]))
+
+    return {
+        "invoice": invoice,
+        "bolt11": invoice["bolt11"],
+        "decoded": decoded,
+        "routehint": routehint,
+        "payment_hash": decoded["payment_hash"],
+        "payment_secret": invoice["payment_secret"],
+        "opening_fee_params": opening_fee_params,
+    }
+
+
+def send_mpp_parts(payer, lsp, client, chanid, invoice_data, num_parts):
+    """Send MPP payment with specified number of parts.
+
+    Args:
+        payer: Payer node (l3)
+        lsp: LSP node (l2)
+        client: Client node (l1)
+        chanid: Channel ID between payer and LSP
+        invoice_data: Dict returned by buy_and_create_invoice
+        num_parts: Number of HTLC parts to send
+
+    Returns:
+        waitsendpay result containing payment_preimage on success
+    """
+    amount_msat = invoice_data["decoded"]["amount_msat"]
+    # Handle both int and string with 'msat' suffix
+    if isinstance(amount_msat, str):
+        amount_msat = int(amount_msat.replace("msat", ""))
+
+    routehint = invoice_data["routehint"]
+    payment_hash = invoice_data["payment_hash"]
+    payment_secret = invoice_data["payment_secret"]
+    bolt11 = invoice_data["bolt11"]
+
+    # Calculate amount per part
+    amount_per_part = amount_msat // num_parts
+
+    # Build route for each part
+    route_part = [
+        {
+            "amount_msat": amount_per_part,
+            "id": lsp.info["id"],
+            "delay": routehint["cltv_expiry_delta"] + 6,
+            "channel": chanid,
+        },
+        {
+            "amount_msat": amount_per_part,
+            "id": client.info["id"],
+            "delay": 6,
+            "channel": routehint["short_channel_id"],
+        },
+    ]
+
+    # Send all parts
+    for partid in range(1, num_parts + 1):
+        payer.rpc.sendpay(
+            route_part,
+            payment_hash,
+            payment_secret=payment_secret,
+            bolt11=bolt11,
+            amount_msat=f"{amount_msat}msat",
+            groupid=1,
+            partid=partid,
+        )
+
+    # Wait for payment to complete
+    result = payer.rpc.waitsendpay(payment_hash, partid=num_parts, groupid=1)
+    return result
+
+
+def wait_for_jit_channel(client, timeout=30):
+    """Wait for JIT channel to appear on client.
+
+    Args:
+        client: Client node to check for channels
+        timeout: Maximum seconds to wait
+
+    Returns:
+        Channel info dict
+
+    Raises:
+        TimeoutError: If no channel appears within timeout
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        channels = client.rpc.listpeerchannels()["channels"]
+        if channels:
+            return channels[0]
+        time.sleep(0.5)
+    raise TimeoutError(f"No JIT channel appeared within {timeout} seconds")
+
+
+def verify_cleanup(client):
+    """Assert that LSPS datastore is cleaned up after test.
+
+    Args:
+        client: Client node to check
+    """
+    assert client.rpc.listdatastore(["lsps"]) == {"datastore": []}
 
 
 def test_lsps_service_disabled(node_factory):
