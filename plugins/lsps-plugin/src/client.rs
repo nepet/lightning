@@ -574,7 +574,37 @@ async fn on_htlc_accepted(
         .context("failed to fetch datastore record"));
 
     // If we don't know about this payment it's not an LSP payment, continue.
-    some_or_continue!(lsp_data.datastore.first());
+    let invoice_entry = some_or_continue!(lsp_data.datastore.first());
+
+    // Extract the lsp_id from the invoice entry
+    let lsp_id = some_or_continue!(
+        invoice_entry.string.as_ref(),
+        "invoice datastore entry missing lsp_id string"
+    );
+
+    // Fetch the DatastoreRecord for this LSP to get opening_fee_msat
+    let client_data = ok_or_continue!(cln_client
+        .call_typed(&ListdatastoreRequest {
+            key: Some(vec![
+                "lsps".to_string(),
+                "client".to_string(),
+                lsp_id.clone(),
+            ]),
+        })
+        .await
+        .context("failed to fetch client datastore record"));
+
+    let client_entry = some_or_continue!(
+        client_data.datastore.first(),
+        "client datastore entry not found for lsp_id={}",
+        lsp_id
+    );
+
+    let ds_record: DatastoreRecord = ok_or_continue!(client_entry
+        .string
+        .as_ref()
+        .ok_or_else(|| anyhow!("client datastore entry missing string"))
+        .and_then(|s| serde_json::from_str(s).context("failed to parse DatastoreRecord")));
 
     let extra_fee_msat = req
         .htlc
@@ -586,11 +616,28 @@ async fn on_htlc_accepted(
         .unwrap_or_default();
 
     debug!(
-        "incoming jit-channel htlc with htlc_amt={}, onion_amt={} and extra_fee={}",
+        "incoming jit-channel htlc with htlc_amt={}, onion_amt={}, extra_fee={}, opening_fee={:?}",
         htlc_amt.msat(),
         onion_amt.msat(),
-        extra_fee_msat
+        extra_fee_msat,
+        ds_record.opening_fee_msat
     );
+
+    // SECURITY CHECK: Validate extra_fee does not exceed opening_fee
+    // Per LSPS2 spec: "client MUST check that sum of all extra_fees <= opening_fee"
+    if let Some(opening_fee) = ds_record.opening_fee_msat {
+        if extra_fee_msat > opening_fee {
+            warn!(
+                "SECURITY: Rejecting HTLC - extra_fee {} exceeds opening_fee {}",
+                extra_fee_msat, opening_fee
+            );
+            let value = serde_json::to_value(HtlcAcceptedResponse::fail(
+                Some("2002".to_string()), // WIRE_TEMPORARY_CHANNEL_FAILURE
+                None,
+            ))?;
+            return Ok(value);
+        }
+    }
 
     if htlc_amt.msat() + extra_fee_msat != onion_amt.msat() {
         warn!(
@@ -598,7 +645,12 @@ async fn on_htlc_accepted(
             (htlc_amt.msat() + extra_fee_msat),
             onion_amt.msat()
         );
-        // FIXME: If we are strict, we should reject the htlc here.
+        // Reject HTLCs where amounts don't match - this is now enforced
+        let value = serde_json::to_value(HtlcAcceptedResponse::fail(
+            Some("2002".to_string()), // WIRE_TEMPORARY_CHANNEL_FAILURE
+            None,
+        ))?;
+        return Ok(value);
     }
 
     let inv_res = ok_or_continue!(cln_client
