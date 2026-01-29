@@ -23,7 +23,7 @@ use cln_lsps::{
                 DatastoreProvider, LightningProvider, NoOpEventEmitter, SessionPersistenceProvider,
             },
             service::Lsps2ServiceHandler,
-            session::{HtlcPart, SessionConfig, SessionId, SessionInput},
+            session::{HtlcPart, SessionConfig, SessionId, SessionInput, MAX_PARTS},
             timeouts::{TimeoutConfig, TimeoutManager},
         },
         server::LspsService,
@@ -460,6 +460,29 @@ async fn handle_mpp_htlc(
         Err(e) => {
             warn!("Failed to get/create session {}: {}", session_id, e);
             return Ok(json_continue());
+        }
+    }
+
+    // Check if we've exceeded MAX_PARTS limit before holding the HTLC
+    if let Some(session) = state.session_manager.get_session(session_id).await {
+        let current_parts = session.htlc_ids().len();
+        if current_parts >= MAX_PARTS {
+            warn!(
+                "Session {} has {} parts, exceeds MAX_PARTS ({}), triggering TooManyParts",
+                session_id, current_parts, MAX_PARTS
+            );
+            // Apply TooManyParts input to fail the session
+            if let Err(e) = state
+                .session_manager
+                .apply_input(session_id, SessionInput::TooManyParts { max_parts: MAX_PARTS })
+                .await
+            {
+                warn!("Failed to apply TooManyParts to session {}: {}", session_id, e);
+            }
+            // Fail this HTLC immediately - the session will fail all held HTLCs
+            return Ok(json_fail(
+                cln_lsps::proto::lsps2::failure_codes::UNKNOWN_NEXT_PEER,
+            ));
         }
     }
 
