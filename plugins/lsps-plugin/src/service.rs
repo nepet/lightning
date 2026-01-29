@@ -116,6 +116,10 @@ async fn main() -> Result<(), anyhow::Error> {
         // )
         .hook("custommsg", service_custommsg_hook)
         .hook("htlc_accepted", on_htlc_accepted)
+        // Subscribe to notifications for MPP session state transitions
+        .subscribe("channel_state_changed", on_channel_state_changed)
+        .subscribe("forward_event", on_forward_event)
+        .subscribe("disconnect", on_disconnect)
         .configure()
         .await?
     {
