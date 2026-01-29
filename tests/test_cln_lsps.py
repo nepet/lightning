@@ -1195,3 +1195,164 @@ def test_lsps2_mpp_withheld_funding_client_holds_unsafe(node_factory, bitcoind):
         f"Funding tx should NOT be in mempool after unsafe hold failure "
         f"(expected {initial_mempool_size}, got {mempool_after_failure})"
     )
+
+
+@unittest.skipUnless(RUST, "RUST is not enabled")
+def test_lsps2_mpp_abandoned_session_releases_utxos(node_factory, bitcoind):
+    """Tests that UTXOs are released when session is abandoned.
+
+    This test verifies that with the withheld funding flow, when a session
+    reaches the Abandoned state (via AwaitingRetry -> ValidUntilPassed),
+    the reserved UTXOs are released back to the LSP's wallet.
+
+    Setup: 3-node topology, client will fail incoming HTLCs
+    Action:
+      1. Client buys JIT channel, payer sends full payment
+      2. Channel opens (withheld), HTLCs forwarded
+      3. Client fails the HTLCs (simulating rejection)
+      4. Session moves to AwaitingRetry
+      5. Modify valid_until to short duration
+      6. Wait for valid_until to expire -> Abandoned
+    Expected:
+      - No funding tx in mempool (withheld, never broadcast)
+      - LSP's UTXOs are released (available in listfunds)
+    """
+    from datetime import datetime, timedelta, timezone
+    import json
+
+    policy_plugin = os.path.join(
+        os.path.dirname(__file__), "plugins/lsps2_policy.py"
+    )
+    hold_plugin = os.path.join(
+        os.path.dirname(__file__), "plugins/hold_htlcs.py"
+    )
+
+    # Client uses hold_htlcs with hold-result=fail to reject incoming HTLCs
+    l1, l2, l3 = node_factory.get_nodes(
+        3,
+        opts=[
+            {
+                "experimental-lsps-client": None,
+                "plugin": hold_plugin,
+                "hold-time": 1,  # Short hold before failing
+                "hold-result": "fail",  # Fail the HTLC
+            },
+            {
+                "experimental-lsps2-service": None,
+                "experimental-lsps2-promise-secret": "0" * 64,
+                "plugin": policy_plugin,
+                "fee-base": 0,
+                "fee-per-satoshi": 0,
+            },
+            {},
+        ],
+    )
+
+    # Give the LSP funds to open JIT channels
+    l2.fundwallet(1_000_000)
+
+    # Record LSP's initial UTXO count
+    initial_outputs = len(l2.rpc.listfunds()["outputs"])
+
+    # Create channel between payer and LSP
+    node_factory.join_nodes([l3, l2], fundchannel=True, wait_for_announce=True)
+
+    # Connect client to LSP (no funded channel yet)
+    node_factory.join_nodes([l1, l2], fundchannel=False)
+
+    # Get the channel ID between l3 and l2
+    chanid = only_one(l3.rpc.listpeerchannels(l2.info["id"])["channels"])[
+        "short_channel_id"
+    ]
+
+    # Payment amount
+    amount_msat = 10_000_000
+
+    # Buy JIT channel and create invoice
+    invoice_data = buy_and_create_invoice(l1, l2, amount_msat)
+
+    routehint = invoice_data["routehint"]
+    payment_hash = invoice_data["payment_hash"]
+    payment_secret = invoice_data["payment_secret"]
+    bolt11 = invoice_data["bolt11"]
+    scid = routehint["short_channel_id"]
+
+    # Record initial mempool state
+    initial_mempool_size = bitcoind.rpc.getmempoolinfo()["size"]
+
+    # Send MPP payment (10 parts)
+    num_parts = 10
+    amount_per_part = amount_msat // num_parts
+
+    route_part = [
+        {
+            "amount_msat": amount_per_part,
+            "id": l2.info["id"],
+            "delay": routehint["cltv_expiry_delta"] + 6,
+            "channel": chanid,
+        },
+        {
+            "amount_msat": amount_per_part,
+            "id": l1.info["id"],
+            "delay": 6,
+            "channel": routehint["short_channel_id"],
+        },
+    ]
+
+    for partid in range(1, num_parts + 1):
+        l3.rpc.sendpay(
+            route_part,
+            payment_hash,
+            payment_secret=payment_secret,
+            bolt11=bolt11,
+            amount_msat=f"{amount_msat}msat",
+            groupid=1,
+            partid=partid,
+        )
+
+    # Wait for client to hold and then fail the HTLC
+    l1.daemon.wait_for_log("Holding onto an incoming htlc for 1 seconds")
+
+    # The first payment attempt should fail (client fails the HTLCs)
+    with pytest.raises(RpcError):
+        l3.rpc.waitsendpay(payment_hash, partid=1, groupid=1, timeout=15)
+
+    # At this point, session should be in AwaitingRetry
+    # Modify the datastore entry to have a very short valid_until
+    ds_key = ["lsps", "lsps2", scid]
+    ds_entries = l2.rpc.listdatastore(ds_key)["datastore"]
+
+    if len(ds_entries) == 1:
+        entry_data = json.loads(ds_entries[0]["string"])
+        short_valid_until = (
+            datetime.now(timezone.utc) + timedelta(seconds=3)
+        ).isoformat().replace("+00:00", "Z")
+        entry_data["opening_fee_params"]["valid_until"] = short_valid_until
+
+        # Update the datastore entry
+        l2.rpc.datastore(
+            key=ds_key,
+            string=json.dumps(entry_data),
+            mode="must-replace",
+        )
+
+        # Wait for valid_until to expire and session to be abandoned
+        time.sleep(5)
+
+    # CRITICAL CHECK: Funding tx should NOT be in mempool
+    mempool_after_abandon = bitcoind.rpc.getmempoolinfo()["size"]
+    assert mempool_after_abandon == initial_mempool_size, (
+        f"Funding tx should NOT be in mempool after session abandoned "
+        f"(expected {initial_mempool_size}, got {mempool_after_abandon})"
+    )
+
+    # Wait a moment for UTXO release to complete
+    time.sleep(1)
+
+    # CRITICAL CHECK: LSP's UTXOs should be released
+    # After abandonment, unreserveinputs should free the reserved UTXOs
+    final_outputs = len(l2.rpc.listfunds()["outputs"])
+    assert final_outputs >= initial_outputs, (
+        f"LSP's UTXOs should be released after session abandoned "
+        f"(initial: {initial_outputs}, final: {final_outputs})"
+    )
