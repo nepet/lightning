@@ -1168,6 +1168,36 @@ impl Session {
                 )
             }
 
+            (SessionState::Collecting { parts, .. }, SessionInput::ClientDisconnected) => {
+                let htlc_ids = Self::extract_htlc_ids(&parts);
+                let events = vec![
+                    SessionEvent::ClientDisconnected {
+                        session_id: self.id,
+                        client_node_id: self.config.client_node_id,
+                        phase: SessionPhase::Collecting,
+                    },
+                    SessionEvent::HtlcsFailedUpstream {
+                        session_id: self.id,
+                        htlc_count: parts.len(),
+                        error_code: FailureCode::TemporaryChannelFailure.as_str().to_string(),
+                        reason: "client_disconnected".to_string(),
+                    },
+                ];
+                let outputs = vec![SessionOutput::FailHtlcs {
+                    session_id: self.id,
+                    htlc_ids,
+                    failure_code: FailureCode::TemporaryChannelFailure,
+                }];
+
+                (
+                    SessionState::Failed {
+                        reason: FailureReason::ClientDisconnected,
+                        phase: SessionPhase::Collecting,
+                    },
+                    ApplyResult::new(events, outputs),
+                )
+            }
+
             // ================================================================
             // Opening State Transitions
             // ================================================================
