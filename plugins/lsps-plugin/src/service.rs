@@ -2,22 +2,40 @@ use anyhow::bail;
 use bitcoin::hashes::Hash;
 use cln_lsps::{
     cln_adapters::{
-        hooks::service_custommsg_hook, rpc::ClnApiRpc, sender::ClnSender, state::ServiceState,
+        hooks::service_custommsg_hook,
+        notifications::{
+            map_channel_state_changed, map_forward_event, parse_forward_event, parse_payment_hash,
+            ForwardStatus,
+        },
+        rpc::ClnApiRpc,
+        sender::ClnSender,
+        session_handler::ClnSessionOutputHandler,
+        state::ServiceState,
         types::HtlcAcceptedRequest,
     },
     core::{
         lsps2::{
             htlc::{Htlc, HtlcAcceptedHookHandler, HtlcDecision, Onion, RejectReason},
+            htlc_holder::{HtlcHolder, HtlcInfo, HtlcResponse},
+            manager::SessionManager,
+            persistence::PersistedPhase,
+            provider::{
+                DatastoreProvider, LightningProvider, NoOpEventEmitter, SessionPersistenceProvider,
+            },
             service::Lsps2ServiceHandler,
+            session::{HtlcPart, SessionConfig, SessionId, SessionInput, MAX_PARTS},
+            timeouts::{TimeoutConfig, TimeoutManager},
         },
         server::LspsService,
     },
-    proto::lsps0::Msat,
+    proto::lsps0::{Msat, ShortChannelId},
 };
 use cln_plugin::{options, Plugin};
-use log::{debug, error, trace};
+use cln_rpc::notifications::ChannelStateChangedNotification;
+use log::{debug, error, trace, warn};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::oneshot;
 
 pub const OPTION_ENABLED: options::FlagConfigOption = options::ConfigOption::new_flag(
     "experimental-lsps2-service",
@@ -30,24 +48,189 @@ pub const OPTION_PROMISE_SECRET: options::StringConfigOption =
         "A 64-character hex string that is the secret for promises",
     );
 
+pub const OPTION_COLLECT_TIMEOUT: options::DefaultIntegerConfigOption =
+    options::ConfigOption::new_i64_with_default(
+        "lsps2-collect-timeout",
+        90,
+        "Timeout in seconds for collecting MPP HTLC parts (default: 90)",
+    );
+
+/// Type alias for the SessionManager with CLN-specific handlers.
+type ClnSessionManager = SessionManager<NoOpEventEmitter, ClnSessionOutputHandler>;
+
 #[derive(Clone)]
 struct State {
     lsps_service: Arc<LspsService>,
     sender: ClnSender,
     lsps2_enabled: bool,
+    /// Session manager for MPP HTLC sessions
+    session_manager: Arc<ClnSessionManager>,
+    /// HTLC holder for deferred hook responses
+    htlc_holder: Arc<HtlcHolder>,
+    /// RPC path for creating providers (e.g., BlockheightProvider)
+    rpc_path: PathBuf,
 }
 
 impl State {
     pub fn new(rpc_path: PathBuf, promise_secret: &[u8; 32]) -> Self {
         let api = Arc::new(ClnApiRpc::new(rpc_path.clone()));
-        let sender = ClnSender::new(rpc_path);
-        let lsps2_handler = Arc::new(Lsps2ServiceHandler::new(api, promise_secret));
+        let sender = ClnSender::new(rpc_path.clone());
+        let lsps2_handler = Arc::new(Lsps2ServiceHandler::new(api.clone(), promise_secret));
         let lsps_service = Arc::new(LspsService::builder().with_protocol(lsps2_handler).build());
+
+        // Create HTLC holder for deferred hook responses
+        let htlc_holder = Arc::new(HtlcHolder::new());
+
+        // Create session output handler (uses HtlcHolder to release HTLCs,
+        // and provider for channel funding RPC calls)
+        let output_handler = Arc::new(ClnSessionOutputHandler::new(
+            htlc_holder.clone(),
+            api.clone(),
+        ));
+
+        // Create session manager with no-op event emitter and CLN output handler
+        let session_manager = Arc::new(SessionManager::new(
+            Arc::new(NoOpEventEmitter),
+            output_handler,
+        ));
+
         Self {
             lsps_service,
             sender,
             lsps2_enabled: true,
+            session_manager,
+            htlc_holder,
+            rpc_path,
         }
+    }
+
+    /// Spawn the timeout manager as a background task.
+    ///
+    /// This should be called after the plugin starts to begin monitoring
+    /// sessions for timeout conditions.
+    pub fn spawn_timeout_manager(&self, collect_timeout_secs: u64) -> tokio::task::JoinHandle<()> {
+        let blockheight_provider = Arc::new(ClnApiRpc::new(self.rpc_path.clone()));
+
+        // Clone the session manager (Arc internally, so cheap)
+        let session_manager = (*self.session_manager).clone();
+
+        let config = TimeoutConfig::new(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(collect_timeout_secs),
+            2,
+        );
+
+        let timeout_manager = TimeoutManager::new(session_manager, blockheight_provider, config);
+
+        debug!(
+            "Spawning timeout manager for JIT channel sessions (collect_timeout={}s)",
+            collect_timeout_secs
+        );
+        timeout_manager.spawn()
+    }
+
+    /// Recover persisted sessions after a restart.
+    ///
+    /// This should be called after the plugin starts to handle sessions
+    /// that were in progress when CLN was shut down or crashed.
+    ///
+    /// # Critical Recovery
+    ///
+    /// Sessions in `Settling` phase have received the preimage but haven't
+    /// broadcast the funding transaction. This is a CRITICAL state - we MUST
+    /// broadcast the funding transaction to secure the channel. Failing to do
+    /// so means the client can claim the payment but the LSP loses the channel.
+    ///
+    /// # Non-Critical Recovery
+    ///
+    /// Sessions in other phases (Opening, AwaitingChannelReady, Forwarding,
+    /// WaitingPreimage, AwaitingRetry) cannot be fully recovered because:
+    /// - HTLCs held in hooks are lost on restart (CLN fails them)
+    /// - The sender will retry when their HTLCs timeout
+    ///
+    /// For these sessions, we log a warning and delete the persisted state.
+    pub async fn recover_sessions(&self) -> Result<(), anyhow::Error> {
+        let rpc = ClnApiRpc::new(self.rpc_path.clone());
+
+        // Load all persisted sessions
+        let sessions = rpc.load_all_sessions().await?;
+
+        if sessions.is_empty() {
+            debug!("No persisted JIT channel sessions to recover");
+            return Ok(());
+        }
+
+        debug!(
+            "Recovering {} persisted JIT channel session(s)",
+            sessions.len()
+        );
+
+        for session in sessions {
+            let session_id = session.id();
+            let phase_name = session.phase.name();
+
+            if session.phase.requires_broadcast() {
+                // CRITICAL: Session in Settling phase - must broadcast funding!
+                if let PersistedPhase::Settling {
+                    funding_psbt,
+                    preimage,
+                    channel_id,
+                } = &session.phase
+                {
+                    warn!(
+                        "Recovering session {:?} in Settling phase - broadcasting funding transaction",
+                        session_id
+                    );
+
+                    match rpc.broadcast_funding(funding_psbt).await {
+                        Ok(result) => {
+                            debug!(
+                                "Successfully broadcast funding for recovered session {:?}: txid={}",
+                                session_id, result.txid
+                            );
+
+                            // Delete the persisted session - recovery complete
+                            if let Err(e) = rpc.delete_session(session_id).await {
+                                warn!(
+                                    "Failed to delete recovered session {:?} from datastore: {}",
+                                    session_id, e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            // This is a critical error - log prominently
+                            error!(
+                                "CRITICAL: Failed to broadcast funding for session {:?}: {} \
+                                 (channel_id={}, preimage={}). \
+                                 Manual intervention may be required!",
+                                session_id,
+                                e,
+                                hex::encode(channel_id),
+                                hex::encode(preimage)
+                            );
+                            // Don't delete - keep for retry on next restart
+                        }
+                    }
+                }
+            } else {
+                // Non-critical phases - HTLCs are lost, sender will retry
+                warn!(
+                    "Session {:?} in phase '{}' cannot be fully recovered - \
+                     held HTLCs were lost on restart, sender will retry",
+                    session_id, phase_name
+                );
+
+                // Delete the persisted session - can't recover it
+                if let Err(e) = rpc.delete_session(session_id).await {
+                    warn!(
+                        "Failed to delete unrecoverable session {:?} from datastore: {}",
+                        session_id, e
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -66,6 +249,7 @@ async fn main() -> Result<(), anyhow::Error> {
     if let Some(plugin) = cln_plugin::Builder::new(tokio::io::stdin(), tokio::io::stdout())
         .option(OPTION_ENABLED)
         .option(OPTION_PROMISE_SECRET)
+        .option(OPTION_COLLECT_TIMEOUT)
         // FIXME: Temporarily disabled lsp feature to please test cases, this is
         // ok as the feature is optional per spec.
         // We need to ensure that `connectd` only starts after all plugins have
@@ -80,6 +264,10 @@ async fn main() -> Result<(), anyhow::Error> {
         // )
         .hook("custommsg", service_custommsg_hook)
         .hook("htlc_accepted", on_htlc_accepted)
+        // Subscribe to notifications for MPP session state transitions
+        .subscribe("channel_state_changed", on_channel_state_changed)
+        .subscribe("forward_event", on_forward_event)
+        .subscribe("disconnect", on_disconnect)
         .configure()
         .await?
     {
@@ -115,8 +303,24 @@ async fn main() -> Result<(), anyhow::Error> {
                     }
                 };
 
+                let collect_timeout_secs = plugin.option(&OPTION_COLLECT_TIMEOUT)? as u64;
+
                 let state = State::new(rpc_path, &secret);
+
+                // Clone state before moving into plugin so we can use it to spawn background tasks
+                let state_for_tasks = state.clone();
                 let plugin = plugin.start(state).await?;
+
+                // Recover any persisted sessions from previous runs
+                // This is critical for sessions in Settling phase that need to broadcast funding
+                if let Err(e) = state_for_tasks.recover_sessions().await {
+                    error!("Failed to recover persisted sessions: {}", e);
+                    // Continue anyway - don't fail startup due to recovery errors
+                }
+
+                // Spawn timeout manager background task
+                let _timeout_handle = state_for_tasks.spawn_timeout_manager(collect_timeout_secs);
+
                 plugin.join().await
             } else {
                 bail!("lsps2 enabled but no promise-secret set.");
@@ -167,7 +371,30 @@ async fn handle_htlc_inner(
     };
 
     let rpc_path = Path::new(&p.configuration().lightning_dir).join(&p.configuration().rpc_file);
-    let api = ClnApiRpc::new(rpc_path);
+    let api = ClnApiRpc::new(rpc_path.clone());
+
+    // Check if this SCID is a JIT session and whether it's MPP
+    let ds_entry = match api.get_buy_request(&short_channel_id).await {
+        Ok(entry) => entry,
+        Err(_) => {
+            // Not a JIT session SCID, continue
+            trace!("SCID {} is not a JIT session, continue.", short_channel_id);
+            return Ok(json_continue());
+        }
+    };
+
+    // Check if this is an MPP payment
+    if ds_entry.expected_payment_size.is_some() {
+        // MPP payment - use the new session flow
+        debug!(
+            "MPP HTLC for JIT session {}: amount={}",
+            short_channel_id,
+            req.htlc.amount_msat.msat()
+        );
+        return handle_mpp_htlc(p, &req, short_channel_id, ds_entry).await;
+    }
+
+    // No-MPP payment - use the existing blocking flow
     // Fixme: Use real htlc_minimum_amount.
     let handler = HtlcAcceptedHookHandler::new(api, 1000);
 
@@ -181,7 +408,7 @@ async fn handle_htlc_inner(
         extra_tlvs: req.htlc.extra_tlvs.unwrap_or_default(),
     };
 
-    debug!("Handle potential jit-session HTLC.");
+    debug!("Handle no-MPP JIT session HTLC.");
     let response = match handler.handle(&htlc, &onion).await {
         Ok(dec) => {
             log_decision(&dec);
@@ -195,6 +422,129 @@ async fn handle_htlc_inner(
     };
 
     Ok(serde_json::to_value(&response)?)
+}
+
+/// Handle an MPP HTLC using the session state machine.
+///
+/// This function:
+/// 1. Creates or gets the session from SessionManager
+/// 2. Holds the HTLC using HtlcHolder with a oneshot channel
+/// 3. Submits the HTLC part to the session
+/// 4. Awaits the response on the oneshot channel
+/// 5. Converts the HtlcResponse to JSON
+async fn handle_mpp_htlc(
+    p: &Plugin<State>,
+    req: &HtlcAcceptedRequest,
+    jit_scid: ShortChannelId,
+    ds_entry: cln_lsps::proto::lsps2::DatastoreEntry,
+) -> Result<serde_json::Value, anyhow::Error> {
+    let state = p.state();
+    let session_id = SessionId::from(jit_scid);
+
+    // Create session config from datastore entry
+    let config = SessionConfig::new(
+        ds_entry.peer_id,
+        ds_entry.opening_fee_params.clone(),
+        ds_entry.expected_payment_size,
+    );
+
+    // Get or create the session
+    let created = state
+        .session_manager
+        .get_or_create_session(session_id, || config)
+        .await;
+
+    match created {
+        Ok(true) => debug!("Created new MPP session: {}", session_id),
+        Ok(false) => debug!("Using existing MPP session: {}", session_id),
+        Err(e) => {
+            warn!("Failed to get/create session {}: {}", session_id, e);
+            return Ok(json_continue());
+        }
+    }
+
+    // Check if we've exceeded MAX_PARTS limit before holding the HTLC
+    if let Some(session) = state.session_manager.get_session(session_id).await {
+        let current_parts = session.htlc_ids().len();
+        if current_parts >= MAX_PARTS {
+            warn!(
+                "Session {} has {} parts, exceeds MAX_PARTS ({}), triggering TooManyParts",
+                session_id, current_parts, MAX_PARTS
+            );
+            // Apply TooManyParts input to fail the session
+            if let Err(e) = state
+                .session_manager
+                .apply_input(session_id, SessionInput::TooManyParts { max_parts: MAX_PARTS })
+                .await
+            {
+                warn!("Failed to apply TooManyParts to session {}: {}", session_id, e);
+            }
+            // Fail this HTLC immediately - the session will fail all held HTLCs
+            return Ok(json_fail(
+                cln_lsps::proto::lsps2::failure_codes::UNKNOWN_NEXT_PEER,
+            ));
+        }
+    }
+
+    // Create the HtlcInfo for the holder
+    let htlc_info = htlc_info_from_request(req);
+
+    // Create the oneshot channel for the response
+    let (tx, rx) = oneshot::channel();
+
+    // Hold the HTLC (this stores the sender)
+    state.htlc_holder.hold(session_id, htlc_info, tx).await;
+
+    // Create the HtlcPart for the session
+    let part = htlc_part_from_request(req, jit_scid);
+
+    // Submit the part to the session
+    let input = SessionInput::PartArrived { part };
+    match state.session_manager.apply_input(session_id, input).await {
+        Ok(phase) => {
+            debug!("Session {} transitioned to phase: {:?}", session_id, phase);
+        }
+        Err(e) => {
+            warn!("Failed to apply input to session {}: {}", session_id, e);
+            // Try to release the HTLC we just held
+            state
+                .htlc_holder
+                .release_fail(
+                    session_id,
+                    cln_lsps::core::lsps2::session::FailureCode::TemporaryChannelFailure,
+                )
+                .await;
+            return Ok(json_continue());
+        }
+    }
+
+    // Await the response from the HTLC holder
+    // This will be sent when the session decides what to do (forward or fail)
+    match rx.await {
+        Ok(response) => {
+            debug!(
+                "Got HTLC response for session {}: {:?}",
+                session_id,
+                match &response {
+                    HtlcResponse::Continue { forward_to, .. } =>
+                        format!("Continue to channel {}", hex::encode(forward_to.0)),
+                    HtlcResponse::Fail { failure_code } => format!("Fail with {:?}", failure_code),
+                }
+            );
+            htlc_response_to_json(response)
+        }
+        Err(_) => {
+            // The sender was dropped without sending - this shouldn't happen
+            // in normal operation but could happen if the session was removed
+            warn!(
+                "HTLC response channel dropped for session {}, failing HTLC",
+                session_id
+            );
+            Ok(json_fail(
+                cln_lsps::proto::lsps2::failure_codes::TEMPORARY_CHANNEL_FAILURE,
+            ))
+        }
+    }
 }
 
 fn decision_to_response(decision: HtlcDecision) -> Result<serde_json::Value, anyhow::Error> {
@@ -257,5 +607,540 @@ fn log_decision(decision: &HtlcDecision) {
         HtlcDecision::Reject { reason } => {
             debug!("Rejecting HTLC: {:?}", reason);
         }
+    }
+}
+
+// ============================================================================
+// MPP Session Helper Functions
+// ============================================================================
+
+/// Convert HtlcAcceptedRequest to HtlcPart for the session state machine.
+///
+/// # Arguments
+/// * `req` - The HTLC accepted request from the hook
+/// * `jit_scid` - The JIT SCID that this HTLC targets
+fn htlc_part_from_request(req: &HtlcAcceptedRequest, jit_scid: ShortChannelId) -> HtlcPart {
+    // Convert payment_hash from Vec<u8> to [u8; 32]
+    let mut payment_hash = [0u8; 32];
+    if req.htlc.payment_hash.len() == 32 {
+        payment_hash.copy_from_slice(&req.htlc.payment_hash);
+    }
+
+    HtlcPart::new(
+        req.htlc.id,
+        Msat::from_msat(req.htlc.amount_msat.msat()),
+        req.htlc.cltv_expiry,
+        payment_hash,
+        req.onion.payload.clone(),
+        req.htlc.extra_tlvs.clone().unwrap_or_default(),
+        jit_scid,
+    )
+}
+
+/// Convert HtlcAcceptedRequest to HtlcInfo for the HTLC holder.
+///
+/// # Arguments
+/// * `req` - The HTLC accepted request from the hook
+fn htlc_info_from_request(req: &HtlcAcceptedRequest) -> HtlcInfo {
+    // Convert payment_hash from Vec<u8> to [u8; 32]
+    let mut payment_hash = [0u8; 32];
+    if req.htlc.payment_hash.len() == 32 {
+        payment_hash.copy_from_slice(&req.htlc.payment_hash);
+    }
+
+    HtlcInfo {
+        htlc_id: req.htlc.id,
+        amount_msat: Msat::from_msat(req.htlc.amount_msat.msat()),
+        cltv_expiry: req.htlc.cltv_expiry,
+        payment_hash,
+        payload: req.onion.payload.clone(),
+    }
+}
+
+/// Convert HtlcResponse to JSON for the hook response.
+fn htlc_response_to_json(response: HtlcResponse) -> Result<serde_json::Value, anyhow::Error> {
+    use cln_lsps::core::lsps2::session::FailureCode;
+
+    match response {
+        HtlcResponse::Continue {
+            forward_to,
+            mut payload,
+            mut extra_tlvs,
+        } => {
+            // CLN expects forward_to as a hex-encoded channel_id (32 bytes)
+            Ok(serde_json::json!({
+                "result": "continue",
+                "payload": hex::encode(payload.to_bytes()?),
+                "forward_to": hex::encode(forward_to.0),
+                "extra_tlvs": hex::encode(extra_tlvs.to_bytes()?)
+            }))
+        }
+        HtlcResponse::Fail { failure_code } => {
+            let failure_message = match failure_code {
+                FailureCode::TemporaryChannelFailure => "1007", // temporary_channel_failure
+                FailureCode::UnknownNextPeer => "400a",         // unknown_next_peer
+            };
+            Ok(serde_json::json!({
+                "result": "fail",
+                "failure_message": failure_message
+            }))
+        }
+    }
+}
+
+// ============================================================================
+// Notification Handlers
+// ============================================================================
+
+/// Handle channel_state_changed notification.
+///
+/// This notification is sent when a channel's state changes. We use it to detect:
+/// - `CHANNELD_NORMAL`: Channel is ready for forwarding (triggers `ClientChannelReady`)
+/// - Closing states: Channel is closing (triggers `ClientDisconnected`)
+async fn on_channel_state_changed(
+    p: Plugin<State>,
+    v: serde_json::Value,
+) -> Result<(), anyhow::Error> {
+    // Parse the notification - the value is wrapped in {"channel_state_changed": {...}}
+    let inner = match v.get("channel_state_changed") {
+        Some(inner) => inner.clone(),
+        None => {
+            debug!("Missing 'channel_state_changed' key in notification params");
+            return Ok(());
+        }
+    };
+
+    let notif: ChannelStateChangedNotification = match serde_json::from_value(inner) {
+        Ok(n) => n,
+        Err(e) => {
+            debug!("Failed to parse channel_state_changed notification: {}", e);
+            return Ok(());
+        }
+    };
+
+    let state = p.state();
+    if !state.lsps2_enabled {
+        return Ok(());
+    }
+
+    // Convert channel_id to [u8; 32]
+    let channel_id: [u8; 32] = *notif.channel_id.as_byte_array();
+
+    // Find session by channel_id
+    let session_id = match state.session_manager.find_by_channel_id(&channel_id).await {
+        Some(id) => id,
+        None => {
+            trace!(
+                "No JIT session found for channel_id {}",
+                hex::encode(channel_id)
+            );
+            return Ok(());
+        }
+    };
+
+    debug!(
+        "channel_state_changed for session {:?}: {:?} -> {:?}",
+        session_id, notif.old_state, notif.new_state
+    );
+
+    // Get alias SCID from the notification's short_channel_id field.
+    // For zero-conf/withheld channels, the notification may not include the
+    // short_channel_id, so we query the channel info to get the alias SCID.
+    let alias_scid = match notif.short_channel_id {
+        Some(scid) => Some(scid),
+        None => {
+            // Query channel info to get the alias SCID
+            let rpc = ClnApiRpc::new(state.rpc_path.clone());
+            match rpc.get_channel_info(&notif.peer_id, Some(&channel_id)).await {
+                Ok(Some(info)) => {
+                    debug!(
+                        "Got channel info for {}: alias_scid={:?}",
+                        hex::encode(channel_id),
+                        info.alias_scid
+                    );
+                    info.alias_scid
+                }
+                Ok(None) => {
+                    debug!(
+                        "Channel {} not found in listpeerchannels",
+                        hex::encode(channel_id)
+                    );
+                    None
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to get channel info for {}: {}",
+                        hex::encode(channel_id),
+                        e
+                    );
+                    None
+                }
+            }
+        }
+    };
+
+    // Map to SessionInput
+    let input = match map_channel_state_changed(notif.new_state.clone(), alias_scid) {
+        Some(input) => input,
+        None => {
+            trace!(
+                "Channel state {:?} does not trigger session transition (alias_scid={:?})",
+                notif.new_state,
+                alias_scid
+            );
+            return Ok(());
+        }
+    };
+
+    // For CHANNELD_NORMAL, add a delay to ensure CLN's internal channel
+    // state is fully ready for HTLC forwarding. This addresses a race condition
+    // where forwards attempted immediately after CHANNELD_NORMAL may fail because
+    // CLN hasn't completed internal setup (channel_update exchange, etc.).
+    // 500ms gives CLN time to exchange channel_updates and register the channel
+    // for forwarding in its internal routing tables.
+    if matches!(notif.new_state, cln_rpc::primitives::ChannelState::CHANNELD_NORMAL) {
+        debug!("Waiting 500ms for channel internal setup before forwarding");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // Apply input to session
+    match state.session_manager.apply_input(session_id, input).await {
+        Ok(phase) => {
+            debug!(
+                "Session {:?} transitioned to phase {:?} after channel_state_changed",
+                session_id, phase
+            );
+        }
+        Err(e) => {
+            warn!(
+                "Failed to apply channel_state_changed to session {:?}: {}",
+                session_id, e
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle forward_event notification.
+///
+/// This notification is sent when a forward's status changes. We use it to detect:
+/// - `settled`: Preimage received (triggers `PreimageReceived`)
+/// - `failed`/`local_failed`: Client rejected (triggers `ClientRejectedPayment`)
+async fn on_forward_event(p: Plugin<State>, v: serde_json::Value) -> Result<(), anyhow::Error> {
+    // Parse the notification using our custom parser (not in cln_rpc)
+    let notif = match parse_forward_event(&v) {
+        Some(n) => n,
+        None => {
+            debug!("Failed to parse forward_event notification");
+            return Ok(());
+        }
+    };
+
+    let state = p.state();
+    if !state.lsps2_enabled {
+        return Ok(());
+    }
+
+    // Parse payment_hash
+    let payment_hash = match parse_payment_hash(&notif.payment_hash) {
+        Some(h) => h,
+        None => {
+            debug!(
+                "Invalid payment_hash in forward_event: {}",
+                notif.payment_hash
+            );
+            return Ok(());
+        }
+    };
+
+    // Find session by payment_hash
+    let session_id = match state
+        .session_manager
+        .find_by_payment_hash(&payment_hash)
+        .await
+    {
+        Some(id) => id,
+        None => {
+            trace!(
+                "No JIT session found for payment_hash {}",
+                notif.payment_hash
+            );
+            return Ok(());
+        }
+    };
+
+    debug!(
+        "forward_event for session {:?}: status={:?}",
+        session_id, notif.status
+    );
+
+    // Map to SessionInput
+    let input = match map_forward_event(&notif) {
+        Some(input) => input,
+        None => {
+            trace!(
+                "Forward status {:?} does not trigger session transition",
+                notif.status
+            );
+            return Ok(());
+        }
+    };
+
+    // Log preimage if available
+    if notif.status == ForwardStatus::Settled {
+        if let Some(ref preimage_hex) = notif.preimage {
+            debug!(
+                "Session {:?} received preimage: {}",
+                session_id, preimage_hex
+            );
+        }
+    }
+
+    // Apply input to session
+    match state.session_manager.apply_input(session_id, input).await {
+        Ok(phase) => {
+            debug!(
+                "Session {:?} transitioned to phase {:?} after forward_event",
+                session_id, phase
+            );
+        }
+        Err(e) => {
+            warn!(
+                "Failed to apply forward_event to session {:?}: {}",
+                session_id, e
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle disconnect notification.
+///
+/// This notification is sent when a peer disconnects. We use it to detect
+/// client disconnection during channel opening, which should fail the session.
+async fn on_disconnect(p: Plugin<State>, v: serde_json::Value) -> Result<(), anyhow::Error> {
+    // Parse the peer_id from the notification
+    // The disconnect notification has format: {"disconnect": {"id": "pubkey_hex"}}
+    let inner = match v.get("disconnect") {
+        Some(inner) => inner,
+        None => {
+            debug!("Missing 'disconnect' key in notification params");
+            return Ok(());
+        }
+    };
+
+    let peer_id: bitcoin::secp256k1::PublicKey = match inner.get("id") {
+        Some(serde_json::Value::String(s)) => match s.parse() {
+            Ok(pk) => pk,
+            Err(e) => {
+                debug!("Failed to parse peer_id in disconnect notification: {}", e);
+                return Ok(());
+            }
+        },
+        _ => {
+            debug!("Missing or invalid 'id' in disconnect notification");
+            return Ok(());
+        }
+    };
+
+    let state = p.state();
+    if !state.lsps2_enabled {
+        return Ok(());
+    }
+
+    // Find all sessions for this peer
+    let session_ids = state.session_manager.find_by_peer_id(&peer_id).await;
+
+    if session_ids.is_empty() {
+        trace!("No JIT sessions found for disconnected peer {}", peer_id);
+        return Ok(());
+    }
+
+    debug!(
+        "Peer {} disconnected, found {} JIT session(s)",
+        peer_id,
+        session_ids.len()
+    );
+
+    // Apply ClientDisconnected to each session
+    let input = SessionInput::ClientDisconnected;
+    for session_id in session_ids {
+        match state
+            .session_manager
+            .apply_input(session_id, input.clone())
+            .await
+        {
+            Ok(phase) => {
+                debug!(
+                    "Session {:?} transitioned to phase {:?} after disconnect",
+                    session_id, phase
+                );
+            }
+            Err(e) => {
+                // Session may already be in a terminal state, which is fine
+                trace!(
+                    "Failed to apply disconnect to session {:?}: {}",
+                    session_id,
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // JSON Helper Function Tests
+    // ========================================================================
+
+    #[test]
+    fn test_json_continue_format() {
+        let result = json_continue();
+        assert_eq!(result["result"], "continue");
+        assert!(result.get("payload").is_none());
+        assert!(result.get("forward_to").is_none());
+    }
+
+    #[test]
+    fn test_json_continue_forward_format() {
+        let payload = vec![0x01, 0x02, 0x03];
+        let forward_to = vec![0xaa, 0xbb, 0xcc];
+        let extra_tlvs = vec![0xff];
+
+        let result = json_continue_forward(payload, forward_to, extra_tlvs);
+
+        assert_eq!(result["result"], "continue");
+        assert_eq!(result["payload"], "010203");
+        assert_eq!(result["forward_to"], "aabbcc");
+        assert_eq!(result["extra_tlvs"], "ff");
+    }
+
+    #[test]
+    fn test_json_fail_format() {
+        let result = json_fail("1007");
+        assert_eq!(result["result"], "fail");
+        assert_eq!(result["failure_message"], "1007");
+    }
+
+    // ========================================================================
+    // Routing Logic Documentation Tests
+    //
+    // These tests document the expected routing behavior:
+    //
+    // HTLC Routing Decision Tree (in handle_htlc_inner):
+    // ┌────────────────────────────────────────────────────────────────────┐
+    // │ 1. No short_channel_id in onion?                                   │
+    // │    └─ YES → json_continue() [We are final destination]             │
+    // │                                                                    │
+    // │ 2. SCID not in datastore?                                          │
+    // │    └─ YES → json_continue() [Not a JIT session]                    │
+    // │                                                                    │
+    // │ 3. expected_payment_size is Some(_)?                               │
+    // │    └─ YES → handle_mpp_htlc() [MPP session flow]                   │
+    // │    └─ NO  → HtlcAcceptedHookHandler.handle() [No-MPP fast path]    │
+    // └────────────────────────────────────────────────────────────────────┘
+    //
+    // The actual routing logic tests are in:
+    // - htlc.rs tests: Test HtlcAcceptedHookHandler (no-MPP path)
+    // - session.rs tests: Test Session state machine (MPP path)
+    // - manager.rs tests: Test SessionManager (MPP session management)
+    // ========================================================================
+
+    /// This test documents that the no-MPP path produces a forward response.
+    ///
+    /// When `expected_payment_size` is `None`, the HTLC is handled by
+    /// `HtlcAcceptedHookHandler` which produces an `HtlcDecision::Forward`
+    /// for valid HTLCs. This decision is converted to a JSON response with
+    /// `payload`, `forward_to`, and `extra_tlvs` fields.
+    #[test]
+    fn no_mpp_path_produces_forward_response() {
+        // The no-MPP path (HtlcAcceptedHookHandler) produces HtlcDecision::Forward
+        // for valid payments, which gets converted to this JSON structure:
+        let decision = HtlcDecision::Forward {
+            payload: cln_lsps::core::tlv::TlvStream::default(),
+            forward_to: bitcoin::hashes::sha256::Hash::from_byte_array([1u8; 32]),
+            extra_tlvs: cln_lsps::core::tlv::TlvStream::default(),
+        };
+
+        let result = decision_to_response(decision).unwrap();
+
+        assert_eq!(result["result"], "continue");
+        assert!(result.get("forward_to").is_some());
+        // payload and extra_tlvs may be empty but present
+    }
+
+    /// This test documents that the no-MPP path rejects with failure codes.
+    ///
+    /// When validation fails (expired offer, amount out of bounds, etc.),
+    /// `HtlcAcceptedHookHandler` produces `HtlcDecision::Reject` which
+    /// gets converted to a fail response.
+    #[test]
+    fn no_mpp_path_produces_fail_response_on_rejection() {
+        // Test various rejection reasons produce correct failure codes
+        let cases = vec![
+            (
+                RejectReason::OfferExpired {
+                    valid_until: chrono::Utc::now(),
+                },
+                "1007", // TEMPORARY_CHANNEL_FAILURE
+            ),
+            (
+                RejectReason::AmountBelowMinimum {
+                    minimum: Msat::from_msat(1000),
+                },
+                "4010", // UNKNOWN_NEXT_PEER
+            ),
+            (RejectReason::PolicyDenied, "4010"),
+            (RejectReason::FundingFailed, "4010"),
+        ];
+
+        for (reason, expected_code) in cases {
+            let decision = HtlcDecision::Reject { reason };
+            let result = decision_to_response(decision).unwrap();
+
+            assert_eq!(result["result"], "fail");
+            assert_eq!(result["failure_message"], expected_code);
+        }
+    }
+
+    /// This test documents that MppNotSupported rejection continues.
+    ///
+    /// If an MPP HTLC somehow reaches the no-MPP handler (shouldn't happen
+    /// in normal operation), the rejection is converted to a continue
+    /// response to avoid breaking the payment - the sender will retry.
+    #[test]
+    fn mpp_not_supported_rejection_continues() {
+        let decision = HtlcDecision::Reject {
+            reason: RejectReason::MppNotSupported,
+        };
+
+        let result = decision_to_response(decision).unwrap();
+
+        // MppNotSupported converts to continue, not fail
+        assert_eq!(result["result"], "continue");
+        assert!(result.get("failure_message").is_none());
+    }
+
+    /// This test documents that NotOurs decision continues.
+    ///
+    /// When the SCID is not found in the datastore, the handler returns
+    /// `HtlcDecision::NotOurs` which is converted to a continue response.
+    #[test]
+    fn not_ours_decision_continues() {
+        let decision = HtlcDecision::NotOurs;
+        let result = decision_to_response(decision).unwrap();
+
+        assert_eq!(result["result"], "continue");
     }
 }
