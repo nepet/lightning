@@ -31,6 +31,9 @@ def on_htlc_accepted(htlc, onion, plugin, **kwargs):
 
     # Give the tester something to look for
     plugin.log("htlc_accepted hook called")
+    if plugin.hold_result == 'fail':
+        # CLN v25.12+ requires failure_message when failing HTLCs
+        return {'result': 'fail', 'failure_message': '1007'}  # temporary_channel_failure
     return {'result': plugin.hold_result}
 
 
