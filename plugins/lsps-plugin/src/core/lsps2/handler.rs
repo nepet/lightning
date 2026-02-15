@@ -438,16 +438,13 @@ impl<A: DatastoreProvider + Lsps2OfferProvider + LightningProvider> HtlcAccepted
         // become READY to use.
         // ---
 
-        // Fixme: We only accept no-mpp for now, mpp and other flows will be added later on
-        // Fixme: We continue mpp for now to let the test mock handle the htlc, as we need
-        // to test the client implementation for mpp payments.
+        // MPP payments are handled via the SessionManager in service.rs (handle_mpp_htlc).
+        // In production, service.rs routes MPP HTLCs to the session flow before reaching
+        // this handler. This continue response allows test mocks to handle MPP HTLCs
+        // for client-side testing scenarios.
         if ds_rec.expected_payment_size.is_some() {
-            warn!("mpp payments are not implemented yet");
+            warn!("MPP HTLC reached legacy handler - should be routed to session flow");
             return Ok(HtlcAcceptedResponse::continue_(None, None, None));
-            // return Ok(HtlcAcceptedResponse::fail(
-            //     Some(UNKNOWN_NEXT_PEER.to_string()),
-            //     None,
-            // ));
         }
 
         // B) Is the fee option menu still valid?
@@ -1342,8 +1339,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // We deactivate the mpp check on the experimental server for
-              // client side checks.
+    #[ignore] // MPP is now handled via SessionManager in service.rs (handle_mpp_htlc).
+              // This handler returns continue for MPP to support client-side test mocks.
     async fn test_htlc_mpp_not_implemented() {
         let fake = FakeCln::default();
         let handler = HtlcAcceptedHookHandler::new(fake.clone(), 1000);

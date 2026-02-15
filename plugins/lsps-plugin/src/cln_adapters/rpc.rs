@@ -1,6 +1,8 @@
 use crate::{
     core::lsps2::provider::{
-        Blockheight, BlockheightProvider, DatastoreProvider, LightningProvider, Lsps2OfferProvider,
+        Blockheight, BlockheightProvider, ChannelInfo, DatastoreProvider,
+        FundChannelCompleteResult, FundChannelStartResult, FundPsbtResult, LightningProvider,
+        Lsps2OfferProvider, SendPsbtResult, SignPsbtResult,
     },
     proto::{
         lsps0::Msat,
@@ -97,6 +99,59 @@ impl LightningProvider for ClnApiRpc {
         }
 
         return Ok(false);
+    }
+
+    // Stubs for MPP withheld funding flow — real implementations in a later commit.
+
+    async fn fund_channel_start(
+        &self,
+        _peer_id: &PublicKey,
+        _amount_sat: u64,
+        _announce: bool,
+        _mindepth: Option<u32>,
+    ) -> Result<FundChannelStartResult> {
+        unimplemented!("MPP withheld funding not yet wired")
+    }
+
+    async fn fund_channel_complete_withheld(
+        &self,
+        _peer_id: &PublicKey,
+        _psbt: &str,
+    ) -> Result<FundChannelCompleteResult> {
+        unimplemented!("MPP withheld funding not yet wired")
+    }
+
+    async fn broadcast_funding(&self, _psbt: &str) -> Result<SendPsbtResult> {
+        unimplemented!("MPP withheld funding not yet wired")
+    }
+
+    async fn get_channel_info(
+        &self,
+        _peer_id: &PublicKey,
+        _channel_id: Option<&[u8; 32]>,
+    ) -> Result<Option<ChannelInfo>> {
+        unimplemented!("MPP withheld funding not yet wired")
+    }
+
+    async fn fund_psbt(
+        &self,
+        _amount_sat: u64,
+        _feerate: &str,
+        _startweight: u32,
+    ) -> Result<FundPsbtResult> {
+        unimplemented!("MPP withheld funding not yet wired")
+    }
+
+    async fn sign_psbt(&self, _psbt: &str) -> Result<SignPsbtResult> {
+        unimplemented!("MPP withheld funding not yet wired")
+    }
+
+    async fn unreserve_inputs(&self, _psbt: &str) -> Result<()> {
+        unimplemented!("MPP withheld funding not yet wired")
+    }
+
+    async fn close_channel(&self, _channel_id: &[u8; 32]) -> Result<()> {
+        unimplemented!("MPP withheld funding not yet wired")
     }
 }
 

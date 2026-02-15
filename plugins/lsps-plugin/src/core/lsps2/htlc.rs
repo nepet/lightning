@@ -111,9 +111,10 @@ impl<A: DatastoreProvider + Lsps2OfferProvider + LightningProvider> HtlcAccepted
         // become READY to use.
         // ---
 
-        // Fixme: We only accept no-mpp for now, mpp and other flows will be added later on
-        // Fixme: We continue mpp for now to let the test mock handle the htlc, as we need
-        // to test the client implementation for mpp payments.
+        // MPP payments are handled via the SessionManager in service.rs (handle_mpp_htlc).
+        // This check is a defensive safeguard - if an MPP HTLC somehow reaches this
+        // handler (which should only process no-MPP payments), reject it gracefully
+        // rather than proceeding with incorrect single-part logic.
         if ds_rec.expected_payment_size.is_some() {
             return Ok(HtlcDecision::Reject {
                 reason: RejectReason::MppNotSupported,
@@ -237,6 +238,10 @@ impl<A: DatastoreProvider + Lsps2OfferProvider + LightningProvider> HtlcAccepted
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::lsps2::provider::{
+        ChannelInfo, FundChannelCompleteResult, FundChannelStartResult, FundPsbtResult,
+        SendPsbtResult, SignPsbtResult,
+    };
     use crate::core::tlv::TlvStream;
     use crate::proto::lsps0::{Msat, Ppm, ShortChannelId};
     use crate::proto::lsps2::{
@@ -462,6 +467,57 @@ mod tests {
             self.channel_ready_checks.fetch_add(1, Ordering::SeqCst);
             Ok(*self.channel_ready.lock().unwrap())
         }
+
+        async fn fund_channel_start(
+            &self,
+            _peer_id: &PublicKey,
+            _amount_sat: u64,
+            _announce: bool,
+            _mindepth: Option<u32>,
+        ) -> AnyResult<FundChannelStartResult> {
+            unimplemented!("not needed for HTLC tests")
+        }
+
+        async fn fund_channel_complete_withheld(
+            &self,
+            _peer_id: &PublicKey,
+            _psbt: &str,
+        ) -> AnyResult<FundChannelCompleteResult> {
+            unimplemented!("not needed for HTLC tests")
+        }
+
+        async fn broadcast_funding(&self, _psbt: &str) -> AnyResult<SendPsbtResult> {
+            unimplemented!("not needed for HTLC tests")
+        }
+
+        async fn get_channel_info(
+            &self,
+            _peer_id: &PublicKey,
+            _channel_id: Option<&[u8; 32]>,
+        ) -> AnyResult<Option<ChannelInfo>> {
+            unimplemented!("not needed for HTLC tests")
+        }
+
+        async fn fund_psbt(
+            &self,
+            _amount_sat: u64,
+            _feerate: &str,
+            _startweight: u32,
+        ) -> AnyResult<FundPsbtResult> {
+            unimplemented!("not needed for HTLC tests")
+        }
+
+        async fn sign_psbt(&self, _psbt: &str) -> AnyResult<SignPsbtResult> {
+            unimplemented!("not needed for HTLC tests")
+        }
+
+        async fn unreserve_inputs(&self, _psbt: &str) -> AnyResult<()> {
+            unimplemented!("not needed for HTLC tests")
+        }
+
+        async fn close_channel(&self, _channel_id: &[u8; 32]) -> AnyResult<()> {
+            unimplemented!("not needed for HTLC tests")
+        }
     }
 
     fn handler(api: MockApi) -> HtlcAcceptedHookHandler<MockApi> {
@@ -484,8 +540,13 @@ mod tests {
         assert_eq!(result, HtlcDecision::NotOurs);
     }
 
+    /// Test that MPP payments are rejected by this handler.
+    ///
+    /// In production, MPP payments are routed to `handle_mpp_htlc()` in service.rs
+    /// before reaching this handler. This test verifies the defensive safeguard:
+    /// if an MPP HTLC somehow reaches this no-MPP handler, it rejects gracefully.
     #[tokio::test]
-    async fn continues_when_mpp_payment() {
+    async fn rejects_mpp_payment_as_safety_net() {
         let entry = test_datastore_entry(Some(Msat(50_000_000))); // MPP = has expected size
         let api = MockApi::new().with_buy_request(entry);
         let h = handler(api);
