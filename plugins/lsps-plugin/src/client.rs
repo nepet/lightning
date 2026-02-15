@@ -268,6 +268,8 @@ async fn on_lsps_lsps2_approve(
     let ds_rec = DatastoreRecord {
         jit_channel_scid: req.jit_channel_scid.clone(),
         client_trusts_lsp: req.client_trusts_lsp.unwrap_or_default(),
+        opening_fee_msat: req.opening_fee_msat,
+        cumulative_extra_fee_msat: 0,
     };
     let ds_rec_json = serde_json::to_string(&ds_rec)?;
 
@@ -364,7 +366,8 @@ async fn on_lsps_lsps2_invoice(
     };
 
     // Check that the amount is big enough to cover the fee and a single HTLC.
-    let reduced_amount_msat = if let Some(payment_msat) = payment_size_msat {
+    // Also store the opening_fee_msat for later validation of extra_fee TLVs.
+    let (reduced_amount_msat, opening_fee_msat) = if let Some(payment_msat) = payment_size_msat {
         match compute_opening_fee(
             payment_msat.msat(),
             selected_params.min_fee_msat.msat(),
@@ -379,12 +382,12 @@ async fn on_lsps_lsps2_invoice(
                         fee_msat
                     );
                 }
-                Some(payment_msat.msat() - fee_msat)
+                (Some(payment_msat.msat() - fee_msat), Some(fee_msat))
             }
             None => bail!("failed to compute opening fee"),
         }
     } else {
-        None
+        (None, None)
     };
 
     // 3. Request channel from LSP.
@@ -485,6 +488,7 @@ async fn on_lsps_lsps2_invoice(
         jit_channel_scid: buy_res.jit_channel_scid,
         payment_hash: public_inv.payment_hash.to_string(),
         client_trusts_lsp: Some(buy_res.client_trusts_lsp),
+        opening_fee_msat,
     };
     let _: serde_json::Value = cln_client.call_raw("lsps-lsps2-approve", &appr_req).await?;
 
@@ -522,13 +526,37 @@ async fn on_invoice_payment(
     let mut cln_client = ok_or_continue!(cln_rpc::ClnRpc::new(rpc_path.clone())
         .await
         .context("failed to connect to core-lightning"));
+
+    // First, look up the invoice entry to get the lsp_id
+    let invoice_key = vec!["lsps".to_string(), "invoice".to_string(), hash.to_string()];
+    let lsp_data = ok_or_continue!(cln_client
+        .call_typed(&ListdatastoreRequest {
+            key: Some(invoice_key.clone()),
+        })
+        .await
+        .context("failed to fetch invoice datastore record"));
+
+    // Extract lsp_id and delete client entry if present
+    if let Some(entry) = lsp_data.datastore.first() {
+        if let Some(lsp_id) = entry.string.as_ref() {
+            // Delete the client datastore entry
+            let _ = cln_client
+                .call_typed(&DeldatastoreRequest {
+                    key: vec!["lsps".to_string(), "client".to_string(), lsp_id.clone()],
+                    generation: None,
+                })
+                .await;
+        }
+    }
+
+    // Delete the invoice datastore entry
     ok_or_continue!(cln_client
         .call_typed(&DeldatastoreRequest {
-            key: vec!["lsps".to_string(), "invoice".to_string(), hash.to_string()],
+            key: invoice_key,
             generation: None,
         })
         .await
-        .context("failed to delete datastore record"));
+        .context("failed to delete invoice datastore record"));
 
     Ok(serde_json::json!({"result": "continue"}))
 }
@@ -571,7 +599,37 @@ async fn on_htlc_accepted(
         .context("failed to fetch datastore record"));
 
     // If we don't know about this payment it's not an LSP payment, continue.
-    some_or_continue!(lsp_data.datastore.first());
+    let invoice_entry = some_or_continue!(lsp_data.datastore.first());
+
+    // Extract the lsp_id from the invoice entry
+    let lsp_id = some_or_continue!(
+        invoice_entry.string.as_ref(),
+        "invoice datastore entry missing lsp_id string"
+    );
+
+    // Fetch the DatastoreRecord for this LSP to get opening_fee_msat
+    let client_data = ok_or_continue!(cln_client
+        .call_typed(&ListdatastoreRequest {
+            key: Some(vec![
+                "lsps".to_string(),
+                "client".to_string(),
+                lsp_id.clone(),
+            ]),
+        })
+        .await
+        .context("failed to fetch client datastore record"));
+
+    let client_entry = some_or_continue!(
+        client_data.datastore.first(),
+        "client datastore entry not found for lsp_id={}",
+        lsp_id
+    );
+
+    let ds_record: DatastoreRecord = ok_or_continue!(client_entry
+        .string
+        .as_ref()
+        .ok_or_else(|| anyhow!("client datastore entry missing string"))
+        .and_then(|s| serde_json::from_str(s).context("failed to parse DatastoreRecord")));
 
     let extra_fee_msat = req
         .htlc
@@ -582,12 +640,61 @@ async fn on_htlc_accepted(
         .flatten()
         .unwrap_or_default();
 
+    // Calculate proposed cumulative extra_fee for MPP validation
+    let proposed_cumulative = ds_record.cumulative_extra_fee_msat.saturating_add(extra_fee_msat);
+
     debug!(
-        "incoming jit-channel htlc with htlc_amt={}, onion_amt={} and extra_fee={}",
+        "incoming jit-channel htlc with htlc_amt={}, onion_amt={}, extra_fee={}, \
+         cumulative={}, proposed_cumulative={}, opening_fee={:?}",
         htlc_amt.msat(),
         onion_amt.msat(),
-        extra_fee_msat
+        extra_fee_msat,
+        ds_record.cumulative_extra_fee_msat,
+        proposed_cumulative,
+        ds_record.opening_fee_msat
     );
+
+    // SECURITY CHECK: Validate cumulative extra_fee does not exceed opening_fee
+    // Per LSPS2 spec: "client MUST check that sum of all extra_fees <= opening_fee"
+    if let Some(opening_fee) = ds_record.opening_fee_msat {
+        if proposed_cumulative > opening_fee {
+            warn!(
+                "SECURITY: Rejecting HTLC - cumulative extra_fee {} (current {} + new {}) \
+                 exceeds opening_fee {}",
+                proposed_cumulative, ds_record.cumulative_extra_fee_msat, extra_fee_msat, opening_fee
+            );
+            let value = serde_json::to_value(HtlcAcceptedResponse::fail(
+                Some("2002".to_string()), // WIRE_TEMPORARY_CHANNEL_FAILURE
+                None,
+            ))?;
+            return Ok(value);
+        }
+    }
+
+    // Update datastore with new cumulative extra_fee
+    if extra_fee_msat > 0 {
+        let updated_record = DatastoreRecord {
+            cumulative_extra_fee_msat: proposed_cumulative,
+            ..ds_record
+        };
+        let updated_json = ok_or_continue!(serde_json::to_string(&updated_record)
+            .context("failed to serialize updated DatastoreRecord"));
+
+        ok_or_continue!(cln_client
+            .call_typed(&DatastoreRequest {
+                generation: None,
+                hex: None,
+                mode: Some(DatastoreMode::CREATE_OR_REPLACE),
+                string: Some(updated_json),
+                key: vec![
+                    "lsps".to_string(),
+                    "client".to_string(),
+                    lsp_id.clone(),
+                ],
+            })
+            .await
+            .context("failed to update cumulative extra_fee in datastore"));
+    }
 
     if htlc_amt.msat() + extra_fee_msat != onion_amt.msat() {
         warn!(
@@ -595,7 +702,12 @@ async fn on_htlc_accepted(
             (htlc_amt.msat() + extra_fee_msat),
             onion_amt.msat()
         );
-        // FIXME: If we are strict, we should reject the htlc here.
+        // Reject HTLCs where amounts don't match - this is now enforced
+        let value = serde_json::to_value(HtlcAcceptedResponse::fail(
+            Some("2002".to_string()), // WIRE_TEMPORARY_CHANNEL_FAILURE
+            None,
+        ))?;
+        return Ok(value);
     }
 
     let inv_res = ok_or_continue!(cln_client
@@ -617,7 +729,10 @@ async fn on_htlc_accepted(
         hex::encode(&req.htlc.payment_hash)
     );
 
-    let total_amt = invoice.amount_msat.unwrap_or(htlc_amt).msat();
+    // For fixed-amount invoices, use the invoice amount (which is already reduced by the fee).
+    // For variable-amount invoices, use the actual HTLC amount since the fee is deducted
+    // from each part by the LSP.
+    let total_amt = invoice.amount_msat.map(|a| a.msat()).unwrap_or_else(|| htlc_amt.msat());
 
     let mut payload = req.onion.payload.clone();
     payload.set_tu64(TLV_FORWARD_AMT, htlc_amt.msat());
@@ -677,19 +792,9 @@ async fn on_openchannel(
             "Allowing zero-conf channel from LSP {}",
             &req.openchannel.id
         );
-        let ds_req = DeldatastoreRequest {
-            generation: None,
-            key: vec![
-                "lsps".to_string(),
-                "client".to_string(),
-                req.openchannel.id.clone(),
-            ],
-        };
-        if let Some(err) = cln_client.call_typed(&ds_req).await.err() {
-            // We can do nothing but report that there was an issue deleting the
-            // datastore record.
-            warn!("Failed to delete LSP record from datastore: {}", err);
-        }
+        // Note: Don't delete the datastore record here - it's still needed by
+        // htlc_accepted to validate extra_fee and process the payment.
+        // Cleanup happens in on_invoice_payment after payment is complete.
         // Fixme: Check that we actually use client-trusts-LSP mode - can be
         // found in the ds record.
         return Ok(serde_json::json!({
@@ -895,10 +1000,19 @@ struct ClnRpcLsps2Approve {
     payment_hash: String,
     #[serde(default)]
     client_trusts_lsp: Option<bool>,
+    /// The opening fee agreed upon during lsps2.buy
+    #[serde(default)]
+    opening_fee_msat: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DatastoreRecord {
     jit_channel_scid: ShortChannelId,
     client_trusts_lsp: bool,
+    /// The opening fee agreed upon during lsps2.buy, used to validate extra_fee TLVs
+    #[serde(default)]
+    opening_fee_msat: Option<u64>,
+    /// Cumulative extra_fee received across all HTLC parts (for MPP validation)
+    #[serde(default)]
+    cumulative_extra_fee_msat: u64,
 }
