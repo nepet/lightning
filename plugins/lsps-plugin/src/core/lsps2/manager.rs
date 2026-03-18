@@ -301,11 +301,10 @@ mod tests {
         ShortChannelId::from(999u64 << 40 | 9u64 << 16 | 9)
     }
 
-    fn test_peer_id() -> cln_rpc::primitives::PublicKey {
-        serde_json::from_value(serde_json::json!(
-            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
-        ))
-        .unwrap()
+    fn test_peer_id() -> bitcoin::secp256k1::PublicKey {
+        "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+            .parse()
+            .unwrap()
     }
 
     fn opening_fee_params(min_fee_msat: u64) -> OpeningFeeParams {
