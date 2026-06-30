@@ -396,8 +396,12 @@ impl Session {
                 };
 
                 if threshold_reached {
+                    let fee_base_msat = match self.payment_size_msat {
+                        Some(fixed) => fixed.msat(),
+                        None => parts_sum.msat(),
+                    };
                     let opening_fee_msat = compute_opening_fee(
-                        parts_sum.msat(),
+                        fee_base_msat,
                         self.opening_fee_params.min_fee_msat.msat(),
                         self.opening_fee_params.proportional.ppm() as u64,
                     )
@@ -2090,5 +2094,37 @@ mod tests {
         let _ = result;
         assert!(session.is_terminal());
         assert_eq!(session.outcome(), Some(SessionOutcome::Succeeded));
+    }
+
+    #[test]
+    fn collecting_fixed_amount_fee_uses_payment_size_not_htlc_amount() {
+        // For a fixed-amount session (payment_size_msat = Some(10_000)), when a
+        // much larger HTLC arrives (100_000_000_000 msat), the opening fee must
+        // be computed from the agreed payment_size_msat, not from parts_sum.
+        //
+        // With min_fee=1_000 and proportional=1_000 ppm:
+        //   correct fee = max(1_000, ceil(10_000 * 1_000 / 1_000_000))   =   1_000
+        //   wrong fee   = max(1_000, ceil(1e11  * 1_000 / 1_000_000))    = 100_000_000
+        let mut s = session(3, Some(10_000), 1_000);
+
+        let _ = s
+            .apply(SessionInput::AddPart {
+                part: part(1, 100_000_000_000),
+            })
+            .unwrap();
+
+        let expected_fee = compute_opening_fee(10_000, 1_000, 1_000).unwrap();
+
+        match s.state {
+            SessionState::AwaitingChannelReady { opening_fee_msat, .. } => {
+                assert_eq!(
+                    opening_fee_msat,
+                    expected_fee,
+                    "opening fee must be computed from payment_size_msat (10_000), \
+                     not parts_sum (100_000_000_000); got {opening_fee_msat}, want {expected_fee}"
+                );
+            }
+            _ => panic!("expected AwaitingChannelReady, got {:?}", s.state),
+        }
     }
 }
