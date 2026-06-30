@@ -127,17 +127,19 @@ async fn main() -> Result<(), anyhow::Error> {
                 valid_until_hours
             );
         }
-        if min_lifetime < 0 {
+        if min_lifetime < 0 || min_lifetime > i64::from(u32::MAX) {
             bail!(
-                "`{}` must be non-negative, got {}",
+                "`{}` must be between 0 and {}, got {}",
                 OPTION_MIN_LIFETIME.name,
+                u32::MAX,
                 min_lifetime
             );
         }
-        if max_client_to_self_delay < 0 {
+        if max_client_to_self_delay < 0 || max_client_to_self_delay > i64::from(u32::MAX) {
             bail!(
-                "`{}` must be non-negative, got {}",
+                "`{}` must be between 0 and {}, got {}",
                 OPTION_MAX_CLIENT_TO_SELF_DELAY.name,
+                u32::MAX,
                 max_client_to_self_delay
             );
         }
