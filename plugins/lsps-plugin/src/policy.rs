@@ -1,4 +1,4 @@
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use chrono::{Duration, Utc};
 use cln_lsps::lsps0::primitives::{Msat, Ppm};
 use cln_lsps::lsps2::model::{
@@ -166,6 +166,13 @@ async fn main() -> Result<(), anyhow::Error> {
                 channel_capacity_msat
             );
         }
+        if channel_capacity_msat % 1_000 != 0 {
+            bail!(
+                "`{}` must be divisible by 1000 (whole satoshis), got {}",
+                OPTION_CHANNEL_CAPACITY_MSAT.name,
+                channel_capacity_msat
+            );
+        }
 
         let state = State {
             min_fee_msat: Msat::from_msat(min_fee_msat as u64),
@@ -193,7 +200,11 @@ async fn on_getpolicy(
         serde_json::from_value(v).unwrap_or(Lsps2PolicyGetInfoRequest { token: None });
 
     let s = p.state();
-    let valid_until = Utc::now() + Duration::hours(s.valid_until_hours);
+    let offset = Duration::try_hours(s.valid_until_hours)
+        .ok_or_else(|| anyhow!("`{}` is out of range", OPTION_VALID_UNTIL_HOURS.name))?;
+    let valid_until = Utc::now()
+        .checked_add_signed(offset)
+        .ok_or_else(|| anyhow!("`{}` is out of range", OPTION_VALID_UNTIL_HOURS.name))?;
 
     let params = PolicyOpeningFeeParams {
         min_fee_msat: s.min_fee_msat,
