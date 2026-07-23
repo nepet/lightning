@@ -314,10 +314,13 @@ target/${RUST_PROFILE}/cln-lsps-client: ${CLN_LSPS_PLUGIN_SRC}
 	cargo build ${CARGO_OPTS} --bin cln-lsps-client
 target/${RUST_PROFILE}/cln-lsps-service: ${CLN_LSPS_PLUGIN_SRC}
 	cargo build ${CARGO_OPTS} --bin cln-lsps-service
+target/${RUST_PROFILE}/cln-lsps-policy: ${CLN_LSPS_PLUGIN_SRC}
+	cargo build ${CARGO_OPTS} --bin cln-lsps-policy
 
 ifneq ($(RUST),0)
 include plugins/rest-plugin/Makefile
-DEFAULT_TARGETS += $(CLN_PLUGIN_EXAMPLES) plugins/cln-grpc plugins/clnrest plugins/cln-lsps-client plugins/cln-lsps-service
+
+DEFAULT_TARGETS += $(CLN_PLUGIN_EXAMPLES) plugins/cln-grpc plugins/clnrest plugins/cln-lsps-client plugins/cln-lsps-service target/${RUST_PROFILE}/cln-lsps-policy
 endif
 
 clean: plugins-clean
