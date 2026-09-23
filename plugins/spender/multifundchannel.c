@@ -1846,7 +1846,7 @@ param_destinations_array(struct command *cmd, const char *name,
 	json_for_each_arr(i, json_dest, tok) {
 		struct multifundchannel_destination *dest;
 		const char *id;
-		char *addrhint;
+		const char *addrhint;
 		struct amount_sat *amount, *request_amt;
 		bool *announce;
 		struct amount_msat *push_msat;
@@ -1997,9 +1997,6 @@ json_multifundchannel(struct command *cmd,
 		   p_opt("commitment_feerate", param_string, &mfc->cmtmt_feerate_str),
 		   NULL))
 		return command_param_failed();
-
-	/* Should exist; it would only nonexist if it were a notification.  */
-	assert(cmd->id);
 
 	mfc->id = ++mfc_id;
 	mfc->cmd = cmd;

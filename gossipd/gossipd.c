@@ -261,7 +261,7 @@ static void handle_recv_gossip(struct daemon *daemon, const u8 *outermsg)
 	case WIRE_PEER_STORAGE:
 	case WIRE_PEER_STORAGE_RETRIEVAL:
 	case WIRE_STFU:
-	case WIRE_SPLICE:
+	case WIRE_SPLICE_INIT:
 	case WIRE_SPLICE_ACK:
 	case WIRE_SPLICE_LOCKED:
 		break;
@@ -328,6 +328,11 @@ void tell_lightningd_peer_update(struct daemon *daemon,
 {
 	struct peer_update remote_update;
 	u8* msg;
+
+	/* FIXME: Tell connectd to kick out source peer if this happens? */
+	if (daemon_conn_queue_length(daemon->master) > 10000)
+		return;
+
 	remote_update.scid = scid;
 	remote_update.fee_base = fee_base_msat;
 	remote_update.fee_ppm = fee_ppm;
@@ -495,6 +500,15 @@ static void inject_gossip(struct daemon *daemon, const u8 *msg)
 
 /*~ This is where lightningd tells us that a channel's funding transaction has
  * been spent. */
+/* BOLT #7:
+ * ## Pruning the Network View
+ *...
+ * ### Requirements
+ *
+ * A node:
+ *   - SHOULD monitor the funding transactions in the blockchain, to identify
+ *   channels that are being closed.
+ */
 static void handle_outpoints_spent(struct daemon *daemon, const u8 *msg)
 {
 	struct short_channel_id *scids;

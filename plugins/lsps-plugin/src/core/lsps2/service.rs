@@ -171,7 +171,7 @@ mod tests {
         Lsps2PolicyGetInfoResponse, OpeningFeeParams, PolicyOpeningFeeParams, Promise,
         SessionOutcome,
     };
-    use anyhow::{anyhow, Result as AnyResult};
+    use anyhow::{Result as AnyResult, anyhow};
     use chrono::{TimeZone, Utc};
     use std::sync::{Arc, Mutex};
 

@@ -299,19 +299,19 @@ automatically by `lightningd`.
   This option supports both legacy 32-byte `hsm_secret` files (where the passphrase
   encrypts the secret) and new BIP39 mnemonic-based secrets (where the passphrase
   is used as additional entropy during seed derivation according to the BIP39 standard).
-  
+
   Note that once you set a passphrase, this option will be mandatory for
-  `lightningd` to start. If there is no HSM secret yet, `lightningd` will create 
+  `lightningd` to start. If there is no HSM secret yet, `lightningd` will create
   a new mnemonic-based secret that will be secured with your passphrase following
   BIP39 specifications.
-  
+
   For legacy users: If you have an existing encrypted `hsm_secret` that was created
   with the deprecated `encrypted-hsm` option, this will continue to work seamlessly.
-  
+
   For new mnemonic-based secrets: The passphrase becomes part of the seed derivation
-  process as specified in BIP39, providing an additional factor of security. The 
+  process as specified in BIP39, providing an additional factor of security. The
   mnemonic words alone are not sufficient to derive the seed without the passphrase.
-  
+
   If you have an unencrypted legacy `hsm_secret` you want to encrypt, or need to
   manage your HSM secrets, see lightning-hsmtool(8).
 
@@ -339,7 +339,7 @@ connections. Default is 9736.
 * **recover**=*mnemonic*
 
   Restore the node from a mnemonic.  For pre-25.12 nodes (which didn't have a mnemonic), use a 32-byte secret encoded as either a codex32 secret string or a 64-character hex string.
-  
+
   This will fail if the `hsm_secret` file exists.  Your node will start the node in offline mode, for manual recovery.  The secret can be extracted from the `hsm_secret` using lightning-hsmtool(8)'s `getsecret`.
 
 * **alias**=*NAME*
@@ -563,6 +563,10 @@ command, so they invoices can also be paid onchain.
 
   Setting this makes `xpay` wait until all parts have failed/succeeded before returning.  Usually this is unnecessary, as xpay will return on the first success (we have the preimage, if they don't take all the parts that's their problem) or failure (the destination could succeed another part, but it would mean it was only partially paid).  The default is `false`.
 
+* **xpay-user-layer**=*name* [plugin `xpay`]
+
+  Specify the name of a layer `xpay` shall use always for every payment.  This is specially useful when combined with `xpay-handle-pay` since the `layers` parameter is not available in the `pay` interface.  This can be specified multiple times to add more layers.
+
 * **askrene-timeout**=*SECONDS* [plugin `askrene`, *dynamic*]
 
   This option makes the `getroutes` call fail if it takes more than this many seconds.  Setting it to zero is a fun way to ensure your node never makes payments.
@@ -574,6 +578,15 @@ command, so they invoices can also be paid onchain.
 * **bkpr-currency**=*name* [plugin `bookkeeper`, *dynamic*]
 
   The *name* is an ISO-4217 name (e.g. USD), which will be passed to *currencyrate* to fetch the exchange rate for that currency on each bookkeeper event.  Setting *name* to the empty string is equivalent not setting it.
+
+* **bwatch-poll-interval**=*MILLISECONDS* [plugin `bwatch`]
+
+  Delay between polls for new blocks from `bitcoind` (default: 30000).
+
+* **experimental-bwatch** [plugin `bwatch`]
+
+  Enable the experimental *bwatch* chain watcher.  Without this, the
+  plugin stays loaded but does not poll `bitcoind` or process watches.
 
 ### Networking options
 
@@ -706,6 +719,12 @@ all DNS lookups, to avoid leaking information.
 * **disable-dns**
 
   Disable the DNS bootstrapping mechanism to find a node by its node ID.
+
+* **message-padding**=*BOOL*
+
+  If set to `true`, `connectd` will send extra bytes to peers to make messages
+uniform length.  Some implementations don't accept these extra bytes,
+and our detection of them is not always reliable, so this option defaults to `false`.
 
 * **tor-service-password**=*PASSWORD*
 
@@ -852,6 +871,12 @@ about whether to add funds or not to a proposed channel is handled
 automatically by a plugin that implements the appropriate logic for
 your needs. The default behavior is to not contribute funds.
 
+* **experimental-simple-close**
+
+  Specifying this enables support for the simplified mutual close protocol
+([bolt][bolt] #2), where each peer independently builds and broadcasts its
+own closing transaction rather than iteratively negotiating a single agreed fee.
+
 * **experimental-splicing**
 
   Specifying this enables support for the splicing protocol ([bolt][bolt] #863),
@@ -862,20 +887,22 @@ The operations will be bundled into a single transaction. The channel will remai
 active while awaiting splice confirmation, however you can only spend the smaller
 of the prior channel balance and the new one.
 
-* **experimental-lsps-client**
+  (deprecated in v26.04)
+
+* **experimental-lsps-client** [plugin `cln-lsps-client`]
 
   Specifying this enables client side support for the lsps protocol
 ([blip][blip] #50). Core-Lightning only supports the lsps2 ([blip][blip] #52)
 subprotocol describing the creation of just-in-time-channel (JIT-channels)
 between a LSP and this client.
 
-* **experimental-lsps2-service**
+* **experimental-lsps2-service** [plugin `cln-lsps-service`]
 
   Specifying this enables a LSP JIT-Channel service according to the lsps
 protocol ([blip][blip] #52). It requires a LSP-Policy plugin to be available and
 a *experimental-lsps2-promise-secret* to be set.
 
-* **experimental-lsps2-promise-secret**=*promisesecret*
+* **experimental-lsps2-promise-secret**=*promisesecret* [plugin `cln-lsps-service`]
 
   Sets a `promisesecret` for the LSP JIT-Channel service. Is a 64-character hex
  string that acts as the secret for promises according to ([blip][blip] #52).

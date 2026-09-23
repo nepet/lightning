@@ -12,6 +12,7 @@
 #include <wallet/wallet.h>
 
 struct amount_msat;
+struct watchman;
 
 /* Various adjustable things. */
 struct config {
@@ -95,8 +96,13 @@ struct config {
 typedef STRMAP(const char *) alt_subdaemon_map;
 
 enum lightningd_state {
+	/* Starting up */
 	LD_STATE_INITIALIZING,
+	/* Normal */
 	LD_STATE_RUNNING,
+	/* Waiting for graceful shutdown */
+	LD_STATE_GRACE,
+	/* Shutting down */
 	LD_STATE_SHUTDOWN,
 };
 
@@ -239,6 +245,7 @@ struct lightningd {
 	/* Derive all our BIP86 keys from here */
 	struct ext_key *bip86_base;
 	struct wallet *wallet;
+	struct watchman *watchman;
 
 	/* Outstanding waitsendpay commands. */
 	struct list_head waitsendpay_commands;
@@ -250,7 +257,8 @@ struct lightningd {
 	struct list_head disconnect_commands;
 	/* Outstanding wait commands */
 	struct list_head wait_commands;
-
+	/* Outstanding graceful commands */
+	struct list_head graceful_commands;
 	/* Outstanding splice commands. */
 	struct list_head splice_commands;
 
@@ -369,9 +377,6 @@ struct lightningd {
 	/* Tell connectd we don't want TCP_NODELAY */
 	bool dev_keep_nagle;
 
-	/* Pad outgoing messages to uniform 1460-byte segments (traffic analysis defence) */
-	bool dev_uniform_padding;
-
 	/* tor support */
 	struct wireaddr *proxyaddr;
 	bool always_use_proxy;
@@ -437,6 +442,9 @@ struct lightningd {
 
 	/* Nodes to use for invoices / offers */
 	struct node_id *fronting_nodes;
+
+	/* Whether connectd should pad messages to make them equal length */
+	bool message_padding;
 };
 
 /* Turning this on allows a tal allocation to return NULL, rather than aborting.

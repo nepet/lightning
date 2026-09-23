@@ -420,6 +420,10 @@ static void broadcast_new_gossip(struct lightningd *ld,
 	if (ld->dev_suppress_gossip)
 		return;
 
+	/* BOLT #7:
+	 * - SHOULD send gossip messages as it generates them regardless
+	 *   of `timestamp`.
+	 */
 	/* Tell all our peers about it, too! */
 	for (peer = peer_node_id_map_first(ld->peers, &it);
 	     peer;
@@ -659,6 +663,11 @@ static void stash_remote_announce_sigs(struct channel *channel,
 		  fmt_short_channel_id(tmpctx, scid),
 		  channel->scid ? fmt_short_channel_id(tmpctx, *channel->scid) : "none");
 
+	/* BOLT #7:
+	 *   - If it has not sent `channel_ready`:
+	 *     - SHOULD defer handling the `announcement_signatures` until
+	 *       after it has sent `channel_ready`.
+	 */
 	/* Save to db if we like these signatures */
 	if (!channel->scid)
 		return;
@@ -679,9 +688,13 @@ static void stash_remote_announce_sigs(struct channel *channel,
  * - If the `open_channel` message has the `announce_channel` bit set AND a
  *   `shutdown` message has not been sent:
  *    - After `channel_ready` has been sent and received AND the funding
- *       transaction has enough confirmations to ensure that it won't be
- *       reorganized:
- *       - MUST send `announcement_signatures` for the funding transaction.
+ *      transaction has enough confirmations to ensure that it won't be
+ *      reorganized:
+ *      - MUST send `announcement_signatures` for the funding transaction.
+ *    - After `splice_locked` has been sent and received AND the splice
+ *      transaction has enough confirmations to ensure that it won't be
+ *      reorganized:
+ *      - MUST send `announcement_signatures` for the matching splice transaction.
  * - Otherwise:
  *   - MUST NOT send the `announcement_signatures` message.
  */

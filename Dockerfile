@@ -57,8 +57,7 @@ RUN apt-get update && \
         flex \
         jq \
         libtool \
-        gettext \
-        protobuf-compiler
+        gettext
 
 WORKDIR /opt
 
@@ -189,6 +188,7 @@ RUN dpkg --add-architecture ${target_arch_dpkg}
 
 RUN apt-get update && \
     apt-get install -qq -y --no-install-recommends \
+        protobuf-compiler \
         pkg-config:${target_arch_dpkg} \
         crossbuild-essential-${target_arch_dpkg} && \
     apt-get clean && \

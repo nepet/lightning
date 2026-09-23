@@ -2,6 +2,7 @@
 #define LIGHTNING_LIGHTNINGD_PLUGIN_H
 #include "config.h"
 #include <ccan/intmap/intmap.h>
+#include <common/hash_str.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
 
@@ -23,11 +24,6 @@ struct plugin_subscription {
 	struct plugin *owner;
 	const char *topic;
 };
-
-static inline size_t hash_str(const char *str)
-{
-	return siphash24(siphash_seed(), str, strlen(str));
-}
 
 static inline const char *plugin_subscription_key(const struct plugin_subscription *ps)
 {
@@ -407,15 +403,19 @@ void json_add_config_plugin(struct json_stream *stream,
 			    const char *fieldname,
 			    const struct opt_table *ot);
 
-/* Attempt to setconfig an option in a plugin.  Calls success or fail, may be async! */
+/* Attempt to setconfig an option in a plugin.  Calls success or fail, may be async!
+ * For scalar options: vals is 1-element array (or NULL/0 for NOARG).
+ * For multi options: vals is the complete new set of values. */
 struct command_result *plugin_set_dynamic_opt(struct command *cmd,
 					      const struct opt_table *ot,
-					      const char *val,
+					      const char **vals,
+					      size_t nvals,
 					      bool transient,
 					      struct command_result *(*success)
 					      (struct command *,
 					       const struct opt_table *,
-					       const char *,
+					       const char **,
+					       size_t,
 					       bool));
 
 /* --dev-plugin-save-io */

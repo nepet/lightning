@@ -29,6 +29,7 @@
 #include <lightningd/plugin_control.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/subd.h>
+#include <lightningd/watchman.h>
 
 /* Only this file can include this generated header! */
 # include <plugins/list_of_builtin_plugins_gen.h>
@@ -190,23 +191,15 @@ struct command_result *plugin_register_all_complete(struct lightningd *ld,
 static void tell_connectd_custommsgs(struct plugins *plugins)
 {
 	struct plugin *p;
-	size_t n = 0;
-	u16 *all_msgs = tal_arr(tmpctx, u16, n);
+	u16 *all_msgs = tal_arr(tmpctx, u16, 0);
 
 	/* Not when shutting down */
 	if (!plugins->ld->connectd)
 		return;
 
 	/* Gather from all plugins. */
-	list_for_each(&plugins->plugins, p, list) {
-		size_t num = tal_count(p->custom_msgs);
-		/* Blah blah blah memcpy NULL blah blah */
-		if (num == 0)
-			continue;
-		tal_resize(&all_msgs, n + num);
-		memcpy(all_msgs + n, p->custom_msgs, num * sizeof(*p->custom_msgs));
-		n += num;
-	}
+	list_for_each(&plugins->plugins, p, list)
+		tal_arr_append(&all_msgs, p->custom_msgs);
 
 	/* Don't bother sorting or uniquifying.  If plugins are dumb, they deserve it. */
 	subd_send_msg(plugins->ld->connectd,
@@ -240,7 +233,7 @@ static void plugin_terminated_fail_req(struct plugin *plugin,
 
 	buf = tal_fmt(plugin,
 		      "{\"jsonrpc\": \"2.0\","
-		      "\"id\": %s,"
+		      "\"id\": \"%s\","
 		      "\"error\":"
 		      " {\"code\":%i, \"message\":\"%s\"}"
 		      "}\n\n",
@@ -557,10 +550,9 @@ static const char *plugin_notify_handle(struct plugin *plugin,
 			       "JSON-RPC notify \"id\"-field is not present");
 	}
 
-	/* Include any "" in id */
 	request = strmap_getn(&plugin->pending_requests,
-			      json_tok_full(buffer, idtok),
-			      json_tok_full_len(idtok));
+			      buffer + idtok->start,
+			      idtok->end - idtok->start);
 	if (!request) {
 		return NULL;
 	}
@@ -683,8 +675,8 @@ static void plugin_response_handle(struct plugin *plugin,
 	const tal_t *ctx;
 
 	request = strmap_getn(&plugin->pending_requests,
-			      json_tok_full(buffer, idtok),
-			      json_tok_full_len(idtok));
+			      buffer + idtok->start,
+			      idtok->end - idtok->start);
 	/* Can happen if request was freed before plugin responded */
 	if (!request) {
 		return;
@@ -1196,8 +1188,8 @@ static void json_stream_forward_change_id(struct json_stream *stream,
 					  const char *buffer,
 					  const jsmntok_t *toks,
 					  const jsmntok_t *idtok,
-					  /* Full token, including "" */
-					  const char *new_id)
+					  const char *new_id,
+					  bool make_new_id_a_string)
 {
 	/* We copy everything, but replace the id. Special care has to
 	 * be taken when the id that is being replaced is a string. If
@@ -1211,7 +1203,11 @@ static void json_stream_forward_change_id(struct json_stream *stream,
 
 	json_stream_append(stream, buffer + toks->start,
 			   id_start - (buffer + toks->start));
+	if (make_new_id_a_string)
+		json_stream_append(stream, "\"", 1);
 	json_stream_append(stream, new_id, strlen(new_id));
+	if (make_new_id_a_string)
+		json_stream_append(stream, "\"", 1);
 	json_stream_append(stream, id_end, (buffer + toks->end) - id_end);
 }
 
@@ -1223,7 +1219,8 @@ static void plugin_rpcmethod_cb(const char *buffer,
 	struct json_stream *response;
 
 	response = json_stream_raw_for_cmd(cmd);
-	json_stream_forward_change_id(response, buffer, toks, idtok, cmd->id);
+	/* cmd->id is a complete JSON token, quotes and all (if a string) */
+	json_stream_forward_change_id(response, buffer, toks, idtok, cmd->id, false);
 	json_stream_double_cr(response);
 	command_raw_complete(cmd, response);
 }
@@ -1244,8 +1241,9 @@ static void plugin_notify_cb(const char *buffer,
 	json_add_string(response, "jsonrpc", "2.0");
 	json_add_tok(response, "method", methodtok, buffer);
 	json_stream_append(response, ",\"params\":", strlen(",\"params\":"));
+	/* cmd->id is a complete JSON token, quotes and all (if a string) */
 	json_stream_forward_change_id(response, buffer,
-				      paramtoks, idtok, cmd->id);
+				      paramtoks, idtok, cmd->id, false);
 	json_object_end(response);
 
 	json_stream_double_cr(response);
@@ -1301,7 +1299,7 @@ static struct command_result *plugin_rpcmethod_check(struct command *cmd,
 					plugin_notify_cb,
 					plugin_rpcmethod_cb, cmd);
 
-	json_stream_forward_change_id(req->stream, buffer, toks, idtok, req->id);
+	json_stream_forward_change_id(req->stream, buffer, toks, idtok, req->id, true);
 	json_stream_double_cr(req->stream);
 	plugin_request_send(plugin, req);
 	req->stream = NULL;
@@ -1345,7 +1343,7 @@ static struct command_result *plugin_rpcmethod_dispatch(struct command *cmd,
 					plugin_notify_cb,
 					plugin_rpcmethod_cb, cmd);
 
-	json_stream_forward_change_id(req->stream, buffer, toks, idtok, req->id);
+	json_stream_forward_change_id(req->stream, buffer, toks, idtok, req->id, true);
 	json_stream_double_cr(req->stream);
 	plugin_request_send(plugin, req);
 	req->stream = NULL;
@@ -1385,6 +1383,11 @@ static const char *plugin_rpcmethod_add(struct plugin *plugin,
 		return tal_fmt(plugin,
 			    "\"usage\" not provided by plugin");
 
+	usage = json_escape_unescape_len(tmpctx, take(usage), strlen(usage));
+	if (!usage)
+		return tal_fmt(plugin,
+			       "\"usage\" contains invalid escape sequences");
+
 	err = json_parse_deprecated(cmd, buffer, deprtok, &cmd->depr_start, &cmd->depr_end);
 	if (err)
 		return tal_steal(plugin, err);
@@ -1392,14 +1395,21 @@ static const char *plugin_rpcmethod_add(struct plugin *plugin,
 	cmd->dev_only = false;
 	cmd->dispatch = plugin_rpcmethod_dispatch;
 	cmd->check = plugin_rpcmethod_check;
-	if (!jsonrpc_command_add(plugin->plugins->ld->jsonrpc, cmd, usage)) {
+	if (!jsonrpc_command_add(plugin->plugins->ld->jsonrpc, cmd, take(usage))) {
 		struct plugin *p =
 		    find_plugin_for_command(plugin->plugins->ld, cmd->name);
-		return tal_fmt(
-		    plugin,
-		    "Could not register method \"%s\", a method with "
-		    "that name is already registered by plugin %s",
-		    cmd->name, p->cmd);
+		if (p)
+			return tal_fmt(
+			    plugin,
+			    "Could not register method \"%s\", a method with "
+			    "that name is already registered by plugin %s",
+			    cmd->name, p->cmd);
+		else
+			return tal_fmt(plugin,
+				       "Could not register method \"%s\", a "
+				       "builtin method with "
+				       "that name is already registered",
+				       cmd->name);
 	}
 	tal_arr_expand(&plugin->methods, cmd->name);
 	return NULL;
@@ -2095,6 +2105,7 @@ static void plugin_config_cb(const char *buffer,
 	}
 	if (tal_count(plugin->custom_msgs))
 		tell_connectd_custommsgs(plugin->plugins);
+	watchman_notify_plugin_ready(plugin->plugins->ld, plugin);
 	notify_plugin_started(plugin->plugins->ld, plugin);
 	check_plugins_initted(plugin->plugins);
 }
@@ -2239,12 +2250,14 @@ bool plugins_config(struct plugins *plugins)
 
 struct plugin_set_return {
 	struct command *cmd;
-	const char *val;
+	const char **vals;
+	size_t nvals;
 	const char *optname;
 	bool transient;
 	struct command_result *(*success)(struct command *,
 					  const struct opt_table *,
-					  const char *,
+					  const char **,
+					  size_t,
 					  bool);
 };
 
@@ -2286,7 +2299,7 @@ static void plugin_setconfig_done(const char *buffer,
 	t = json_get_member(buffer, toks, "result");
 	if (!t)
 		goto bad_response;
-	was_pending(psr->success(psr->cmd, ot, psr->val, psr->transient));
+	was_pending(psr->success(psr->cmd, ot, psr->vals, psr->nvals, psr->transient));
 	return;
 
 bad_response:
@@ -2300,12 +2313,14 @@ bad_response:
 
 struct command_result *plugin_set_dynamic_opt(struct command *cmd,
 					      const struct opt_table *ot,
-					      const char *val,
+					      const char **vals,
+					      size_t nvals,
 					      bool transient,
 					      struct command_result *(*success)
 					      (struct command *,
 					       const struct opt_table *,
-					       const char *,
+					       const char **,
+					       size_t,
 					       bool))
 {
 	struct plugin_opt *popt;
@@ -2320,8 +2335,9 @@ struct command_result *plugin_set_dynamic_opt(struct command *cmd,
 
 	psr = tal(cmd, struct plugin_set_return);
 	psr->cmd = cmd;
-	/* val is a child of cmd, so no copy needed. */
-	psr->val = val;
+	/* vals is a child of cmd, so no copy needed. */
+	psr->vals = vals;
+	psr->nvals = nvals;
 	psr->optname = tal_strdup(psr, ot->names + 2);
 	psr->success = success;
 	psr->transient = transient;
@@ -2344,8 +2360,15 @@ struct command_result *plugin_set_dynamic_opt(struct command *cmd,
 					    psr);
 	}
 	json_add_string(req->stream, "config", psr->optname);
-	if (psr->val)
-		json_add_string(req->stream, "val", psr->val);
+	/* Multi options: send array. Scalar: send single value or nothing. */
+	if (ot->type & OPT_MULTI) {
+		json_array_start(req->stream, "val");
+		for (size_t i = 0; i < nvals; i++)
+			json_add_string(req->stream, NULL, vals[i]);
+		json_array_end(req->stream);
+	} else if (nvals > 0 && vals[0]) {
+		json_add_string(req->stream, "val", vals[0]);
+	}
 	jsonrpc_request_end(req);
 	plugin_request_send(plugin, req);
 	return command_still_pending(cmd);

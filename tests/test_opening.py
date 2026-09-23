@@ -7,8 +7,10 @@ from utils import (
 from pyln.testing.utils import FUNDAMOUNT
 
 from pathlib import Path
+import os
 import pytest
 import re
+import threading
 import unittest
 import time
 
@@ -100,7 +102,7 @@ def test_multifunding_v2_best_effort(node_factory, bitcoind):
         working_chans = [l4] if failed_sign else [l2, l4]
         for ldest in working_chans:
             inv = ldest.rpc.invoice(5000, 'i{}'.format(i), 'i{}'.format(i))['bolt11']
-            l1.rpc.pay(inv)
+            l1.rpc.xpay(inv)
 
         # Function to find the SCID of the channel that is
         # currently open.
@@ -170,6 +172,59 @@ def test_v2_open_sigs_reconnect_2(node_factory, bitcoind):
     # Make sure we're ok.
     l1.daemon.wait_for_log(r'to CHANNELD_NORMAL')
     l2.daemon.wait_for_log(r'to CHANNELD_NORMAL')
+
+
+@unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
+@unittest.skipIf(os.getenv('TEST_DB_PROVIDER', 'sqlite3') != 'sqlite3', "sqlite3-specific DB manipulation")
+@pytest.mark.openchannel('v2')
+def test_v2_open_reconnect_next_funding_mismatch(node_factory, bitcoind):
+    """Both nodes set next_funding on reconnect but disagree on txid: error sent, channel fails."""
+    # l2 always sends tx_signatures first.  Disconnecting l2 just before it
+    # sends tx_signatures means neither node ever receives remote tx_sigs, so
+    # both end up in DUALOPEND_OPEN_COMMITTED with remote_funding_sigs_rcvd=False
+    # and will set next_funding in channel_reestablish.
+    broken = r'dualopend daemon died before signed PSBT returned|Owning subdaemon dualopend died'
+    l1, l2 = node_factory.get_nodes(2, opts=[
+        {'may_reconnect': True, 'dev-no-reconnect': None, 'broken_log': broken},
+        {'disconnect': ['-WIRE_TX_SIGNATURES'], 'may_reconnect': True,
+         'dev-no-reconnect': None, 'broken_log': broken}
+    ])
+
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    amount = 2**24
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['p2tr'], amount / 10**8 + 0.01)
+    bitcoind.generate_block(1)
+    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
+
+    # -WIRE_TX_SIGNATURES causes fundchannel to block (it waits for reconnect
+    # that will never come due to dev-no-reconnect); run it in a daemon thread
+    # so the test can proceed.  l2.stop() below unblocks it via peer death.
+    def _fund():
+        try:
+            l1.rpc.fundchannel(l2.info['id'], 100000)
+        except Exception:
+            pass
+
+    threading.Thread(target=_fund, daemon=True).start()
+
+    # Both have exchanged commitment_signed (inflight in DB) but no tx_sigs yet.
+    # Use any() because the channel record may not exist yet when the thread starts.
+    wait_for(lambda: any(c['state'] == 'DUALOPEND_OPEN_COMMITTED'
+                         for c in l1.rpc.listpeerchannels()['channels']))
+    wait_for(lambda: any(c['state'] == 'DUALOPEND_OPEN_COMMITTED'
+                         for c in l2.rpc.listpeerchannels()['channels']))
+
+    # Corrupt l2's stored funding txid so it disagrees with l1's on reconnect.
+    l2.stop()
+    l2.db_manip("UPDATE channel_funding_inflights SET funding_tx_id = X'{}'".format('01' * 32))
+    l2.start()
+
+    # Reconnect: both will set next_funding in channel_reestablish but with
+    # different txids, triggering open_err_fatal on each side per BOLT #2.
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+
+    l1.daemon.wait_for_log(r"next_funding_txid .* doesn't match ours")
+    l2.daemon.wait_for_log(r"next_funding_txid .* doesn't match ours")
 
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
@@ -653,7 +708,7 @@ def test_v2_rbf_liquidity_ad(node_factory, bitcoind, chainparams):
 
     # send some payments, mine a block or two
     inv = l2.rpc.invoice(10**4, '1', 'no_1')
-    l1.rpc.pay(inv['bolt11'])
+    l1.rpc.xpay(inv['bolt11'])
 
     # l2 attempts to close a channel that it leased, should succeed
     # (channel isnt leased)
@@ -1410,6 +1465,137 @@ def test_rbf_non_last_mined(node_factory, bitcoind, chainparams):
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
 @pytest.mark.openchannel('v2')
+def test_rbf_reconnect_non_last_mined(node_factory, bitcoind, chainparams):
+    """
+    Deterministic version of the race in test_rbf_non_last_mined.
+
+    When a non-tip RBF candidate is mined, we identify the mined
+    inflight while processing its block, but only record it on the
+    channel once we have finished catching up with the chain.  A peer
+    reconnecting inside that window reestablishes against the *newest*
+    inflight, locking the channel in with a funding tx that was never
+    mined.
+
+    We hold the window open deterministically: stall l1's fetch of the
+    block after the funding block, so l1 has seen the funding confirm
+    (its scid is set) but never finishes catching up, then reconnect.
+    """
+    l1, l2 = node_factory.get_nodes(2,
+                                    opts={'allow_warning': True,
+                                          'may_reconnect': True})
+
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    amount = 2**24
+    chan_amount = 100000
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['p2tr'], amount / 10**8 + 0.01)
+    bitcoind.generate_block(1)
+    # Wait for it to arrive.
+    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
+
+    res = l1.rpc.fundchannel(l2.info['id'], chan_amount, feerate='7500perkw')
+    chan_id = res['channel_id']
+    vins = bitcoind.rpc.decoderawtransaction(res['tx'])['vin']
+    assert only_one(vins)
+    prev_utxos = ["{}:{}".format(vins[0]['txid'], vins[0]['vout'])]
+
+    # Check that we're waiting for lockin
+    l1.daemon.wait_for_log(' to DUALOPEND_AWAITING_LOCKIN')
+    inflights = only_one(l1.rpc.listpeerchannels()['channels'])['inflight']
+    assert inflights[-1]['funding_txid'] in bitcoind.rpc.getrawmempool()
+
+    def run_retry():
+        startweight = 42 + 173
+        rate = int(find_next_feerate(l1, l2)[:-5])
+        # We 2x the feerate to beat the min-relay fee
+        next_feerate = '{}perkw'.format(rate * 2)
+        initpsbt = l1.rpc.utxopsbt(chan_amount, next_feerate, startweight,
+                                   prev_utxos, reservedok=True,
+                                   excess_as_change=True)
+
+        l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+        bump = l1.rpc.openchannel_bump(chan_id, chan_amount, initpsbt['psbt'])
+        update = l1.rpc.openchannel_update(chan_id, bump['psbt'])
+        assert update['commitments_secured']
+
+        return l1.rpc.signpsbt(update['psbt'])['signed_psbt']
+
+    # Make a second inflight
+    signed_psbt = run_retry()
+    l1.rpc.openchannel_signed(chan_id, signed_psbt)
+
+    # Make it such that l1 and l2 cannot broadcast transactions
+    # (mimics failing to reach the miner with replacement)
+    def censoring_sendrawtx(r):
+        return {'id': r['id'], 'result': {}}
+
+    l1.daemon.rpcproxy.mock_rpc('sendrawtransaction', censoring_sendrawtx)
+    l2.daemon.rpcproxy.mock_rpc('sendrawtransaction', censoring_sendrawtx)
+
+    # Make a 3rd inflight that won't make it into the mempool
+    signed_psbt = run_retry()
+    last = len(l1.daemon.logs)
+    l1.rpc.openchannel_signed(chan_id, signed_psbt)
+
+    wait_for(lambda: l1.daemon.is_in_log("plugin-bcli: sendrawtx exit 0", start=last))
+    time.sleep(.05)
+
+    l1.daemon.rpcproxy.mock_rpc('sendrawtransaction', None)
+    l2.daemon.rpcproxy.mock_rpc('sendrawtransaction', None)
+
+    # We fetch out our inflights list
+    inflights = only_one(l1.rpc.listpeerchannels()['channels'])['inflight']
+    assert len(inflights) == 3
+
+    # l2 goes offline (as in the race, l1's dualopend dies with it)
+    l2.stop()
+
+    # Stall l1's fetch of the block *after* the funding block.  The
+    # mock must hang, not error: an error makes bcli report "no block
+    # yet", which lets l1 conclude it has caught up.  Returning None
+    # passes the request through to the real bitcoind.
+    height = bitcoind.rpc.getblockcount()
+    release_block = threading.Event()
+
+    def stalling_getblockhash(r):
+        if r['params'][0] == height + 2:
+            release_block.wait(timeout=180)
+        return None
+
+    l1.daemon.rpcproxy.mock_rpc('getblockhash', stalling_getblockhash)
+
+    # The 2nd inflight (the mempool tx) gets mined in block height+1.
+    bitcoind.generate_block(2, wait_for_mempool=1)
+
+    # l1 has seen the funding confirm (scid is set), but is wedged
+    # fetching block height+2, so it has not yet recorded *which*
+    # inflight was mined.
+    wait_for(lambda: 'short_channel_id'
+             in only_one(l1.rpc.listpeerchannels()['channels']))
+
+    # l2 comes back fully synced, and reconnects to wedged l1.
+    l2.start()
+    sync_blockheight(bitcoind, [l2])
+    l2.rpc.connect(l1.info['id'], 'localhost', l1.port)
+
+    l1.daemon.wait_for_log(r'to CHANNELD_NORMAL')
+    l2.daemon.wait_for_log(r'to CHANNELD_NORMAL')
+
+    # Let l1 finish catching up before we look at the result.
+    release_block.set()
+    l1.daemon.rpcproxy.mock_rpc('getblockhash', None)
+    sync_blockheight(bitcoind, [l1])
+
+    # The mined inflight (the 2nd) must be the one locked in -- on
+    # both sides, and with its commitment tx.
+    channel = only_one(l1.rpc.listpeerchannels()['channels'])
+    assert channel['funding_txid'] == inflights[1]['funding_txid']
+    assert channel['scratch_txid'] == inflights[1]['scratch_txid']
+    l2_channel = only_one(l2.rpc.listpeerchannels()['channels'])
+    assert l2_channel['funding_txid'] == inflights[1]['funding_txid']
+
+
+@unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
+@pytest.mark.openchannel('v2')
 def test_funder_options(node_factory, bitcoind):
     l1, l2, l3 = node_factory.get_nodes(3)
     l1.fundwallet(10**7)
@@ -1646,7 +1832,7 @@ def test_zeroconf_open(bitcoind, node_factory):
     l2alias = only_one(l2.rpc.listpeerchannels(l3.info['id'])['channels'])['alias']['local']
     assert(hop['pubkey'] == l2.info['id'])  # l2 is the entrypoint
     assert(hop['short_channel_id'] == l2alias)  # Alias has to make sense to entrypoint
-    l2.rpc.pay(inv)
+    l2.rpc.xpay(inv)
 
     # Ensure lightningd knows about the balance change before
     # attempting the other way around.
@@ -1654,7 +1840,7 @@ def test_zeroconf_open(bitcoind, node_factory):
 
     # Inverse payments should work too
     inv = l2.rpc.invoice(10**5, 'lbl', 'desc')['bolt11']
-    l3.rpc.pay(inv)
+    l3.rpc.xpay(inv)
 
 
 def test_zeroconf_public(bitcoind, node_factory, chainparams):
@@ -1792,7 +1978,7 @@ def test_zeroconf_forward(node_factory, bitcoind):
     # Make sure (esp in non-dev-mode) blockheights agree so we don't WIRE_EXPIRY_TOO_SOON...
     sync_blockheight(bitcoind, [l1, l2, l3])
     inv = l3.rpc.invoice(42 * 10**6, 'inv1', 'desc')['bolt11']
-    l1.rpc.pay(inv)
+    l1.rpc.xpay(inv)
 
     # And now try the other way around: zeroconf channel first
     # followed by a public one.
@@ -1803,7 +1989,7 @@ def test_zeroconf_forward(node_factory, bitcoind):
     wait_for(lambda: (p['htlcs'] == [] for p in l2.rpc.listpeerchannels()['channels']))
 
     inv = l1.rpc.invoice(42, 'back1', 'desc')['bolt11']
-    l3.rpc.pay(inv)
+    l3.rpc.xpay(inv)
 
 
 def test_zeroconf_refusal(bitcoind, node_factory, chainparams):
@@ -2068,7 +2254,7 @@ def test_zeroconf_multichan_forward(node_factory):
     l2.daemon.wait_for_log(r'peer_in WIRE_CHANNEL_READY')
     l3.daemon.wait_for_log(r'peer_in WIRE_CHANNEL_READY')
 
-    l1.rpc.pay(inv)
+    l1.rpc.xpay(inv)
 
     for c in l2.rpc.listpeerchannels(l3.info['id'])['channels']:
         if c['channel_id'] == zeroconf_cid:
@@ -2143,7 +2329,7 @@ def test_zeroreserve(node_factory, bitcoind):
 
     # Now do some drain tests on c1, as that should be drainable
     # completely by l2 being the fundee
-    l1.rpc.keysend(l2.info['id'], 10 * 7)  # Something above dust for sure
+    l1.rpc.xkeysend(l2.info['id'], 10 * 7)  # Something above dust for sure
     l2.drain(l1)
 
     # Remember that this is the reserve l1 imposed on l2, so l2 can drain completely
@@ -2682,10 +2868,10 @@ def test_multifunding_all_amount(node_factory, bitcoind):
     wait_for(lambda: [c['state'] for c in (l1.rpc.listpeerchannels()['channels'])] == ['CHANNELD_NORMAL', 'CHANNELD_NORMAL'])
 
     inv = l2.rpc.invoice(5000, 'i1', 'i1')['bolt11']
-    l1.rpc.pay(inv)
+    l1.rpc.xpay(inv)
 
     inv2 = l3.rpc.invoice(100000, 'i2', 'i2')['bolt11']
-    l1.rpc.pay(inv2)
+    l1.rpc.xpay(inv2)
 
 
 @pytest.mark.parametrize("dopay", [True, False])  # Whether to send a payment or not
@@ -2734,7 +2920,7 @@ def test_zeroconf_forget(node_factory, bitcoind, dopay: bool):
     # risking any of our funds.
     if dopay:
         inv = l2.rpc.invoice(1, "payme", "my stake in the unconfirmed channel")
-        l1.rpc.pay(inv["bolt11"])
+        l1.rpc.xpay(inv["bolt11"])
         wait_for(lambda: only_one(l2.rpc.listpeerchannels()['channels'])['to_us_msat'] == 1)
 
     # We need *another* channel to make it forget the first though!  (One block later, otherwise
@@ -2929,6 +3115,31 @@ def test_zeroconf_withhold(node_factory, bitcoind, stay_withheld, mutual_close):
             wait_for(lambda: only_one(l1.rpc.listpeerchannels()['channels'])['state'] == 'AWAITING_UNILATERAL')
 
 
+@pytest.mark.openchannel('v1')
+@pytest.mark.openchannel('v2')
+def test_opening_incoming_unknown_feerates(node_factory, bitcoind):
+    """
+    Don't allow incoming channels if we can't estimate feerates.
+    """
+    nofee_opts = {'ignore-fee-limits': True,
+                  'feerates': None,
+                  'dev-no-fake-fees': True}
+
+    l1, l2 = node_factory.get_nodes(2, opts=[{}, nofee_opts])
+
+    l1.fundwallet(FUNDAMOUNT)
+
+    # Connect peers
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+
+    # Verify fee estimation is failing
+    l2.daemon.wait_for_log('Unable to estimate any fees')
+
+    # Open channel l1 <-> l2: l2 should refuse!
+    with pytest.raises(RpcError, match=r'They sent.*Cannot accept channel: feerates unknown'):
+        l1.rpc.fundchannel(l2.info['id'], 100000)
+
+
 def test_zeroconf_withhold_htlc_failback(node_factory, bitcoind):
     """Test that CLTV timeout on a withheld channel fails HTLCs back upstream without force-close."""
     zeroconf_plugin = str(Path(__file__).parent / "plugins" / "zeroconf-selective.py")
@@ -2993,3 +3204,19 @@ def test_zeroconf_withhold_htlc_failback(node_factory, bitcoind):
 
     # l1's channel to l2 is still normal — no force-close
     assert only_one(l1.rpc.listpeerchannels(l2.info['id'])['channels'])['state'] == 'CHANNELD_NORMAL'
+
+
+@pytest.mark.openchannel('v1')
+@pytest.mark.openchannel('v2')
+def test_no_retransmit_confirmed_funding(node_factory):
+    """An channel must not trigger funding tx re-transmission on restart."""
+    l1, _ = node_factory.line_graph(2, wait_for_announce=True)
+
+    # Channel is in CHANNELD_NORMAL and funding tx is confirmed.
+    assert only_one(l1.rpc.listpeerchannels()['channels'])['state'] == 'CHANNELD_NORMAL'
+
+    l1.restart()
+
+    # Should not have attempted (and failed) to re-broadcast the funding tx.
+    assert not l1.daemon.is_in_log('Failed to re-transmit funding tx')
+    assert not l1.daemon.is_in_log('Successfully rexmitted funding tx')

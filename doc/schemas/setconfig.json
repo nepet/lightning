@@ -33,10 +33,19 @@
           },
           {
             "type": "boolean"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": [
+              "For multi options, an array of string values."
+            ]
           }
         ],
         "description": [
-          "Value of the config variable to be set or updated."
+          "Value of the config variable to be set or updated. For multi options, this must be an array of strings."
         ]
       },
       "transient": {
@@ -63,7 +72,6 @@
         "additionalProperties": false,
         "required": [
           "config",
-          "source",
           "dynamic"
         ],
         "properties": {
@@ -76,7 +84,17 @@
           "source": {
             "type": "string",
             "description": [
-              "Source of configuration setting (`file`:`linenum`)."
+              "Source of configuration setting (`file`:`linenum`) for non-multi options."
+            ]
+          },
+          "sources": {
+            "type": "array",
+            "added": "v26.06",
+            "items": {
+              "type": "string"
+            },
+            "description": [
+              "Sources of configuration settings (`file`:`linenum`) for multi options."
             ]
           },
           "plugin": {
@@ -123,6 +141,16 @@
             "description": [
               "For boolean options."
             ]
+          },
+          "values_str": {
+            "type": "array",
+            "added": "v26.06",
+            "items": {
+              "type": "string"
+            },
+            "description": [
+              "For multi-string options."
+            ]
           }
         }
       }
@@ -157,8 +185,8 @@
         "config": {
           "config": "autoclean-expiredinvoices-age",
           "value_int": 300,
-          "source": "/tmp/.lightning/regtest/config.setconfig:2",
-          "plugin": "/root/lightning/plugins/autoclean",
+          "source": "/home/rusty/.lightning/regtest/config.setconfig:2",
+          "plugin": "/usr/local/libexec/plugins/autoclean",
           "dynamic": true
         }
       }
@@ -176,7 +204,7 @@
         "config": {
           "config": "min-capacity-sat",
           "value_int": 500000,
-          "source": "/tmp/.lightning/regtest/config.setconfig:3",
+          "source": "/home/rusty/.lightning/regtest/config.setconfig:3",
           "dynamic": true
         }
       }

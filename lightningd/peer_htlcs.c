@@ -491,8 +491,20 @@ static void handle_localpay(struct htlc_in *hin,
 	}
 
 	/* BOLT #4:
-	 *
-	 *   incoming `cltv_expiry` < `current_block_height` + `min_final_cltv_expiry_delta`.	 */
+	 *   - If it is the final node:
+	 *...
+	 *     - MUST return an error if:
+	 *...
+	 *      - incoming `cltv_expiry` < `current_block_height` + `min_final_cltv_expiry_delta`.
+	 */
+	/* Or, for inside a blinded path: */
+	/* BOLT #4:
+	 * - If `encrypted_recipient_data` is present:
+	 *...
+	 *   - If it is the final node:
+	 *...
+	 *     - MUST return an error if incoming `cltv_expiry` < `current_block_height` + `min_final_cltv_expiry_delta`.
+	 */
 	if (get_block_height(ld->topology) + ld->config.cltv_final
 	    > hin->cltv_expiry) {
 		log_debug(hin->key.channel->log,
@@ -558,6 +570,7 @@ static void destroy_hout_subd_died(struct htlc_out *hout)
 
 	hout->failmsg = towire_temporary_channel_failure(hout,
 							 channel_update_for_error(tmpctx,
+										  hout->in,
 										  hout->key.channel));
 
 	/* Assign a temporary state (we're about to free it!) so checks
@@ -607,7 +620,7 @@ static void rcvd_htlc_reply(struct subd *subd, const u8 *msg, const int *fds UNU
 		 */
 		/* We still append the channel_update (if we have one!)  FIXME: provide an option? */
 		if (fromwire_peektype(failmsg) & UPDATE) {
-			const u8 *update = channel_update_for_error(tmpctx, hout->key.channel);
+			const u8 *update = channel_update_for_error(tmpctx, hout->in, hout->key.channel);
 			towire(&failmsg, update, tal_bytelen(update));
 		}
 		hout->failmsg = tal_steal(hout, failmsg);
@@ -713,7 +726,7 @@ const u8 *send_htlc_out(const tal_t *ctx,
 		log_info(out->log, "Attempt to send HTLC but unowned (%s)",
 			 channel_state_name(out));
 		return towire_temporary_channel_failure(ctx,
-							channel_update_for_error(tmpctx, out));
+							channel_update_for_error(tmpctx, in, out));
 	}
 
 	/* Note: we allow outgoing HTLCs before sync, for fast startup. */
@@ -853,7 +866,7 @@ static void forward_htlc(struct htlc_in *hin,
 					 next->old_feerate_ppm)) {
 			failmsg = towire_fee_insufficient(tmpctx, hin->msat,
 							  channel_update_for_error(tmpctx,
-										   next));
+										   hin, next));
 			goto fail;
 		}
 		log_info(hin->key.channel->log,
@@ -867,7 +880,7 @@ static void forward_htlc(struct htlc_in *hin,
 		    || amount_msat_less(amt_to_forward, next->old_htlc_minimum_msat)
 		    || amount_msat_greater(amt_to_forward, next->old_htlc_maximum_msat)) {
 			failmsg = towire_temporary_channel_failure(tmpctx,
-								   channel_update_for_error(tmpctx, next));
+								   channel_update_for_error(tmpctx, hin, next));
 			goto fail;
 		}
 		log_info(hin->key.channel->log,
@@ -877,7 +890,7 @@ static void forward_htlc(struct htlc_in *hin,
 	if (!check_cltv(hin, cltv_expiry, outgoing_cltv_value,
 			ld->config.cltv_expiry_delta)) {
 		failmsg = towire_incorrect_cltv_expiry(tmpctx, cltv_expiry,
-						       channel_update_for_error(tmpctx, next));
+						       channel_update_for_error(tmpctx, hin, next));
 		goto fail;
 	}
 
@@ -896,7 +909,7 @@ static void forward_htlc(struct htlc_in *hin,
 			  outgoing_cltv_value,
 			  get_block_height(ld->topology));
 		failmsg = towire_expiry_too_soon(tmpctx,
-						 channel_update_for_error(tmpctx, next));
+						 channel_update_for_error(tmpctx, hin, next));
 		goto fail;
 	}
 
@@ -1940,6 +1953,8 @@ void onchain_failed_our_htlc(const struct channel *channel,
 
 static void remove_htlc_in(struct channel *channel, struct htlc_in *hin)
 {
+	struct lightningd *ld = channel->peer->ld;
+
 	htlc_in_check(hin, __func__);
 	assert(hin->failonion || hin->preimage || hin->badonion);
 
@@ -1985,10 +2000,13 @@ static void remove_htlc_in(struct channel *channel, struct htlc_in *hin)
 	}
 
 	tal_free(hin);
+	check_graceful_shutdown(ld);
 }
 
 static void remove_htlc_out(struct channel *channel, struct htlc_out *hout)
 {
+	struct lightningd *ld = channel->peer->ld;
+
 	htlc_out_check(hout, __func__);
 	assert(hout->failonion || hout->preimage || hout->failmsg);
 	log_debug(channel->log, "Removing out HTLC %"PRIu64" state %s %s",
@@ -2035,6 +2053,7 @@ static void remove_htlc_out(struct channel *channel, struct htlc_out *hout)
 	}
 
 	tal_free(hout);
+	check_graceful_shutdown(ld);
 }
 
 static bool update_in_htlc(struct channel *channel,
@@ -2256,6 +2275,9 @@ void peer_sending_commitsig(struct channel *channel, const u8 *msg)
 	/* Tell it we've got it, and to go ahead with commitment_signed. */
 	subd_send_msg(channel->owner,
 		      take(towire_channeld_sending_commitsig_reply(msg)));
+
+	/* Maybe graceful wants to know? */
+	check_graceful_shutdown(ld);
 }
 
 static bool channel_added_their_htlc(struct channel *channel,
@@ -2523,6 +2545,9 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 	/* Tell it we've committed, and to go ahead with revoke. */
 	msg = towire_channeld_got_commitsig_reply(msg);
 	subd_send_msg(channel->owner, take(msg));
+
+	/* Maybe graceful wants to know? */
+	check_graceful_shutdown(ld);
 }
 
 /* Shuffle them over, forgetting the ancient one. */
@@ -2612,6 +2637,12 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 	badonions = tal_arrz(msg, enum onion_wire, tal_count(changed));
 	failmsgs = tal_arrz(msg, u8 *, tal_count(changed));
 	for (i = 0; i < tal_count(changed); i++) {
+		/* BOLT #2:
+		 * A node:
+		 *   - until an incoming HTLC has been irrevocably committed:
+		 *     - MUST NOT offer the corresponding outgoing HTLC
+		 *       (`update_add_htlc`) in response to that incoming HTLC.
+		 */
 		/* If we're doing final accept, we need to forward */
 		if (changed[i].newstate == RCVD_ADD_ACK_REVOCATION) {
 			peer_accepted_htlc(failmsgs,
@@ -2667,6 +2698,9 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 	/* FIXME: Check per_commitment_secret -> per_commit_point */
 	update_per_commit_point(channel, &next_per_commitment_point);
 
+	/* BOLT #2:
+	 *  - MUST respond with a `revoke_and_ack` message.
+	 */
 	/* Tell it we've committed, and to go ahead with revoke. */
 	msg = towire_channeld_got_revoke_reply(msg);
 	subd_send_msg(channel->owner, take(msg));
@@ -2694,6 +2728,9 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 					     : fromwire_peektype(failmsgs[i]));
 	}
 	wallet_channel_save(ld->wallet, channel);
+
+	/* Maybe graceful wants to know? */
+	check_graceful_shutdown(ld);
 
 	if (penalty_tx == NULL)
 		return;

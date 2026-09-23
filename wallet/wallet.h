@@ -56,6 +56,12 @@ struct wallet {
 
 	/* How many keys should we look ahead at most? */
 	u64 keyscan_gap;
+
+	/* Address lookahead max index: in-memory copy of the
+	 * bip32_max_index/bip86_max_index db vars, all updates must go
+	 * through wallet_set_max_addr_index. */
+	u64 bip32_max_index;
+	u64 bip86_max_index;
 };
 
 static inline enum output_status output_status_in_db(enum output_status s)
@@ -1043,7 +1049,10 @@ void wallet_payment_set_status(struct wallet *wallet,
  * `payment_hash`.
  *
  * Data is allocated as children of the given context. *faildirection
- * is only set if *failchannel is set non-NULL.
+ * is only set if *failchannel is set non-NULL. *failmsg is NULL when
+ * no raw onion failure message was recorded (local and self-payment
+ * failures, or payments that failed before the failmsg column
+ * existed).
  */
 void wallet_payment_get_failinfo(const tal_t *ctx,
 				 struct wallet *wallet,
@@ -1059,7 +1068,8 @@ void wallet_payment_get_failinfo(const tal_t *ctx,
 				 struct short_channel_id **failchannel,
 				 u8 **failupdate,
 				 char **faildetail,
-				 int *faildirection);
+				 int *faildirection,
+				 u8 **failmsg);
 /**
  * wallet_payment_set_failinfo - Set failure information for a given
  * `payment_hash`.
@@ -1075,7 +1085,8 @@ void wallet_payment_set_failinfo(struct wallet *wallet,
 				 const struct short_channel_id *failchannel,
 				 const u8 *failupdate,
 				 const char *faildetail,
-				 int faildirection);
+				 int faildirection,
+				 const u8 *failmsg);
 
 /**
  * payments_first: get first payment, optionally filtering by status
@@ -1474,12 +1485,14 @@ static inline bool offer_status_used(enum offer_status s)
  * @bolt12: offer as text.
  * @label: optional label for this offer.
  * @status: OFFER_SINGLE_USE or OFFER_MULTIPLE_USE
+ * @force_paths: so we know we have to use same path(s) for invoices
  */
 bool wallet_offer_create(struct wallet *w,
 			 const struct sha256 *offer_id,
 			 const char *bolt12,
 			 const struct json_escape *label,
-			 enum offer_status status)
+			 enum offer_status status,
+			 bool force_paths)
 	NON_NULL_ARGS(1,2,3);
 
 /**
@@ -1489,6 +1502,7 @@ bool wallet_offer_create(struct wallet *w,
  * @offer_id: the merkle root, as used for signing (must be unique)
  * @label: the label of the offer, set to NULL if none (or NULL)
  * @status: set if succeeds (or NULL)
+ * @force_paths: set if succeeds (or NULL)
  *
  * If @offer_id is found, returns the bolt12 text, sets @label and
  * @state.  Otherwise returns NULL.
@@ -1497,7 +1511,8 @@ char *wallet_offer_find(const tal_t *ctx,
 			struct wallet *w,
 			const struct sha256 *offer_id,
 			const struct json_escape **label,
-			enum offer_status *status)
+			enum offer_status *status,
+			bool *force_paths)
 	NON_NULL_ARGS(1,2,3);
 
 /**
@@ -2017,5 +2032,80 @@ void wallet_datastore_save_payment_description(struct db *db,
 					       const struct sha256 *payment_hash,
 					       const char *desc);
 void migrate_setup_coinmoves(struct lightningd *ld, struct db *db);
+
+/* ====================================================================
+ * bwatch-driven wallet recording.
+ *
+ * These functions are invoked from lightningd/watchman's dispatch table
+ * when bwatch reports activity on a wallet-owned scriptpubkey.  They
+ * persist outputs and transactions in the `our_outputs` and `our_txs`
+ * tables, mirroring every write into the legacy `outputs` /
+ * `transactions` tables so a node can downgrade cleanly for one release.
+ * ==================================================================== */
+
+/* Insert a wallet-owned UTXO row into our_outputs.  If the same outpoint
+ * was previously inserted unconfirmed (blockheight=0), the row is updated
+ * to the new confirmed blockheight so coin selection can spend it. */
+void wallet_add_our_output(struct wallet *w,
+			   const struct bitcoin_outpoint *outpoint,
+			   u32 blockheight, u32 txindex,
+			   const u8 *script, size_t script_len,
+			   struct amount_sat sat,
+			   u32 keyindex);
+
+/* watch_found handler for the wallet/spk/<keyidx>/<form> dispatch entry:
+ * fires when an address form (p2wpkh/p2tr/p2sh_p2wpkh) of this HD key
+ * receives funds.  The keyindex is parsed from @suffix; the address type is
+ * recovered from the matched output script. */
+void wallet_watch_spk(struct lightningd *ld,
+		      const char *suffix,
+		      const struct bitcoin_tx *tx,
+		      size_t outnum,
+		      u32 blockheight,
+		      u32 txindex);
+
+/* Revert handler for the wallet/spk dispatch entry: demotes every output
+ * (and its tx) recorded at @suffix's keyindex and @blockheight back to
+ * unconfirmed. */
+void wallet_scriptpubkey_watch_revert(struct lightningd *ld,
+				      const char *suffix,
+				      u32 blockheight);
+
+/* Record the wallet debit for a spent owned output.  The watch notification
+ * identifies the outpoint but not its amount, so reload the persisted UTXO
+ * before creating the movement. */
+void wallet_record_spend(struct lightningd *ld,
+			 const struct bitcoin_outpoint *outpoint,
+			 const struct bitcoin_txid *txid,
+			 u32 blockheight);
+
+/* watch_found handler for wallet/utxo/<txid>:<outnum>: an output we own was
+ * spent.  Marks it spent in our_outputs, stores the spending tx in our_txs,
+ * and records the withdrawal coin movement. */
+void wallet_utxo_spent_watch_found(struct lightningd *ld,
+				   const char *suffix,
+				   const struct bitcoin_tx *tx,
+				   size_t innum,
+				   u32 blockheight,
+				   u32 txindex);
+
+/* watch_revert handler: a reorg undid that spend; mark the UTXO unspent. */
+void wallet_utxo_spent_watch_revert(struct lightningd *ld,
+				    const char *suffix,
+				    u32 blockheight);
+
+/* Arm a scriptpubkey watch for an HD key under its wallet/spk/<keyidx>/<form>
+ * owner; the form is derived from @script.  No-op (logs broken) if the script
+ * isn't a form the wallet issues. */
+void wallet_add_bwatch_scriptpubkey(struct lightningd *ld,
+				    u64 keyindex,
+				    u32 start_block,
+				    const u8 *script,
+				    size_t script_len);
+
+/* Register a bwatch watch for every scriptpubkey wallet_can_spend
+ * recognizes: every HD key up through {bip32,bip86}_max_index plus the
+ * keyscan_gap lookahead, in the address forms actually issued. */
+void init_wallet_scriptpubkey_watches(struct wallet *w);
 
 #endif /* LIGHTNING_WALLET_WALLET_H */

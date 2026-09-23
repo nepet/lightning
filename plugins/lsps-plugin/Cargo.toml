@@ -1,7 +1,8 @@
 [package]
 name = "cln-lsps"
 version = "0.1.1"
-edition = "2021"
+edition = "2024"
+rust-version.workspace = true
 
 [[bin]]
 name = "cln-lsps-client"
@@ -20,14 +21,13 @@ cln = ["cln-plugin", "cln-rpc"]
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
-bitcoin = { version = "0.32", features = ["serde"] }
-chrono = { version= "0.4.42", features = ["serde"] }
+bitcoin = { version = "0.32.2", features = ["serde"] }
+chrono = { version = "0.4.42", features = ["serde"] }
 cln-plugin = { workspace = true, optional = true }
 cln-rpc = { workspace = true, optional = true }
 hex = "0.4"
 log = "0.4"
-paste = "1.0.15"
-rand = "0.9"
+rand = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 thiserror = "2.0"

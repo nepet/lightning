@@ -18,11 +18,13 @@ Here's a checklist for the release process.
 
 ## Preparing for -rc1
 
-1. Check that `CHANGELOG.md` is well formatted, ordered in areas, covers all signficant changes, and sub-ordered approximately by user impact & coolness.
+1. Make sure any `CHANGELOG.md` changes from point releases have been imported.
 2. Use `devtools/changelog.py` to collect the changelog entries from pull request commit messages and merge them into the manually maintained `CHANGELOG.md`. This does API queries to GitHub, which are severely ratelimited unless you use an API token: set the `GH_TOKEN` environment variable to a Personal Access Token from https://github.com/settings/tokens
-3. Create a new CHANGELOG.md heading to `v<VERSION>rc1`, and create a link at the bottom. Note that you should exactly copy the date and name format from a previous release, as the `build-release.sh` script relies on this.
-4. Update the package versions: `uv run make update-versions NEW_VERSION=v<VERSION>rc1`
-5. Create a PR with the above.
+3. Check that `CHANGELOG.md` is well formatted, ordered in areas, covers all signficant changes, and sub-ordered approximately by user impact & coolness.
+4. Manually remove any entries which were mentioned for in the previous point releases (they will be duplicates!)
+5. Create a new CHANGELOG.md heading to `v<VERSION>rc1`, and create a link at the bottom. Note that you should exactly copy the date and name format from a previous release, as the `build-release.sh` script relies on this.
+6. Update the package versions: `uv run make update-versions NEW_VERSION=v<VERSION>rc1`
+7. Create a PR with the above.
 
 ## Releasing -rc1
 
@@ -34,8 +36,8 @@ Here's a checklist for the release process.
 6. Push the tag to trigger the "Release 🚀" CI action, which drafts a new `v<VERSION>rc1` pre-release on GitHub and uploads reproducible builds alongside the `SHA256SUMS-v<VERSION>` file and its signature from the `cln@blockstream.com` key.
 7. Verify your local `SHA256SUMS-v<VERSION>` file matches the one in the draft release, then append your local signatures to the release's `SHA256SUMS-v<VERSION>.asc` file to attest to the build's integrity.
 8. Announce rc1 release on core-lightning's release-chat channel on Discord & Telegram.
-9. Use `devtools/credit --verbose v<PREVIOUS-VERSION>` to get commits, days and contributors data for release note.
-10. Prepare release notes draft including information from above step, and share with the team for editing.
+9. Use `devtools/credit --markdown v<PREVIOUS-VERSION>` to generate a single contributor list for the release notes. Use `devtools/credit --verbose v<PREVIOUS-VERSION>` for namer selection and detailed annotations.
+10. Prepare release notes draft including the contributor list from above, and share with the team for editing.
 11. Upgrade your personal nodes to the rc1, to help testing.
 12. Github action `Publish Python 🐍 distributions 📦 to PyPI and TestPyPI` uploads the pyln modules on test PyPI server. Make sure that the action has been triggered with RC tag and that the modules have been published on `https://test.pypi.org/project/pyln-*/#history`.
 13. Docker image publishing is handled by the GitHub action `Build and push multi-platform docker images`. Ensure that this action is triggered and that the RC image has been successfully uploaded to Docker Hub after the action completes. Alternatively, you can publish Docker images by running the `tools/build-release.sh docker` script. The GitHub action takes approximately 3-4 hours, while the script takes about 6-7 hours. It is highly recommended to test your Docker setup if you haven't done so before. Prior to building docker images by `tools/build-release.sh` script, ensure that `multiarch/qemu-user-static` setup is working on your system as described [here](https://docs.corelightning.org/docs/docker-images#setting-up-multiarchqemu-user-static).
@@ -44,7 +46,7 @@ Here's a checklist for the release process.
 
 1. Update CHANGELOG.md by changing rc(N-1) to rcN. Update the changelog list with information from newly merged PRs also.
 2. Update the package versions: `uv run make update-versions NEW_VERSION=v<VERSION>rcN`
-3. Add a PR with the rcN.
+3. Add a PR with the rcN, and merge it.
 4. Tag it `git pull && git tag -s v<VERSION>rcN && git push origin v<VERSION>rcN`.
 5. Pushing the tag automatically starts the "Release 🚀" CI job, creating a draft pre-release and uploading reproducible builds with their `SHA256SUMS` files signed by the project key.
 6. Set up the reproducible build environment by running the script `contrib/cl-repro.sh` to generate the necessary builder images.
@@ -80,7 +82,7 @@ Here's a checklist for the release process.
    - Run `tools/build-release.sh --verify`. It will create reproducible images, verify checksums and sign.
    - Send your signatures from `release/SHA256SUMS-v<VERSION>.asc` to release captain.
    - Or follow [link](https://docs.corelightning.org/docs/repro#verifying-a-reproducible-build) for manual verification instructions.
-12. Append signatures shared by the team into the `SHA256SUMS-v<VERSION>.asc` file, verify with `gpg --verify SHA256SUMS-v<VERSION>.asc` and include the file in the draft release.
+12. Append signatures shared by the team into the `SHA256SUMS-v<VERSION>.asc` file, verify with `gpg --verify SHA256SUMS-v<VERSION>.asc SHA256SUMS-v<VERSION>` (always pass the manifest as the second argument, otherwise `gpg` may verify a payload embedded in the `.asc` and exit successfully without ever reading the checksums) and include the file in the draft release.
 13. The GitHub action `Publish Python 🐍 distributions 📦 to PyPI and TestPyPI` should upload the pyln modules to pypi.org. However, this can also be done manually by running `uv run make pyln-release`. This process requires keys for each of the `pyln-client`, `pyln-proto`, and `pyln-testing` modules to be accessible to uv. You can set the key as an environment variable and build and publish each pyln release independently:
     - `export UV_PUBLISH_TOKEN=<pyln-client token>`
     - `uv run make pyln-release-client`
@@ -97,10 +99,16 @@ Here's a checklist for the release process.
 
 ## Post-release
 
-1. Create a PR to update Makefile's CLN_NEXT_VERSION and important dates for the next release on `.github/PULL_REQUEST_TEMPLATE.md`.
+1. Create a PR to update:
+  * `Makefile`: variables CLN_NEXT_VERSION and CLN_PREV_VERSION (this may break tests as deprecated things are disabled!)
+  * `tools/lightningd-downgrade.c`: to downgrade to the just-released version.
+  * `.github/workflows/ci.yaml`: change old-cln to download the just-released version.
+  * `.github/PULL_REQUEST_TEMPLATE.md` for important dates for the next release.
 2. Look through PRs which were delayed for release and merge them.
 3. Close out the Milestone for the now-shipped release.
 4. Update this file with any missing or changed instructions.
+5. Fetch the latest bolt revision in ../bolts.  Then run `./devtools/bolt-catchup.sh` to update BOLTVERSION in the Makefile and run `make check-bolt-quotes`.  It may get confused by merges in the BOLTs repository, so you may have to do some manual work.  Note: this step may involve a significant amount of work for new spec changes!
+6. Go through `doc/developers-guide/deprecated-features.md` and remove features and code whose `Last Supported` was the prior version (i.e. now two versions ago: we give one version where the user can use `i-promise-to-fix-broken-api-user=FEATURENAME` to re-enable it).  Also remove the features from any schemas and other documentation.
 
 ## Performing the Point (hotfix) Release
 
@@ -116,7 +124,7 @@ Here's a checklist for the release process.
 10. Sign the release locally by running `tools/build-release.sh bin-Fedora bin-Ubuntu sign` which will sign the release contents and create `SHA256SUMS-v<VERSION>` and `SHA256SUMS-v<VERSION>.asc` in the release folder.
 11. Validate that your local checksums `SHA256SUMS-v<VERSION>` match the Draft release's, then add your signatures to the draft release's signature `SHA256SUMS-v<VERSION>.asc` file.
 12. Share the `SHA256SUMS-v<VERSION>` and `SHA256SUMS-v<VERSION>.asc` files with the team for verification and signing.
-13. Append the signatures received from the team to the `SHA256SUMS-v<VERSION>.asc` file. Verify the file using `gpg --verify SHA256SUMS-v<VERSION>.asc`. Then re-upload the file.
+13. Append the signatures received from the team to the `SHA256SUMS-v<VERSION>.asc` file. Verify the file using `gpg --verify SHA256SUMS-v<VERSION>.asc SHA256SUMS-v<VERSION>`; the manifest must be passed as the second argument, otherwise `gpg` may verify a payload embedded in the `.asc` and exit successfully without ever reading the checksums. Then re-upload the file.
 14. Finalize and publish the release (change it from draft to public).
 15. Ensure that the GitHub Actions for `Publish Python 🐍 distributions 📦 to PyPI and TestPyPI` and `Build and push multi-platform docker images` are functioning correctly. Check that the `PyPI` modules published on `https://pypi.org/project/pyln-*` and that the Docker image has been uploaded to Docker Hub.
 16. Create a PR to merge updates from `update-versions` and `CHANGELOG.md` into `master` to keep it up-to-date for the next release.

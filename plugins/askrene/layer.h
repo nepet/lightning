@@ -52,7 +52,7 @@ bool layer_check_local_channel(const struct local_channel *lc,
 			       const struct node_id *n2,
 			       struct amount_msat capacity);
 
-/* Add a local channel to a layer! */
+/* Add a local channel to a layer: src must not be equal to dst!*/
 void layer_add_local_channel(struct layer *layer,
 			     const struct node_id *src,
 			     const struct node_id *dst,
@@ -86,6 +86,9 @@ void layer_add_update_channel(struct layer *layer,
 			      const u32 *proportional_fee,
 			      const u16 *delay);
 
+void layer_remove_channel_update(struct layer *layer,
+				 const struct short_channel_id_dir *scidd);
+
 /* If any capacities of channels are limited, unset the corresponding element in
  * the capacities[] array */
 void layer_clear_overridden_capacities(const struct layer *layer,
@@ -104,12 +107,18 @@ void layer_apply_biases(const struct layer *layer,
 			const struct gossmap *gossmap,
 			s8 *biases);
 
-/* Add one or more constraints on a layer. */
+/* Add a constraint to a layer. */
 const struct constraint *layer_add_constraint(struct layer *layer,
 					      const struct short_channel_id_dir *scidd,
 					      u64 timestamp,
 					      const struct amount_msat *min,
 					      const struct amount_msat *max);
+
+/* Add a usage constraint to a layer: a successful payment has given us more info */
+const struct impression *layer_add_impression(struct layer *layer,
+					      const struct short_channel_id_dir *scidd,
+					      u64 timestamp,
+					      struct amount_msat amount);
 
 /* Add local channels from this layer. */
 void layer_add_localmods(const struct layer *layer,
@@ -133,6 +142,12 @@ void json_add_constraint(struct json_stream *js,
 			 const char *fieldname,
 			 const struct constraint *c,
 			 const struct layer *layer);
+
+/* Print a usage constraint */
+void json_add_impression(struct json_stream *js,
+			       const char *fieldname,
+			       const struct impression *imp,
+			       const struct layer *layer);
 
 /* Print a single bias */
 void json_add_bias(struct json_stream *js,

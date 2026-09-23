@@ -21,7 +21,7 @@ def test_invoice(node_factory, chainparams):
 
     # Side note: invoice calls out to listincoming, so check JSON id is as expected
     myname = os.path.splitext(os.path.basename(sys.argv[0]))[0]
-    l1.daemon.wait_for_log(r': "{}:invoice#[0-9]*/cln:listincoming#[0-9]*"\[OUT\]'.format(myname))
+    l1.daemon.wait_for_log(r': {}:invoice#[0-9]*/cln:listincoming#[0-9]*\[OUT\]'.format(myname))
 
     after = int(time.time())
     b11 = l1.rpc.decode(inv['bolt11'])
@@ -141,7 +141,7 @@ def test_invoice_preimage(node_factory):
 
     # Make invoice and pay it
     inv = l2.rpc.invoice(amount_msat=123456, label="inv", description="?", preimage=invoice_preimage)
-    payment = l1.rpc.pay(inv['bolt11'])
+    payment = l1.rpc.xpay(inv['bolt11'])
 
     # Check preimage was given.
     payment_preimage = payment['payment_preimage']
@@ -176,7 +176,7 @@ def test_invoice_routeboost(node_factory, bitcoind):
     assert r['cltv_expiry_delta'] == 6
 
     # Pay it (and make sure it's fully resolved before we take l2 offline!)
-    l2.rpc.pay(inv['bolt11'])
+    l2.rpc.xpay(inv['bolt11'])
     wait_channel_quiescent(l2, l3)
 
     # Due to reserve & fees, l2 doesn't have capacity to pay this.
@@ -362,7 +362,7 @@ def test_invoice_routeboost_private(node_factory, bitcoind):
     # It will use an explicit exposeprivatechannels even if it thinks its a dead-end
     l0.rpc.close(l1.info['id'])
     l0.wait_for_channel_onchain(l1.info['id'])
-    bitcoind.generate_block(13)
+    bitcoind.generate_block(73)
     wait_for(lambda: l2.rpc.listchannels(scid_dummy)['channels'] == [])
 
     inv = l2.rpc.invoice(amount_msat=123456, label="inv7", description="?", exposeprivatechannels=scid)
@@ -386,8 +386,8 @@ def test_invoice_expiry(node_factory, executor):
     inv = l2.rpc.invoice(amount_msat=123000, label='test_pay', description='description', expiry=1)['bolt11']
     time.sleep(2)
 
-    with pytest.raises(RpcError):
-        l1.rpc.pay(inv)
+    with pytest.raises(RpcError, match='Invoice expired [1-9] seconds ago'):
+        l1.rpc.xpay(inv)
 
     invoices = l2.rpc.listinvoices('test_pay')['invoices']
     assert len(invoices) == 1
@@ -460,7 +460,7 @@ def test_waitinvoice(node_factory, executor):
     time.sleep(1)
     assert not f.done()
     # Pay invoice 2
-    l1.rpc.pay(inv2['bolt11'])
+    l1.rpc.xpay(inv2['bolt11'])
     # Waiter should stil be blocked
     time.sleep(1)
     assert not f.done()
@@ -468,7 +468,7 @@ def test_waitinvoice(node_factory, executor):
     r = executor.submit(l2.rpc.waitinvoice, 'inv2').result(timeout=5)
     assert r['label'] == 'inv2'
     # Pay invoice 1
-    l1.rpc.pay(inv1['bolt11'])
+    l1.rpc.xpay(inv1['bolt11'])
     # Waiter for invoice 1 should now finish
     r = f.result(timeout=5)
     assert r['label'] == 'inv1'
@@ -494,8 +494,8 @@ def test_waitanyinvoice(node_factory, executor):
     assert not f.done()
 
     # Now pay the first two invoices and make sure we notice
-    l1.rpc.pay(inv1['bolt11'])
-    l1.rpc.pay(inv2['bolt11'])
+    l1.rpc.xpay(inv1['bolt11'])
+    l1.rpc.xpay(inv2['bolt11'])
     r = f.result(timeout=5)
     assert r['label'] == 'inv1'
     pay_index = r['pay_index']
@@ -509,7 +509,7 @@ def test_waitanyinvoice(node_factory, executor):
     f = executor.submit(l2.rpc.waitanyinvoice, pay_index)
     time.sleep(1)
     assert not f.done()
-    l1.rpc.pay(inv3['bolt11'])
+    l1.rpc.xpay(inv3['bolt11'])
     r = f.result(timeout=5)
     assert r['label'] == 'inv3'
     pay_index = r['pay_index']
@@ -521,7 +521,7 @@ def test_waitanyinvoice(node_factory, executor):
 
     # If timeout is 0 but a paid invoice is available
     # anyway, it should return successfully immediately.
-    l1.rpc.pay(inv4['bolt11'])
+    l1.rpc.xpay(inv4['bolt11'])
     r = executor.submit(l2.rpc.waitanyinvoice, pay_index, 0).result(timeout=5)
     assert r['label'] == 'inv4'
 
@@ -556,13 +556,13 @@ def test_waitanyinvoice_reversed(node_factory, executor):
 
     # Pay inv2, wait, pay inv1, wait
     # Pay inv2
-    l1.rpc.pay(inv2['bolt11'])
+    l1.rpc.xpay(inv2['bolt11'])
     # Wait - should not block, should return inv2
     r = executor.submit(l2.rpc.waitanyinvoice).result(timeout=5)
     assert r['label'] == 'inv2'
     pay_index = r['pay_index']
     # Pay inv1
-    l1.rpc.pay(inv1['bolt11'])
+    l1.rpc.xpay(inv1['bolt11'])
     # Wait inv2 - should not block, should return inv1
     r = executor.submit(l2.rpc.waitanyinvoice, pay_index).result(timeout=5)
     assert r['label'] == 'inv1'
@@ -602,7 +602,7 @@ def test_amountless_invoice(node_factory):
     details = l1.rpc.decode(inv)
     assert('msatoshi' not in details)
 
-    l1.rpc.pay(inv, amount_msat=1337)
+    l1.rpc.xpay(inv, amount_msat=1337)
 
     i = l2.rpc.listinvoices()['invoices']
     assert(len(i) == 1)
@@ -692,7 +692,7 @@ def test_wait_invoices(node_factory, executor):
 
     waitfut = executor.submit(l2.rpc.call, 'wait', {'subsystem': 'invoices', 'indexname': 'updated', 'nextvalue': 1})
     l2.daemon.wait_for_log('waiting on invoices updated 1')
-    l1.rpc.pay(inv['bolt11'])
+    l1.rpc.xpay(inv['bolt11'])
     waitres = waitfut.result(TIMEOUT)
     assert waitres == {'subsystem': 'invoices',
                        'updated': 1,
@@ -776,7 +776,9 @@ def test_wait_invoices(node_factory, executor):
 
 
 def test_invoice_deschash(node_factory, chainparams):
-    l1, l2 = node_factory.line_graph(2)
+    # xpay ignores description, so use real pay.
+    l1, l2 = node_factory.line_graph(2, opts={'xpay-handle-pay': False,
+                                              'allow-deprecated-apis': True})
 
     # BOLT #11:
     # * `h`: tagged field: hash of description
@@ -836,7 +838,7 @@ def test_listinvoices_index(node_factory):
 
     # Pay 10 of them, in reverse order.  These will be the last ones in the 'updated' index.
     for i in range(70, 60, -1):
-        l1.rpc.pay(invs[i]['bolt11'])
+        l1.rpc.xpay(invs[i]['bolt11'])
 
     # Make sure it's fully resolved!
     wait_for(lambda: only_one(l2.rpc.listpeerchannels()['channels'])['htlcs'] == [])
@@ -884,6 +886,52 @@ def test_unified_invoices(node_factory, bitcoind):
     res = l1.rpc.waitinvoice('inv1')
 
     assert(txid == res['paid_outpoint']['txid'])
+
+
+def test_onchain_invoice_delinvoice_during_payment_hook(node_factory, bitcoind):
+    """delinvoice while onchain invoice_payment hook is pending must not crash."""
+    # Absolute path: inline plugins run in the test process (not lightning-dir).
+    unhold = [None]
+
+    def setup(plugin):
+        @plugin.hook("invoice_payment")
+        def on_payment(payment, plugin, **kwargs):
+            plugin.log("holding invoice_payment for label={}".format(payment["label"]))
+            while not os.path.exists(unhold[0]):
+                time.sleep(0.1)
+            plugin.log(
+                "releasing invoice_payment for label={}".format(payment["label"])
+            )
+            return {"result": "continue"}
+
+    l1 = node_factory.get_node(
+        options={"invoices-onchain-fallback": None}, inline_plugin=setup
+    )
+    unhold[0] = os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, "unhold")
+    amount_sat = 1000
+    inv = l1.rpc.invoice(
+        amount_sat * 1000, "inv1", "test_onchain_invoice_delinvoice_during_payment_hook"
+    )
+    b11 = l1.rpc.decode(inv["bolt11"])
+    assert len(b11["fallbacks"]) == 1
+    addr = b11["fallbacks"][0]["addr"]
+
+    # Pay the on-chain fallback while the hook holds resolution.
+    bitcoind.rpc.sendtoaddress(addr, amount_sat / 10**8)
+    bitcoind.generate_block(1)
+
+    l1.daemon.wait_for_log(r"holding invoice_payment for label=inv1")
+    assert only_one(l1.rpc.listinvoices("inv1")["invoices"])["status"] == "unpaid"
+
+    # Delete the unpaid invoice while the hook is still pending.
+    l1.rpc.delinvoice("inv1", "unpaid")
+
+    # Let the hook finish; lightningd must survive the stale reply.
+    open(unhold[0], "w").close()
+    l1.daemon.wait_for_log(r"releasing invoice_payment for label=inv1")
+
+    # RPC still works => no restartable crash from invoice_payment_hooks_done.
+    assert l1.rpc.listinvoices("inv1") == {"invoices": []}
 
 
 def test_expiry_startup_crash(node_factory, bitcoind):

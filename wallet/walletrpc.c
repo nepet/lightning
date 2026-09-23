@@ -290,13 +290,10 @@ static struct command_result *json_listaddrs(struct command *cmd,
 	if (!max_index) {
 		max_index = tal(cmd, u64);
 		/* Use bip86_max_index for BIP86 wallets, bip32_max_index for legacy */
-		if (use_bip86) {
-			*max_index = db_get_intvar(cmd->ld->wallet->db,
-						   "bip86_max_index", 0);
-		} else {
-			*max_index = db_get_intvar(cmd->ld->wallet->db,
-						   "bip32_max_index", 0);
-		}
+		if (use_bip86)
+			*max_index = cmd->ld->wallet->bip86_max_index;
+		else
+			*max_index = cmd->ld->wallet->bip32_max_index;
 	}
 	response = json_stream_success(cmd);
 	json_array_start(response, "addresses");
@@ -459,7 +456,12 @@ static struct command_result *json_listfunds(struct command *cmd,
 	     p = peer_node_id_map_next(cmd->ld->peers, &it)) {
 		struct channel *c;
 		list_for_each(&p->channels, c, list) {
-			/* We don't print out uncommitted channels */
+			/* We don't print out uncommitted channels, which makes us meet this: */
+			/* BOLT #2:
+			 * The receiving node MUST NOT:
+			 *   - consider funds received, using `push_msat`, to be received
+			 *    until the funding transaction has reached sufficient depth.
+			 */
 			if (channel_state_uncommitted(c->state))
 				continue;
 			json_object_start(response, NULL);

@@ -11,8 +11,11 @@ from decimal import Decimal
 from pyln.client import LightningRpc
 from pyln.client import Millisatoshi
 from pyln.client import NodeVersion
+from pyln.client import Plugin
+from pyln.client.plugin import PluginLogHandler
 
-import ephemeral_port_reserve  # type: ignore
+import tempfile
+import errno
 import json
 import logging
 import lzma
@@ -22,6 +25,7 @@ import os
 import random
 import re
 import shutil
+import socket
 import sqlite3
 import string
 import struct
@@ -29,6 +33,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import warnings
 
 BITCOIND_CONFIG = {
@@ -78,11 +83,13 @@ def env(name, default=None):
 VALGRIND = env("VALGRIND") == "1"
 TEST_NETWORK = env("TEST_NETWORK", 'regtest')
 TEST_DEBUG = env("TEST_DEBUG", "0") == "1"
+
+INLINE_PLUGIN_PATH = os.path.join(os.path.dirname(__file__), 'inline-plugin.py')
 SLOW_MACHINE = env("SLOW_MACHINE", "0") == "1"
 DEPRECATED_APIS = env("DEPRECATED_APIS", "0") == "1"
 TIMEOUT = int(env("TIMEOUT", 180 if SLOW_MACHINE else 60))
 EXPERIMENTAL_DUAL_FUND = env("EXPERIMENTAL_DUAL_FUND", "0") == "1"
-EXPERIMENTAL_SPLICING = env("EXPERIMENTAL_SPLICING", "0") == "1"
+EXPERIMENTAL_SIMPLE_CLOSE = env("EXPERIMENTAL_SIMPLE_CLOSE", "0") == "1"
 GENERATE_EXAMPLES = env("GENERATE_EXAMPLES", "0") == "1"
 RUST = env("RUST", "0") == "1"
 
@@ -167,25 +174,152 @@ def get_tx_p2wsh_outnum(bitcoind, tx, amount):
     return None
 
 
-unused_port_lock = threading.Lock()
-unused_port_set = set()
+_PORT_LOCK_DIR = Path(tempfile.gettempdir()) / "pyln-testing-ports"
+_PORT_LOCK_DIR.mkdir(exist_ok=True)
+
+# If we never hand out this many ports, something is wrong with our
+# ephemeral-range detection, and allocating from the OS range is a risky
+# fallback we'd rather fail loudly about.
+_MIN_RESERVED_PORTS = 2048
+
+
+def ephemeral_port_range():
+    """Return the (lo, hi) of the OS ephemeral source-port range, or None.
+
+    The kernel only ever assigns *source* ports from this range, so a listen
+    socket bound to a port *outside* it can never collide with an active
+    OS-assigned connection.  Linux/BSD expose it via /proc; macOS via sysctl.
+    """
+    try:
+        with open('/proc/sys/net/ipv4/ip_local_port_range') as f:
+            lo, hi = (int(x) for x in f.read().split())
+            return lo, hi
+    except OSError:
+        pass
+    try:
+        import subprocess
+        lo = int(subprocess.check_output(
+            ['sysctl', '-n', 'net.inet.ip.portrange.first']).strip())
+        hi = int(subprocess.check_output(
+            ['sysctl', '-n', 'net.inet.ip.portrange.last']).strip())
+        return lo, hi
+    except Exception:
+        # Unknown platform: assume the Linux default.
+        return None
+
+
+def _reserved_port_pool():
+    """Return (lo, hi) of the port range we may bind.
+
+    We prefer the region strictly below the OS ephemeral floor (which is never
+    used for source ports, so a test's listen port cannot be stolen by a
+    *binding* foreign process either, except a deliberate one).  If a machine
+    runs with a very low ephemeral floor we fall back to above the ceiling,
+    and finally to the ephemeral range itself as a best effort.
+    """
+    rng = ephemeral_port_range()
+    if rng is None:
+        lo, hi = 32768, 60999
+    else:
+        lo, hi = rng
+
+    if lo > 1024 and lo - 1024 >= _MIN_RESERVED_PORTS:
+        return 1024, lo - 1
+    if hi < 65535 and 65535 - hi >= _MIN_RESERVED_PORTS:
+        return hi + 1, 65535
+    # No room anywhere else: e.g. an ephemeral range covering everything.
+    return lo, hi
+
+
+def _port_is_free(port):
+    """Return True if 127.0.0.1:port can be bound right now.
+
+    This is an actual bind() test (like the old ephemeral_port_reserve), so we
+    never hand out a port that is genuinely claimed *right now*, as opposed to
+    merely reserved via lockfile.  We use SO_REUSEADDR to match the daemons, so
+    a lingering TIME_WAIT socket doesn't count as "in use".
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(('127.0.0.1', port))
+        return True
+    except OSError as e:
+        if e.errno != errno.EADDRINUSE:
+            raise
+        return False
+    finally:
+        s.close()
 
 
 def reserve_unused_port():
-    """Get an unused port: avoids handing out the same port unless it's been
-    returned"""
-    with unused_port_lock:
-        while True:
-            port = ephemeral_port_reserve.reserve()
-            if port not in unused_port_set:
-                break
-        unused_port_set.add(port)
+    """Get an unused port from the non-ephemeral pool.
 
-    return port
+    We test-bind the candidate so a port claimed by anything at all right now
+    is skipped, then take the filesystem lock so our *own* workers never pick
+    the same genuinely free port concurrently.  Note the lockfile only
+    coordinates our own allocations: the real protection against the OS
+    stealing a port via source-port assignment is that the pool lies outside
+    the ephemeral source-port range.
+    """
+    pool_lo, pool_hi = _reserved_port_pool()
+    while True:
+        port = random.randint(pool_lo, pool_hi)
+        if not _port_is_free(port):
+            continue
+
+        lock_path = _PORT_LOCK_DIR / f"{port}.lock"
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return port
+        except FileExistsError:
+            continue
 
 
 def drop_unused_port(port):
-    unused_port_set.remove(port)
+    if port:
+        lock_path = _PORT_LOCK_DIR / f"{port}.lock"
+        lock_path.unlink(missing_ok=True)
+
+
+def cleanup_stale_port_locks():
+    """Remove lockfiles whose owning process no longer exists."""
+    try:
+        for lock_path in _PORT_LOCK_DIR.glob("*.lock"):
+            try:
+                pid = int(lock_path.read_text())
+                try:
+                    os.kill(pid, 0)  # signal 0 = existence check, no actual signal
+                except ProcessLookupError:
+                    lock_path.unlink(missing_ok=True)
+            except (ValueError, PermissionError, FileNotFoundError):
+                pass
+    except Exception:
+        pass  # best-effort, never crash the test run over cleanup
+
+
+def wait_for_port_released(port, timeout=TIMEOUT):
+    """Wait until 127.0.0.1:port can be bound again.
+
+    A stopped node's connectd holds the listen socket until it exits,
+    which can be several seconds after lightningd itself is gone
+    (subdaemons are separate processes, and die slowly under valgrind).
+    Restarting the node before the port is released makes the new
+    connectd fail with 'Address already in use'.
+    """
+    start_time = time.time()
+    while not _port_is_free(port):
+        if time.time() - start_time > timeout:
+            raise TimeoutError(
+                "Port {} was not released within {} seconds"
+                .format(port, timeout))
+        time.sleep(0.1)
+
+    waited = time.time() - start_time
+    if waited >= 1:
+        logging.info("Port %d took %.1fs to be released", port, waited)
 
 
 class TailableProc(object):
@@ -286,6 +420,8 @@ class TailableProc(object):
 
     def cleanup_files(self):
         """Ensure files are closed."""
+        cleanup_stale_port_locks()
+
         for f in ["stdout_write", "stderr_write", "stdout_read", "stderr_read"]:
             try:
                 getattr(self, f).close()
@@ -454,14 +590,10 @@ class BitcoinD(TailableProc):
     def __init__(self, bitcoin_dir="/tmp/bitcoind-test", rpcport=None):
         TailableProc.__init__(self, bitcoin_dir, verbose=False)
 
-        if rpcport is None:
-            self.reserved_rpcport = reserve_unused_port()
-            rpcport = self.reserved_rpcport
-        else:
-            self.reserved_rpcport = None
-
         self.bitcoin_dir = bitcoin_dir
         self.rpcport = rpcport
+        self.reserved_rpcport = None
+        self.port_setup = False
         self.prefix = 'bitcoind'
         self.canned_blocks = None
 
@@ -485,21 +617,37 @@ class BitcoinD(TailableProc):
             '-debug=validation',
             '-rpcthreads=20',
         ]
-        # For up to and including 0.16.1, this needs to be in main section.
-        BITCOIND_CONFIG['rpcport'] = rpcport
-        # For after 0.16.1 (eg. 3f398d7a17f136cd4a67998406ca41a124ae2966), this
-        # needs its own [regtest] section.
-        BITCOIND_REGTEST = {'rpcport': rpcport}
         self.conf_file = os.path.join(bitcoin_dir, 'bitcoin.conf')
+
+    def set_port(self, rpcport):
+        assert self.port_setup is False
+
+        BITCOIND_REGTEST = {'rpcport': rpcport}
         write_config(self.conf_file, BITCOIND_CONFIG, BITCOIND_REGTEST)
+        self.port_setup = True
+
+    def kill(self):
+        try:
+            self.stop()
+        except Exception:
+            self.proc.kill()
+        self.proc.wait()
+
+        self.cleanup_files()
+        drop_unused_port(self.rpcport)
+        for p in self.proxies:
+            drop_unused_port(p.rpcport)
+
+    def start(self, wallet_file=None):
+        if not self.port_setup:
+            if self.rpcport is None:
+                self.reserved_rpcport = reserve_unused_port()
+                self.rpcport = self.reserved_rpcport
+            self.set_port(self.rpcport)
+
         self.rpc = SimpleBitcoinProxy(btc_conf_file=self.conf_file)
         self.proxies = []
 
-    def __del__(self):
-        if self.reserved_rpcport is not None:
-            drop_unused_port(self.reserved_rpcport)
-
-    def start(self, wallet_file=None):
         TailableProc.start(self)
         self.wait_for_log("Done loading", timeout=TIMEOUT)
 
@@ -519,7 +667,7 @@ class BitcoinD(TailableProc):
         return TailableProc.stop(self)
 
     def get_proxy(self):
-        proxy = BitcoinRpcProxy(self)
+        proxy = BitcoinRpcProxy(self, rpcport=reserve_unused_port())
         self.proxies.append(proxy)
         proxy.start()
         return proxy
@@ -658,11 +806,6 @@ class BitcoinD(TailableProc):
 
 class ElementsD(BitcoinD):
     def __init__(self, bitcoin_dir="/tmp/bitcoind-test", rpcport=None):
-        config = BITCOIND_CONFIG.copy()
-        if 'regtest' in config:
-            del config['regtest']
-
-        config['chain'] = 'liquid-regtest'
         BitcoinD.__init__(self, bitcoin_dir, rpcport)
 
         self.cmd_line = [
@@ -677,13 +820,20 @@ class ElementsD(BitcoinD):
             '-con_blocksubsidy=5000000000',
             '-acceptnonstdtxn=1',  # FIXME Issues such as dust limit interacting with anchors
         ]
-        conf_file = os.path.join(bitcoin_dir, 'elements.conf')
-        config['rpcport'] = self.rpcport
-        BITCOIND_REGTEST = {'rpcport': self.rpcport}
-        write_config(conf_file, config, BITCOIND_REGTEST, section_name='liquid-regtest')
-        self.conf_file = conf_file
-        self.rpc = SimpleBitcoinProxy(btc_conf_file=self.conf_file)
+        self.conf_file = os.path.join(bitcoin_dir, 'elements.conf')
         self.prefix = 'elementsd'
+
+    def set_port(self, rpcport):
+        assert self.port_setup is False
+
+        config = BITCOIND_CONFIG.copy()
+        if 'regtest' in config:
+            del config['regtest']
+        config['chain'] = 'liquid-regtest'
+        config['rpcport'] = rpcport
+        BITCOIND_REGTEST = {'rpcport': rpcport}
+        write_config(self.conf_file, config, BITCOIND_REGTEST, section_name='liquid-regtest')
+        self.port_setup = True
 
     def getnewaddress(self):
         """Need to get an address and then make it unconfidential
@@ -807,6 +957,9 @@ class LightningD(TailableProc):
 
     def start(self, stdin=None, wait_for_initialized=True, stderr_redir=False):
         self.opts['bitcoin-rpcport'] = self.rpcproxy.rpcport
+        # On restart, the previous incarnation's connectd may still be
+        # dying and holding our listen port: don't launch until it's free.
+        wait_for_port_released(self.port)
         TailableProc.start(self, stdin, stdout_redir=False, stderr_redir=stderr_redir)
         if wait_for_initialized:
             self.wait_for_log("Server started with public key")
@@ -903,6 +1056,7 @@ class LightningNode(object):
                  executable=None,
                  bad_notifications=False,
                  old_hsmsecret=None,
+                 no_entropy=False,
                  **kwargs):
         self.bitcoin = bitcoind
         self.executor = executor
@@ -914,6 +1068,7 @@ class LightningNode(object):
         self.allow_warning = allow_warning
         self.db = db
         self.lightning_dir = Path(lightning_dir)
+        self.no_entropy = no_entropy
 
         # Assume successful exit
         self.rc = 0
@@ -963,11 +1118,13 @@ class LightningNode(object):
             self.daemon.opts["dev-no-reconnect"] = None
         if EXPERIMENTAL_DUAL_FUND:
             self.daemon.opts["experimental-dual-fund"] = None
-        if EXPERIMENTAL_SPLICING:
-            self.daemon.opts["experimental-splicing"] = None
+        if EXPERIMENTAL_SIMPLE_CLOSE:
+            self.daemon.opts["experimental-simple-close"] = None
         # Avoid test flakes cause by this option unless explicitly set.
         if self.cln_version >= "v24.11":
             self.daemon.opts.update({"autoconnect-seeker-peers": 0})
+        if no_entropy:
+            self.daemon.env["CLN_DEV_ENTROPY_SEED"] = str(node_id)
 
         jsondir = Path(lightning_dir) / "plugin-io"
         jsondir.mkdir()
@@ -1072,6 +1229,11 @@ class LightningNode(object):
             creds,
             options=(('grpc.ssl_target_name_override', 'cln'),)
         )
+
+        # Force the connect+handshake to finish now, instead of lazily on
+        # the first RPC the caller happens to make.
+        grpc.channel_ready_future(channel).result(timeout=10)
+
         from pyln import grpc as clnpb
         return clnpb.NodeStub(channel)
 
@@ -1366,7 +1528,7 @@ class LightningNode(object):
         start_time = time.time()
         while time.time() < start_time + timeout:
             try:
-                self.rpc.getroute(destination.info['id'], 1, 1)
+                self.single_route(destination.info['id'], 1)
                 return True
             except Exception:
                 time.sleep(1)
@@ -1386,19 +1548,9 @@ class LightningNode(object):
                     wait_for(lambda: len(self.rpc.listpeerchannels(peer["id"])['channels'][idx]['htlcs']) == 0)
 
     # This sends money to a directly connected peer
-    # if `route` is `True`, it can also send over the network.
-    def pay(self, dst, amt, label=None, route=False):
+    def pay(self, dst, amt, label=None):
         if not label:
             label = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(20))
-
-        if route is True:
-            invoice = dst.rpc.invoice(amt, label, "desc")
-            route = self.rpc.getroute(dst.info["id"], amt, riskfactor=0, fuzzpercent=0)
-            self.rpc.sendpay(route["route"], invoice["payment_hash"], payment_secret=invoice.get('payment_secret'))
-            result = self.rpc.waitsendpay(invoice["payment_hash"])
-            assert result.get('status') == 'complete'
-            self.wait_for_htlcs()
-            return
 
         # check we are connected
         dst_id = dst.info['id']
@@ -1430,6 +1582,16 @@ class LightningNode(object):
 
         # Make sure they're all settled, in case we quickly mine blocks!
         dst.wait_for_htlcs()
+
+    def single_route(self, node_id, amount_msat, cltv=9):
+        """Similar to the getroute() call (different output though!)"""
+        return only_one(self.rpc.getroutes(source=self.info['id'],
+                                           destination=node_id,
+                                           amount_msat=amount_msat,
+                                           layers=["auto.localchans", "auto.sourcefree"],
+                                           maxfee_msat=10000000,
+                                           final_cltv=cltv,
+                                           maxparts=1)['routes'])['path']
 
     # This helper sends all money to a peer until even 1 msat can't get through.
     def drain(self, peer):
@@ -1743,6 +1905,8 @@ class NodeFactory(object):
             'start',
             'gossip_store_file',
             'old_hsmsecret',
+            'no_entropy',
+            'base_port',
         ]
         node_opts = {k: v for k, v in opts.items() if k in node_opt_keys}
         cli_opts = {k: v for k, v in opts.items() if k not in node_opt_keys}
@@ -1789,10 +1953,15 @@ class NodeFactory(object):
     def get_node(self, node_id=None, options=None, dbfile=None,
                  bkpr_dbfile=None, feerates=(15000, 11000, 7500, 3750),
                  start=True, wait_for_bitcoind_sync=True, may_fail=False,
-                 expect_fail=False, cleandir=True, gossip_store_file=None, unused_grpc_port=True, **kwargs):
+                 expect_fail=False, cleandir=True, gossip_store_file=None, unused_grpc_port=True,
+                 inline_plugin=None, base_port=None, **kwargs):
         node_id = self.get_node_id() if not node_id else node_id
-        port = reserve_unused_port()
-        grpc_port = self.get_unused_port() if unused_grpc_port else None
+        if base_port:
+            port = base_port + node_id * 2 - 1
+            grpc_port = base_port + node_id * 2
+        else:
+            port = reserve_unused_port()
+            grpc_port = self.get_unused_port() if unused_grpc_port else None
 
         lightning_dir = os.path.join(
             self.directory, "lightning-{}/".format(node_id))
@@ -1816,7 +1985,8 @@ class NodeFactory(object):
             node.set_feerates(feerates, False)
 
         self.nodes.append(node)
-        self.reserved_ports.append(port)
+        if not base_port:
+            self.reserved_ports.append(port)
         if dbfile:
             with open(os.path.join(node.daemon.lightning_dir, TEST_NETWORK,
                                    'lightningd.sqlite3'), 'xb') as out:
@@ -1832,6 +2002,11 @@ class NodeFactory(object):
         if gossip_store_file:
             shutil.copy(gossip_store_file, os.path.join(node.daemon.lightning_dir, TEST_NETWORK,
                                                         'gossip_store'))
+
+        if inline_plugin is not None:
+            if 'plugin' not in node.daemon.opts:
+                node.daemon.opts['plugin'] = INLINE_PLUGIN_PATH
+            _inline_plugin(node, inline_plugin)
 
         if start:
             try:
@@ -1947,3 +2122,108 @@ class NodeFactory(object):
             drop_unused_port(p)
 
         return not unexpected_fail, err_msgs
+
+
+class _NoPylnInternalsFilter(logging.Filter):
+    """Drop log records generated inside the pyln packages themselves.
+
+    An inline plugin's Plugin() lives in the test process, so its
+    PluginLogHandler on the root logger would forward pyln's own machinery
+    logs into the node's log.  wait_for_logs()'s 'Waiting for [pattern]'
+    announcement embeds the pattern verbatim, lands in the very log being
+    scanned, and matches itself, silently reducing the wait to a no-op.
+    Only records from outside pyln (i.e. the plugin author's own logging)
+    may be forwarded.
+    """
+    PYLN_DIRS = tuple(
+        os.path.dirname(os.path.abspath(f)) + os.sep
+        for f in (__file__,
+                  sys.modules[PluginLogHandler.__module__].__file__))
+
+    def filter(self, record):
+        return not os.path.abspath(record.pathname).startswith(self.PYLN_DIRS)
+
+
+def _inline_plugin(node, setup_fn):
+    """Set up an inline plugin serve thread for a not-yet-started node.
+
+    Normally called via get_node(inline_plugin=setup_fn).  The plugin's cwd
+    (set by lightningd) is node.daemon.lightning_dir/TEST_NETWORK/, which is
+    where the shim looks for inline-plugin.sock.
+
+    Example::
+
+        def setup(plugin):
+            @plugin.method('greet')
+            def greet(name, plugin):
+                return {'message': f'hello {name}'}
+
+        l1 = node_factory.get_node(inline_plugin=setup)
+        assert l1.rpc.greet('world') == {'message': 'hello world'}
+    """
+    sock_path = os.path.join(node.daemon.lightning_dir, TEST_NETWORK, 'inline-plugin.sock')
+    srv = socket.socket(socket.AF_UNIX)
+    try:
+        srv.bind(sock_path)
+    except OSError as e:
+        # AF_UNIX caps the bind path (108 bytes on Linux, 104 on macOS),
+        # and the node dir embeds the (possibly long) test name.  Bind
+        # through a short symlink alias to the socket's directory -- the
+        # bind-side analogue of UnixSocket.connect's Darwin workaround
+        # (bind can't go through a dangling final-component symlink, so
+        # alias the directory rather than the socket).  The socket file
+        # still lands at sock_path, where the shim's cwd-relative connect
+        # expects it.
+        if e.args[0] != "AF_UNIX path too long":
+            raise
+        alias_dir = tempfile.mkdtemp(prefix='pyln-sock-')
+        alias = os.path.join(alias_dir, 'd')
+        os.symlink(os.path.dirname(sock_path), alias)
+        try:
+            srv.bind(os.path.join(alias, os.path.basename(sock_path)))
+        finally:
+            os.unlink(alias)
+            os.rmdir(alias_dir)
+    srv.listen(1)
+
+    plugin = Plugin(autopatch=False)
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, PluginLogHandler) and handler.plugin is plugin:
+            handler.addFilter(_NoPylnInternalsFilter())
+    setup_fn(plugin)
+
+    def serve():
+        while True:
+            conn, _ = srv.accept()
+
+            class _SockWriter:
+                def write(self, data):
+                    try:
+                        conn.sendall(data)
+                    except OSError:
+                        pass
+
+                def flush(self):
+                    pass
+
+            writer = _SockWriter()
+            plugin.stdout = types.SimpleNamespace(buffer=writer, flush=writer.flush)
+
+            partial = b""
+            while True:
+                try:
+                    chunk = conn.recv(4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                partial += chunk
+                msgs = partial.split(b'\n\n')
+                if len(msgs) < 2:
+                    continue
+                try:
+                    partial = plugin._multi_dispatch(msgs)
+                except Exception:
+                    break
+
+    threading.Thread(target=serve, daemon=True).start()

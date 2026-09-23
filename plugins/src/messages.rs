@@ -1,5 +1,5 @@
-use crate::options::UntypedConfigOption;
 use crate::HookFilter;
+use crate::options::UntypedConfigOption;
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -99,6 +99,7 @@ pub(crate) enum JsonRpc<N, R> {
     Notification(N),
     CustomRequest(serde_json::Value, Value),
     CustomNotification(Value),
+    Error(serde_json::Value),
 }
 
 /// This function disentangles the various cases:

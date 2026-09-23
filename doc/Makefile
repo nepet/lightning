@@ -42,6 +42,7 @@ MARKDOWNPAGES := doc/addgossip.7 \
 	doc/connect.7 \
 	doc/createinvoice.7 \
 	doc/createonion.7 \
+	doc/createproof.7 \
 	doc/createrune.7 \
 	doc/currencyconvert.7 \
 	doc/currencyrate.7 \
@@ -76,6 +77,7 @@ MARKDOWNPAGES := doc/addgossip.7 \
 	doc/getlog.7 \
 	doc/getroute.7 \
 	doc/getroutes.7 \
+	doc/graceful.7 \
 	doc/help.7 \
 	doc/injectonionmessage.7 \
 	doc/injectpaymentonion.7 \
@@ -126,6 +128,7 @@ MARKDOWNPAGES := doc/addgossip.7 \
 	doc/renepay.7 \
 	doc/renepaystatus.7 \
 	doc/reserveinputs.7 \
+	doc/sendamount.7 \
 	doc/sendcustommsg.7 \
 	doc/sendinvoice.7 \
 	doc/sendonion.7 \
@@ -158,7 +161,25 @@ MARKDOWNPAGES := doc/addgossip.7 \
 	doc/wait.7 \
 	doc/waitsendpay.7 \
 	doc/withdraw.7 \
+	doc/xkeysend.7 \
 	doc/xpay.7
+
+NOTIFICATION_SCHEMAS := $(wildcard doc/schemas/notification/*.json)
+NOTIFICATION_MARKDOWNPAGES := $(patsubst doc/schemas/notification/%.json,doc/notification-%.7,$(NOTIFICATION_SCHEMAS))
+
+HOOK_SCHEMAS := $(wildcard doc/schemas/hook/*.json)
+HOOK_MARKDOWNPAGES := $(patsubst doc/schemas/hook/%.json,doc/hook-%.7,$(HOOK_SCHEMAS))
+
+MARKDOWNPAGES += $(NOTIFICATION_MARKDOWNPAGES) $(HOOK_MARKDOWNPAGES)
+
+$(foreach s,$(wildcard doc/schemas/*.json), \
+  $(eval doc/$(basename $(notdir $(s))).7.md: $(s)))
+
+$(foreach s,$(wildcard doc/schemas/notification/*.json), \
+  $(eval doc/notification-$(basename $(notdir $(s))).7.md: $(s)))
+
+$(foreach s,$(wildcard doc/schemas/hook/*.json), \
+  $(eval doc/hook-$(basename $(notdir $(s))).7.md: $(s)))
 
 ifeq ($(HAVE_SQLITE3),1)
 MARKDOWNPAGES += doc/listsqlschemas.7 doc/sql.7
@@ -188,7 +209,7 @@ doc/schemas/sql.json: doc/schemas/sql-template.json plugins/sql
 
 doc-all: $(MANPAGES) doc/index.rst
 
-SCHEMAS := $(wildcard doc/schemas/*.json) $(wildcard doc/schemas/notification/*.json)
+SCHEMAS := $(wildcard doc/schemas/*.json) $(NOTIFICATION_SCHEMAS) $(HOOK_SCHEMAS)
 
 # Don't try to build sql.json tables with plugins/sql if we don't have sqlite3
 ifeq ($(HAVE_SQLITE3),0)
@@ -210,8 +231,29 @@ check-doc: check-config-docs check-manpages check-fmt-schemas
 LBRACKET=(
 RBRACKET=)
 
-$(MARKDOWNPAGES_WITH_EXT): doc/%.7.md: doc/schemas/%.json tools/fromschema.py
-	@tools/fromschema.py --markdownfile=$@ $< > $@.tmp && mv $@.tmp $@
+doc/sql.7.md: doc/schemas/sql.json
+
+$(MARKDOWNPAGES_WITH_EXT): doc/%.7.md: tools/fromschema.py
+	@base="$*"; \
+	json="doc/schemas/$$base.json"; \
+	if [ ! -f "$$json" ]; then \
+		case "$$base" in \
+			notification-*) \
+				name=$${base#notification-}; \
+				json="doc/schemas/notification/$$name.json"; \
+				;; \
+			hook-*) \
+				name=$${base#hook-}; \
+				json="doc/schemas/hook/$$name.json"; \
+				;; \
+		esac; \
+	fi; \
+	if [ ! -f "$$json" ]; then \
+		echo "No schema found for $@ (looked for $$json)"; \
+		exit 1; \
+	fi; \
+	tools/fromschema.py --markdownfile=$@ $$json > $@.tmp && mv $@.tmp $@
+
 
 LOWDOWN := lowdown
 
@@ -269,10 +311,40 @@ check-manpages: all-programs check-config-docs default-targets
 	@SED=$(SED) tools/check-manpage.sh "lightningd/lightningd --lightning-dir=/tmp/" doc/lightningd-config.5.md
 	@awk '/^$$/ { do { getline } while ($$0 ~ /^( {4,}|\t)/) } /^\s*```/ { do { getline } while ($$0 !~ /^\s*```/) } /^([^`_\\]|`([^`\\]|\\.)*`|\b_|_\b|\\.)*\B_\B/ { print "" ; print "Unescaped underscore at " FILENAME ":" NR ":" ; print ; ret = 1 } ENDFILE { NR = 0 } END { exit ret }' doc/*.[0-9].md
 
-# Makes sure that fields mentioned in schema are in man page, and vice versa.
+# Verify bidirectional consistency between JSON schema and man page
+# First loop (schema to man page):
+#   Extract all non-deprecated schema properties, excluding internal fields (conf, plugins, important-plugins)
+#   and intentionally undocumented options (doc/undoc-flags.list).
+#   Check each appears in man page as '* **option**' or '* **option=**'.
+#
+# Second loop (man page to schema):
+#   Extract all man page options, excluding:
+#     - Plugin-specific options (lines with '[plugin ')
+#     - Command-line only flags (help, version)
+#     - Network aliases (mainnet, testnet, testnet4, signet)
+#     - Plugin management directives (plugin, important-plugin, plugin-dir, clear-plugins)
+#   Check each remaining option exists as a key in schema's configs.properties.
 check-config-docs:
-	@for c in `sed -n 's/^	"\(.*\)": {/\1/p' doc/schemas/listconfigs.json | grep -v '^# version$$' | grep -v '^plugins$$' | grep -v '^important-plugins$$'`; do if ! grep -q "^ \*\*$$c\*\*" doc/lightningd-config.5.md; then echo "$$c undocumented!"; exit 1; fi; done
-	@for c in `grep -v '\[plugin ' doc/lightningd-config.5.md | sed -n 's/^ \*\*\([^*]*\)\*\*.*/\1/p' | grep -v '^\(help\|version\|mainnet\|testnet\|testnet4\|signet\|plugin\|important-plugin\|plugin-dir\|clear-plugins\)$$'`; do if ! grep -q '"'"$$c"'"' doc/schemas/listconfigs.json; then echo "$$c documented but not in schema!"; exit 1; fi; done
+	@for c in `jq -r '.response.properties.configs.properties | to_entries[] | select(.value.deprecated == null) | .key' doc/schemas/listconfigs.json \
+		| grep -v '^conf$$' \
+		| grep -v '^plugins$$' \
+		| grep -v '^important-plugins$$'`; do \
+		if grep -Eq "^$$c=?$$" doc/undoc-flags.list; then \
+			continue; \
+		fi; \
+		if ! grep -q "^\* \*\*$$c\*\*" doc/lightningd-config.5.md && ! grep -q "^\* \*\*$$c=" doc/lightningd-config.5.md; then \
+			echo "$$c is undocumented in markdown but is in schema!"; \
+			exit 1; \
+		fi; \
+	done
+	@for c in `grep '^\* \*\*' doc/lightningd-config.5.md | grep -v '\[plugin ' | sed -n 's/^\* \*\*\([^*=]*\)[=*].*/\1/p' \
+		| grep -v '^\(help\|version\|mainnet\|testnet\|testnet4\|signet\|plugin\|important-plugin\|plugin-dir\|clear-plugins\)$$'`; do \
+		if ! jq -r '.response.properties.configs.properties | keys[]' doc/schemas/listconfigs.json | grep -qx "$$c"; then \
+			echo "$$c documented in markdown but not in schema!"; \
+			exit 1; \
+		fi; \
+	done
+	@echo "Config docs check passed!"
 
 doc-clean:
 	$(RM) $(MANPAGES) $(MARKDOWNPAGES_WITH_EXT) $(OLD_MARKDOWNPAGES_WITH_EXT) doc/.doc_version

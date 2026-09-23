@@ -174,8 +174,7 @@ def test_bitcoin_pruned(node_factory, bitcoind):
         nonlocal fetched_peerblock
         if fetched_peerblock:
             fetched_peerblock = False
-            conf_file = os.path.join(bitcoind.bitcoin_dir, "bitcoin.conf")
-            brpc = RawProxy(btc_conf_file=conf_file)
+            brpc = RawProxy(btc_conf_file=bitcoind.conf_file)
             return {
                 "result": brpc._call(r["method"], *r["params"]),
                 "error": None,
@@ -270,8 +269,7 @@ def test_lightningd_still_loading(node_factory, bitcoind, executor):
 
     # This is slow enough that we're going to notice.
     def mock_getblock(r):
-        conf_file = os.path.join(bitcoind.bitcoin_dir, 'bitcoin.conf')
-        brpc = RawProxy(btc_conf_file=conf_file)
+        brpc = RawProxy(btc_conf_file=bitcoind.conf_file)
         if r['params'][0] == slow_blockid:
             mock_release.wait(TIMEOUT)
         return {
@@ -453,20 +451,12 @@ def test_htlc_out_timeout(node_factory, bitcoind, executor):
     inv = l2.rpc.invoice(amt, 'test_htlc_out_timeout', 'desc')['bolt11']
     assert only_one(l2.rpc.listinvoices('test_htlc_out_timeout')['invoices'])['status'] == 'unpaid'
 
-    executor.submit(l1.dev_pay, inv, dev_use_shadow=False)
+    executor.submit(l1.rpc.xpay, inv)
 
     # l1 will disconnect, and not reconnect.
     l1.daemon.wait_for_log('dev_disconnect: -WIRE_REVOKE_AND_ACK')
 
-    # Takes 6 blocks to timeout (cltv-final + 1), but we also give grace period of 1 block.
-    # shadow route can add extra blocks!
-    status = only_one(l1.rpc.call('paystatus')['pay'])
-    if 'shadow' in status:
-        shadowlen = 6 * status['shadow'].count('Added 6 cltv delay for shadow')
-    else:
-        shadowlen = 0
-
-    bitcoind.generate_block(5 + 1 + shadowlen)
+    bitcoind.generate_block(5 + 1)
     time.sleep(3)
     assert not l1.daemon.is_in_log('hit deadline')
     bitcoind.generate_block(1)
@@ -533,19 +523,12 @@ def test_htlc_in_timeout(node_factory, bitcoind, executor):
     inv = l2.rpc.invoice(amt, 'test_htlc_in_timeout', 'desc')['bolt11']
     assert only_one(l2.rpc.listinvoices('test_htlc_in_timeout')['invoices'])['status'] == 'unpaid'
 
-    executor.submit(l1.dev_pay, inv, dev_use_shadow=False)
+    executor.submit(l1.rpc.xpay, inv)
 
     # l1 will disconnect and not reconnect.
     l1.daemon.wait_for_log('dev_disconnect: -WIRE_REVOKE_AND_ACK')
 
-    # Deadline HTLC expiry minus 1/2 cltv-expiry delta (rounded up) (== cltv - 3).  cltv is 5+1.
-    # shadow route can add extra blocks!
-    status = only_one(l1.rpc.call('paystatus')['pay'])
-    if 'shadow' in status:
-        shadowlen = 6 * status['shadow'].count('Added 6 cltv delay for shadow')
-    else:
-        shadowlen = 0
-    bitcoind.generate_block(2 + shadowlen)
+    bitcoind.generate_block(2)
     assert not l2.daemon.is_in_log('hit deadline')
     bitcoind.generate_block(1)
 
@@ -555,7 +538,7 @@ def test_htlc_in_timeout(node_factory, bitcoind, executor):
     l2.daemon.wait_for_log(' to ONCHAIN')
     l1.daemon.wait_for_log(' to ONCHAIN')
 
-    # L2 will collect HTLC (iff no shadow route)
+    # L2 will collect HTLC
     _, txid, blocks = l2.wait_for_onchaind_tx('OUR_HTLC_SUCCESS_TX',
                                               'OUR_UNILATERAL/THEIR_HTLC')
     assert blocks == 0
@@ -633,7 +616,7 @@ def test_withdraw_misc(node_factory, bitcoind, chainparams):
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == 10)
 
     # Reach around into the db to check that outputs were added
-    assert l1.db_query('SELECT COUNT(*) as c FROM outputs WHERE status=0')[0]['c'] == 10
+    assert l1.db_query('SELECT COUNT(*) as c FROM our_outputs WHERE spendheight IS NULL AND reserved_til = 0')[0]['c'] == 10
 
     waddr = l1.bitcoin.getnewaddress()
     # Now attempt to withdraw some (making sure we collect multiple inputs)
@@ -660,7 +643,7 @@ def test_withdraw_misc(node_factory, bitcoind, chainparams):
     sync_blockheight(bitcoind, [l1])
 
     # Now make sure two of them were marked as spent
-    assert l1.db_query('SELECT COUNT(*) as c FROM outputs WHERE status=2')[0]['c'] == 2
+    assert l1.db_query('SELECT COUNT(*) as c FROM our_outputs WHERE spendheight IS NOT NULL')[0]['c'] == 2
 
     dont_spend_outputs(l1, out['txid'])
 
@@ -671,13 +654,13 @@ def test_withdraw_misc(node_factory, bitcoind, chainparams):
 
     # Make sure l2 received the withdrawal.
     wait_for(lambda: len(l2.rpc.listfunds()['outputs']) == 1)
-    outputs = l2.db_query('SELECT value FROM outputs WHERE status=0;')
+    outputs = l2.db_query('SELECT satoshis as value FROM our_outputs WHERE spendheight IS NULL AND reserved_til = 0;')
     assert only_one(outputs)['value'] == amount
 
     # Now make sure an additional two of them were marked as spent
     sync_blockheight(bitcoind, [l1])
     dont_spend_outputs(l1, out['txid'])
-    assert l1.db_query('SELECT COUNT(*) as c FROM outputs WHERE status=2')[0]['c'] == 4
+    assert l1.db_query('SELECT COUNT(*) as c FROM our_outputs WHERE spendheight IS NOT NULL')[0]['c'] == 4
 
     if chainparams['name'] != 'regtest':
         return
@@ -697,7 +680,7 @@ def test_withdraw_misc(node_factory, bitcoind, chainparams):
     dont_spend_outputs(l1, out['txid'])
 
     # Now make sure additional two of them were marked as spent
-    assert l1.db_query('SELECT COUNT(*) as c FROM outputs WHERE status=2')[0]['c'] == 6
+    assert l1.db_query('SELECT COUNT(*) as c FROM our_outputs WHERE spendheight IS NOT NULL')[0]['c'] == 6
 
     # Simple test for withdrawal to P2WSH
     # Address from: https://bc-2.jp/tools/bech32demo/index.html
@@ -713,7 +696,7 @@ def test_withdraw_misc(node_factory, bitcoind, chainparams):
     sync_blockheight(bitcoind, [l1])
     dont_spend_outputs(l1, out['txid'])
     # Now make sure additional two of them were marked as spent
-    assert l1.db_query('SELECT COUNT(*) as c FROM outputs WHERE status=2')[0]['c'] == 8
+    assert l1.db_query('SELECT COUNT(*) as c FROM our_outputs WHERE spendheight IS NOT NULL')[0]['c'] == 8
 
     # failure testing for invalid SegWit addresses, from BIP173
     # HRP character out of range
@@ -742,7 +725,7 @@ def test_withdraw_misc(node_factory, bitcoind, chainparams):
         l1.rpc.withdraw('tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3pjxtptv', amount)
 
     # Should have 2 outputs available.
-    assert l1.db_query('SELECT COUNT(*) as c FROM outputs WHERE status=0')[0]['c'] == 2
+    assert l1.db_query('SELECT COUNT(*) as c FROM our_outputs WHERE spendheight IS NULL AND reserved_til = 0')[0]['c'] == 2
 
     # Unreserve everything.
     inputs = []
@@ -755,10 +738,10 @@ def test_withdraw_misc(node_factory, bitcoind, chainparams):
     # Test withdrawal to self.
     l1.rpc.withdraw(l1.rpc.newaddr('p2tr')['p2tr'], 'all', minconf=0)
     bitcoind.generate_block(1)
-    assert l1.db_query('SELECT COUNT(*) as c FROM outputs WHERE status=0')[0]['c'] == 1
+    assert l1.db_query('SELECT COUNT(*) as c FROM our_outputs WHERE spendheight IS NULL AND reserved_til = 0')[0]['c'] == 1
 
     l1.rpc.withdraw(waddr, 'all', minconf=0)
-    assert l1.db_query('SELECT COUNT(*) as c FROM outputs WHERE status=0')[0]['c'] == 0
+    assert l1.db_query('SELECT COUNT(*) as c FROM our_outputs WHERE spendheight IS NULL AND reserved_til = 0')[0]['c'] == 0
 
     # This should fail, can't even afford fee.
     with pytest.raises(RpcError, match=r'Could not afford'):
@@ -1014,12 +997,12 @@ def test_malformed_rpc(node_factory):
 def test_valid_json_cli(node_factory):
     """Make sure lightning-cli passes valid json values, so that rust and python plugins
     don't crash."""
-    l1 = node_factory.get_node(
-        options={
-            "log-level": "io",
-            "plugin": os.path.join(os.getcwd(), "tests/plugins/validatejson.py"),
-        }
-    )
+    def setup(plugin):
+        @plugin.method('validate-json-rpc')
+        def validate_json_rpc(plugin, *args, **kwargs):
+            return {}
+
+    l1 = node_factory.get_node(options={"log-level": "io"}, inline_plugin=setup)
     # If passed as a literal number rust's serde_json::from_str will fail as the
     # leading zero makes it invalid for an integer.
     nodeid = "030000000000000000000000000000000000000000000000000000000000000001"
@@ -1044,7 +1027,7 @@ def test_cli(node_factory):
                                    .format(l1.daemon.lightning_dir),
                                    'help']).decode('utf-8')
     # Test some known output.
-    assert 'addgossip message\n\naddpsbtinput' in out
+    assert 'addgossip message\n\naddoutpointwatch' in out
 
     # Check JSON id is as expected
     l1.daemon.wait_for_log(r'jsonrpc#[0-9]*: "cli:help#[0-9]*"\[IN\]')
@@ -1218,7 +1201,18 @@ def test_cli(node_factory):
 
 
 def test_cli_multiline_help(node_factory):
-    l1 = node_factory.get_node(options={'plugin': os.path.join(os.getcwd(), 'tests/plugins/multiline-help.py')})
+    def setup(plugin):
+        from pyln.client import Millisatoshi
+
+        @plugin.method("helpme")
+        def helpme(plugin, msat: Millisatoshi):
+            """This is a message which consumes multiple lines and thus should
+            be well-formatted by lightning-cli help
+
+            """
+            return {'help': msat}
+
+    l1 = node_factory.get_node(inline_plugin=setup)
 
     out = subprocess.check_output(['cli/lightning-cli',
                                    '--network={}'.format(TEST_NETWORK),
@@ -1250,7 +1244,8 @@ def test_cli_commando(node_factory):
                           '--network={}'.format(TEST_NETWORK),
                           '--lightning-dir={}'
                           .format(l1.daemon.lightning_dir),
-                          'help'])
+                          'help'],
+                         timeout=TIMEOUT)
     assert val.returncode == 3
 
     # Valid peer id, but needs rune!
@@ -1259,7 +1254,8 @@ def test_cli_commando(node_factory):
                           '--network={}'.format(TEST_NETWORK),
                           '--lightning-dir={}'
                           .format(l1.daemon.lightning_dir),
-                          'help'])
+                          'help'],
+                         timeout=TIMEOUT)
     assert val.returncode == 1
 
     # This works!
@@ -1268,9 +1264,10 @@ def test_cli_commando(node_factory):
                                    '--network={}'.format(TEST_NETWORK),
                                    '--lightning-dir={}'
                                    .format(l1.daemon.lightning_dir),
-                                   'help']).decode('utf-8')
+                                   'help'],
+                                  timeout=TIMEOUT).decode('utf-8')
     # Test some known output.
-    assert 'addgossip message\n\naddpsbtinput' in out
+    assert 'addgossip message\n\naddoutpointwatch' in out
 
     # Check JSON id is as expected
     l1.daemon.wait_for_log(r'jsonrpc#[0-9]*: "cli:help#[0-9]*"\[IN\]')
@@ -1285,7 +1282,8 @@ def test_cli_commando(node_factory):
                                    '--lightning-dir={}'
                                    .format(l1.daemon.lightning_dir),
                                    '-J', '-k',
-                                   'help', 'command=help']).decode('utf-8')
+                                   'help', 'command=help'],
+                                  timeout=TIMEOUT).decode('utf-8')
     j, _ = json.JSONDecoder().raw_decode(out)
     assert 'help [command]' in j['help'][0]['command']
 
@@ -1296,7 +1294,8 @@ def test_cli_commando(node_factory):
                                    '--lightning-dir={}'
                                    .format(l1.daemon.lightning_dir),
                                    '-J', '-o',
-                                   'help', 'help']).decode('utf-8')
+                                   'help', 'help'],
+                                  timeout=TIMEOUT).decode('utf-8')
     j, _ = json.JSONDecoder().raw_decode(out)
     assert 'help [command]' in j['help'][0]['command']
 
@@ -1307,7 +1306,8 @@ def test_cli_commando(node_factory):
                                    '--lightning-dir={}'
                                    .format(l1.daemon.lightning_dir),
                                    '-J', '--filter={"help":[{"command":true}]}',
-                                   'help', 'help']).decode('utf-8')
+                                   'help', 'help'],
+                                  timeout=TIMEOUT).decode('utf-8')
     j, _ = json.JSONDecoder().raw_decode(out)
     assert j == {'help': [{'command': 'help [command]'}]}
 
@@ -1321,7 +1321,8 @@ def test_cli_commando(node_factory):
                                        '--lightning-dir={}'
                                        .format(l1.daemon.lightning_dir),
                                        '-J', '-o',
-                                       'sendpay']).decode('utf-8')
+                                       'sendpay'],
+                                      timeout=TIMEOUT).decode('utf-8')
     except Exception:
         pass
 
@@ -1333,7 +1334,8 @@ def test_cli_commando(node_factory):
                           '--lightning-dir={}'
                           .format(l1.daemon.lightning_dir),
                           'x"[]{}'],
-                         stdout=subprocess.PIPE)
+                         stdout=subprocess.PIPE,
+                         timeout=TIMEOUT)
     assert 'Unknown command' in out.stdout.decode('utf-8')
 
     subprocess.check_output(['cli/lightning-cli',
@@ -1341,7 +1343,8 @@ def test_cli_commando(node_factory):
                              '--network={}'.format(TEST_NETWORK),
                              '--lightning-dir={}'
                              .format(l1.daemon.lightning_dir),
-                             'invoice', '123000', 'l"[]{}', 'd"[]{}']).decode('utf-8')
+                             'invoice', '123000', 'l"[]{}', 'd"[]{}'],
+                            timeout=TIMEOUT).decode('utf-8')
     # Check label is correct, and also that cli's keyword parsing works.
     out = subprocess.check_output(['cli/lightning-cli',
                                    '--commando={}:{}'.format(l2.info['id'], rune),
@@ -1349,7 +1352,8 @@ def test_cli_commando(node_factory):
                                    '--lightning-dir={}'
                                    .format(l1.daemon.lightning_dir),
                                    '-k',
-                                   'listinvoices', 'label=l"[]{}']).decode('utf-8')
+                                   'listinvoices', 'label=l"[]{}'],
+                                  timeout=TIMEOUT).decode('utf-8')
     j = json.loads(out)
     assert only_one(j['invoices'])['label'] == 'l"[]{}'
 
@@ -1377,7 +1381,7 @@ def test_daemon_option(node_factory):
                                    '--lightning-dir={}'
                                    .format(l1.daemon.lightning_dir),
                                    'help']).decode('utf-8')
-    assert 'addgossip message\n\naddpsbtinput' in out
+    assert 'addgossip message\n\naddoutpointwatch' in out
 
     subprocess.run(['cli/lightning-cli',
                     '--network={}'.format(TEST_NETWORK),
@@ -1446,15 +1450,40 @@ def test_funding_reorg_private(node_factory, bitcoind):
     """
     # Rescan to detect reorg at restart and may_reconnect so channeld
     # will restart.  Reorg can cause bad gossip msg.
-    opts = {'funding-confirms': 2, 'rescan': 10, 'may_reconnect': True,
-            'allow_bad_gossip': True,
-            # gossipd send lightning update for original channel.
-            'allow_warning': True,
-            'dev-fast-reconnect': None,
-            # if it's not zeroconf, we'll terminate on reorg.
-            'plugin': os.path.join(os.getcwd(), 'tests/plugins/zeroconf-selective.py'),
-            'zeroconf_allow': 'any'}
-    l1, l2 = node_factory.line_graph(2, fundchannel=False, opts=opts)
+    def setup(plugin):
+        plugin.add_option(
+            'zeroconf_allow',
+            '03864ef025fde8fb587d989186ce6a4a186895ee44a926bfc370e2c366597a3f8f',
+            'A node_id to allow zeroconf channels from',
+        )
+        plugin.add_option(
+            'zeroconf_mindepth',
+            0,
+            'Number of confirmations to require from allowlisted peers',
+        )
+
+        @plugin.hook('openchannel')
+        def on_openchannel(openchannel, plugin, **kwargs):
+            plugin.log(repr(openchannel))
+            mindepth = int(plugin.options['zeroconf_mindepth']['value'])
+
+            if openchannel['id'] == plugin.options['zeroconf_allow']['value'] or plugin.options['zeroconf_allow']['value'] == 'any':
+                plugin.log(f"This peer is in the zeroconf allowlist, setting mindepth={mindepth}")
+                return {'result': 'continue', 'mindepth': mindepth}
+            else:
+                return {'result': 'continue'}
+
+    cli_opts = {'funding-confirms': 2, 'rescan': 10,
+                'dev-fast-reconnect': None,
+                # if it's not zeroconf, we'll terminate on reorg.
+                'zeroconf_allow': 'any'}
+    node_opts = {'may_reconnect': True,
+                 'allow_bad_gossip': True,
+                 # gossipd send lightning update for original channel.
+                 'allow_warning': True}
+    l1 = node_factory.get_node(inline_plugin=setup, options=cli_opts, **node_opts)
+    l2 = node_factory.get_node(inline_plugin=setup, options=cli_opts, **node_opts)
+    node_factory.join_nodes([l1, l2], fundchannel=False)
     l1.fundwallet(10000000)
     sync_blockheight(bitcoind, [l1])                # height 102
     bitcoind.generate_block(3)                      # heights 103-105
@@ -1492,12 +1521,36 @@ def test_funding_reorg_remote_lags(node_factory, bitcoind):
     """Nodes may disagree about short_channel_id before channel announcement
     """
     # may_reconnect so channeld will restart; bad gossip can happen due to reorg
-    opts = {'funding-confirms': 1, 'may_reconnect': True, 'allow_bad_gossip': True,
-            'allow_warning': True, 'dev-fast-reconnect': None,
-            # if it's not zeroconf, l2 will terminate on reorg.
-            'plugin': os.path.join(os.getcwd(), 'tests/plugins/zeroconf-selective.py'),
-            'zeroconf_allow': 'any'}
-    l1, l2 = node_factory.line_graph(2, fundchannel=False, opts=opts)
+    def setup(plugin):
+        plugin.add_option(
+            'zeroconf_allow',
+            '03864ef025fde8fb587d989186ce6a4a186895ee44a926bfc370e2c366597a3f8f',
+            'A node_id to allow zeroconf channels from',
+        )
+        plugin.add_option(
+            'zeroconf_mindepth',
+            0,
+            'Number of confirmations to require from allowlisted peers',
+        )
+
+        @plugin.hook('openchannel')
+        def on_openchannel(openchannel, plugin, **kwargs):
+            plugin.log(repr(openchannel))
+            mindepth = int(plugin.options['zeroconf_mindepth']['value'])
+
+            if openchannel['id'] == plugin.options['zeroconf_allow']['value'] or plugin.options['zeroconf_allow']['value'] == 'any':
+                plugin.log(f"This peer is in the zeroconf allowlist, setting mindepth={mindepth}")
+                return {'result': 'continue', 'mindepth': mindepth}
+            else:
+                return {'result': 'continue'}
+
+    cli_opts = {'funding-confirms': 1, 'dev-fast-reconnect': None,
+                # if it's not zeroconf, l2 will terminate on reorg.
+                'zeroconf_allow': 'any'}
+    node_opts = {'may_reconnect': True, 'allow_bad_gossip': True, 'allow_warning': True}
+    l1 = node_factory.get_node(inline_plugin=setup, options=cli_opts, **node_opts)
+    l2 = node_factory.get_node(inline_plugin=setup, options=cli_opts, **node_opts)
+    node_factory.join_nodes([l1, l2], fundchannel=False)
     l1.fundwallet(10000000)
     sync_blockheight(bitcoind, [l1])                # height 102
 
@@ -1797,10 +1850,10 @@ def test_ipv4_and_ipv6(node_factory):
         assert bind[1]['address'] == '0.0.0.0'
         assert int(bind[1]['port']) == port
     else:
-        # Assume we're IPv4 only...
+        # Either IPv4-only, or IPv6 dual-stack (covers IPv4 too, so no separate IPv4 socket)
         assert len(bind) == 1
-        assert bind[0]['type'] == 'ipv4'
-        assert bind[0]['address'] == '0.0.0.0'
+        assert bind[0]['type'] in ('ipv4', 'ipv6')
+        assert bind[0]['address'] in ('0.0.0.0', '::')
         assert int(bind[0]['port']) == port
 
 
@@ -2149,14 +2202,14 @@ def test_bad_onion(node_factory, bitcoind):
                                              opts={'log-level': 'io'})
 
     inv = l4.rpc.invoice(123000, 'test_bad_onion', 'description')
-    route = l1.rpc.getroute(l4.info['id'], 123000, 1)['route']
+    route = l1.single_route(l4.info['id'], 123000)
 
     assert len(route) == 3
 
     mangled_nodeid = '0265b6ab5ec860cd257865d61ef0bbf5b3339c36cbda8b26b74e7f1dca490b6518'
 
     # Replace id with a different pubkey, so onion encoded badly at third hop.
-    route[2]['id'] = mangled_nodeid
+    route[2]['node_id_out'] = mangled_nodeid
     l1.rpc.sendpay(route, inv['payment_hash'], payment_secret=inv['payment_secret'])
     with pytest.raises(RpcError) as err:
         l1.rpc.waitsendpay(inv['payment_hash'])
@@ -2168,7 +2221,7 @@ def test_bad_onion(node_factory, bitcoind):
     WIRE_INVALID_ONION_HMAC = 0x8000 | 0x4000 | 5
     assert err.value.error['data']['failcode'] == WIRE_INVALID_ONION_HMAC
     assert err.value.error['data']['erring_node'] == mangled_nodeid
-    assert err.value.error['data']['erring_channel'] == route[2]['channel']
+    assert err.value.error['data']['erring_channel'] == route[2]['short_channel_id_dir'].split('/')[0]
 
     # We should see a WIRE_UPDATE_FAIL_MALFORMED_HTLC from l4.
     line = l4.daemon.is_in_log(r'\[OUT\] 0087')
@@ -2180,7 +2233,7 @@ def test_bad_onion(node_factory, bitcoind):
     l1.daemon.wait_for_log(r'failcode .* from onionreply .*{sha}'.format(sha=sha))
 
     # Replace id with a different pubkey, so onion encoded badly at second hop.
-    route[1]['id'] = mangled_nodeid
+    route[1]['node_id_out'] = mangled_nodeid
     l1.rpc.sendpay(route, inv['payment_hash'], payment_secret=inv['payment_secret'])
     with pytest.raises(RpcError) as err:
         l1.rpc.waitsendpay(inv['payment_hash'])
@@ -2190,7 +2243,7 @@ def test_bad_onion(node_factory, bitcoind):
     assert err.value.error['code'] == PAY_TRY_OTHER_ROUTE
     assert err.value.error['data']['failcode'] == WIRE_INVALID_ONION_HMAC
     assert err.value.error['data']['erring_node'] == mangled_nodeid
-    assert err.value.error['data']['erring_channel'] == route[1]['channel']
+    assert err.value.error['data']['erring_channel'] == route[1]['short_channel_id_dir'].split('/')[0]
 
 
 def test_bad_onion_immediate_peer(node_factory, bitcoind):
@@ -2198,7 +2251,7 @@ def test_bad_onion_immediate_peer(node_factory, bitcoind):
     l1, l2 = node_factory.line_graph(2, opts=[{}, {'dev-fail-process-onionpacket': None}])
 
     inv = l2.rpc.invoice(123000, 'test_bad_onion_immediate_peer', 'description')
-    route = l1.rpc.getroute(l2.info['id'], 123000, 1)['route']
+    route = l1.single_route(l2.info['id'], 123000)
     assert len(route) == 1
 
     l1.rpc.sendpay(route, inv['payment_hash'], payment_secret=inv['payment_secret'])
@@ -2289,7 +2342,7 @@ def test_bitcoind_feerate_floor(node_factory, bitcoind, anchors):
             "unilateral_close": 44000,
             'unilateral_anchor_close': 15000,
             "penalty": 30000,
-            "splice": 15020,
+            "splice": 30020,
             "min_acceptable": 7500,
             "max_acceptable": 600000,
             "floor": 1012,
@@ -2333,7 +2386,7 @@ def test_bitcoind_feerate_floor(node_factory, bitcoind, anchors):
             # This has increased (rounded up)
             "unilateral_close": 44000,
             "penalty": 30000,
-            "splice": 20024,
+            "splice": 30020,
             # This has increased (rounded up)
             "min_acceptable": 20004,
             "max_acceptable": 600000,
@@ -2501,7 +2554,8 @@ def test_list_features_only(node_factory):
                 'option_provide_storage/odd',
                 'option_channel_type/even',
                 'option_scid_alias/odd',
-                'option_zeroconf/odd']
+                'option_zeroconf/odd',
+                'option_splice/odd']
     expected += ['supports_open_accept_channel_type']
 
     assert features == expected
@@ -2822,11 +2876,11 @@ def test_new_node_is_mainnet(node_factory):
 
 
 def test_unicode_rpc(node_factory, executor, bitcoind):
-    node = node_factory.get_node()
+    l1 = node_factory.get_node()
     desc = "Some candy 🍬 and a nice glass of milk 🥛."
 
-    node.rpc.invoice(amount_msat=42, label=desc, description=desc)
-    invoices = node.rpc.listinvoices()['invoices']
+    l1.rpc.invoice(amount_msat=42, label=desc, description=desc)
+    invoices = l1.rpc.listinvoices()['invoices']
     assert(len(invoices) == 1)
     assert(invoices[0]['description'] == desc)
     assert(invoices[0]['label'] == desc)
@@ -2851,29 +2905,29 @@ def test_unix_socket_path_length(node_factory, bitcoind, directory, executor, db
 
 
 def test_waitblockheight(node_factory, executor, bitcoind):
-    node = node_factory.get_node()
+    l1 = node_factory.get_node()
 
-    sync_blockheight(bitcoind, [node])
+    sync_blockheight(bitcoind, [l1])
 
-    blockheight = node.rpc.getinfo()['blockheight']
+    blockheight = l1.rpc.getinfo()['blockheight']
 
     # Should succeed without waiting.
-    node.rpc.waitblockheight(blockheight - 2)
-    node.rpc.waitblockheight(blockheight - 1)
-    node.rpc.waitblockheight(blockheight)
+    l1.rpc.waitblockheight(blockheight - 2)
+    l1.rpc.waitblockheight(blockheight - 1)
+    l1.rpc.waitblockheight(blockheight)
 
     # Developer mode polls bitcoind every second, so 60 seconds is plenty.
     time = 60
 
     # Should not succeed yet.
-    fut2 = executor.submit(node.rpc.waitblockheight, blockheight + 2, time)
-    fut1 = executor.submit(node.rpc.waitblockheight, blockheight + 1, time)
+    fut2 = executor.submit(l1.rpc.waitblockheight, blockheight + 2, time)
+    fut1 = executor.submit(l1.rpc.waitblockheight, blockheight + 1, time)
     assert not fut1.done()
     assert not fut2.done()
 
     # Should take about ~1second and time out.
     with pytest.raises(RpcError):
-        node.rpc.waitblockheight(blockheight + 2, 1)
+        l1.rpc.waitblockheight(blockheight + 2, 1)
 
     # Others should still not be done.
     assert not fut1.done()
@@ -2881,13 +2935,13 @@ def test_waitblockheight(node_factory, executor, bitcoind):
 
     # Trigger just one more block.
     bitcoind.generate_block(1)
-    sync_blockheight(bitcoind, [node])
+    sync_blockheight(bitcoind, [l1])
     fut1.result(5)
     assert not fut2.done()
 
     # Trigger two blocks.
     bitcoind.generate_block(1)
-    sync_blockheight(bitcoind, [node])
+    sync_blockheight(bitcoind, [l1])
     fut2.result(5)
 
 
@@ -3044,8 +3098,10 @@ def test_getemergencyrecoverdata(node_factory):
     Test getemergencyrecoverdata
     """
     l1 = node_factory.get_node()
-    filedata = l1.rpc.getemergencyrecoverdata()['filedata']
-
+    rpc = l1.rpc.getemergencyrecoverdata()
+    filedata = rpc['filedata']
+    assert rpc['can_create_penalty'] is True
+    assert len(rpc['backed_up_channel_ids']) == 0
     with open(os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, "emergency.recover"), "rb") as f:
         lines = f.read().hex()
     assert lines == filedata
@@ -3099,11 +3155,11 @@ def test_emergencyrecoverpenaltytxn(node_factory, bitcoind):
     stubs = l1.rpc.emergencyrecover()["stubs"]
     assert l1.daemon.is_in_log('channel {} already exists!'.format(_['channel_id']))
 
-    l2.rpc.pay(l1.rpc.invoice(25000000, 'lbl1', 'desc1')['bolt11'])
+    l2.rpc.xpay(l1.rpc.invoice(25000000, 'lbl1', 'desc1')['bolt11'])
 
     tx = l2.rpc.dev_sign_last_tx(l1.info['id'])['tx']
 
-    l2.rpc.pay(l1.rpc.invoice(25000000, 'lbl2', 'desc2')['bolt11'])
+    l2.rpc.xpay(l1.rpc.invoice(25000000, 'lbl2', 'desc2')['bolt11'])
 
     l1.stop()
 
@@ -3219,7 +3275,7 @@ def test_recover_plugin(node_factory, bitcoind):
 
     # successful payments
     i31 = l1.rpc.invoice(10000, 'i31', 'desc')
-    l2.rpc.pay(i31['bolt11'])
+    l2.rpc.xpay(i31['bolt11'])
 
     # Now, move l2 back in time.
     l2.stop()
@@ -3393,7 +3449,7 @@ def test_listforwards_and_listhtlcs(node_factory, bitcoind):
 
     # successful payments
     i31 = l3.rpc.invoice(1000, 'i31', 'desc')
-    l1.rpc.pay(i31['bolt11'])
+    l1.rpc.xpay(i31['bolt11'])
 
     # 1 htlc in, 1 htlc out.
     assert len(l2.rpc.listhtlcs()['htlcs']) == 2
@@ -3412,11 +3468,11 @@ def test_listforwards_and_listhtlcs(node_factory, bitcoind):
     assert len(l2.rpc.listhtlcs(id=c12, index='updated', start=1, limit=1)['htlcs']) == 1
 
     i41 = l4.rpc.invoice(2000, 'i41', 'desc')
-    l1.rpc.pay(i41['bolt11'])
+    l1.rpc.xpay(i41['bolt11'])
 
     # failed payment
     failed_inv = l3.rpc.invoice(4000, 'failed', 'desc')
-    failed_route = l1.rpc.getroute(l3.info['id'], 4000, 1)['route']
+    failed_route = l1.single_route(l3.info['id'], 4000)
 
     l2.rpc.close(c23)
 
@@ -3582,7 +3638,7 @@ def test_listforwards_wait(node_factory, executor):
 
     amt1 = 1000
     inv1 = l3.rpc.invoice(amt1, 'inv1', 'desc')
-    l1.rpc.pay(inv1['bolt11'])
+    l1.rpc.xpay(inv1['bolt11'], dev_use_shadow=False)
 
     waitres = waitcreate.result(TIMEOUT)
     assert waitres == {'subsystem': 'forwards',
@@ -3611,8 +3667,8 @@ def test_listforwards_wait(node_factory, executor):
     l2.daemon.wait_for_logs(['waiting on forwards created 2', 'waiting on forwards updated 2'])
     time.sleep(1)
 
-    with pytest.raises(RpcError, match="WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS"):
-        l1.rpc.pay(inv2['bolt11'])
+    with pytest.raises(RpcError, match="incorrect_or_unknown_payment_details"):
+        l1.rpc.xpay(inv2['bolt11'])
 
     waitres = waitcreate.result(TIMEOUT)
     assert waitres == {'subsystem': 'forwards',
@@ -3671,7 +3727,7 @@ def test_listhtlcs_wait(node_factory, bitcoind, executor):
 
     amt1 = 1000
     inv1 = l3.rpc.invoice(amt1, 'inv1', 'desc')
-    l1.rpc.pay(inv1['bolt11'])
+    l1.rpc.xpay(invstring=inv1['bolt11'], dev_use_shadow=False)
 
     waitres = waitcreate.result(TIMEOUT)
     assert waitres == {'subsystem': 'htlcs',
@@ -3705,8 +3761,8 @@ def test_listhtlcs_wait(node_factory, bitcoind, executor):
     waitcreate = executor.submit(l2.rpc.wait, subsystem='htlcs', indexname='created', nextvalue=4)
     l2.daemon.wait_for_log('waiting on htlcs created 4')
 
-    with pytest.raises(RpcError, match="WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS"):
-        l1.rpc.pay(inv2['bolt11'])
+    with pytest.raises(RpcError, match="incorrect_or_unknown_payment_details"):
+        l1.rpc.xpay(inv2['bolt11'], dev_use_shadow=False)
 
     waitres = waitcreate.result(TIMEOUT)
     assert waitres == {'subsystem': 'htlcs',
@@ -3741,7 +3797,7 @@ def test_listforwards_ancient(node_factory, bitcoind):
 
     amt1 = 1000
     inv1 = l3.rpc.invoice(amt1, 'inv1', 'desc')
-    l1.rpc.pay(inv1['bolt11'])
+    l1.rpc.xpay(inv1['bolt11'])
 
     forwards = l2.rpc.listforwards()['forwards']
     assert len(forwards) == 1
@@ -3894,7 +3950,7 @@ def test_force_feerates(node_factory):
         "unilateral_close": 2222,
         "unilateral_anchor_close": 2222,
         "penalty": 2222,
-        "splice": 2227,
+        "splice": 1116,
         "min_acceptable": 1875,
         "max_acceptable": 150000,
         "estimates": estimates,
@@ -3911,7 +3967,7 @@ def test_force_feerates(node_factory):
         "unilateral_close": 3333,
         "unilateral_anchor_close": 3333,
         "penalty": 6666,
-        "splice": 3338,
+        "splice": 1116,
         "min_acceptable": 1875,
         "max_acceptable": 150000,
         "estimates": estimates,
@@ -3931,8 +3987,8 @@ def test_datastore_escapeing(node_factory):
 
 
 def test_datastore(node_factory):
-    # Suppress xpay and bookkeeper which use the datastore
-    l1 = node_factory.get_node(options={"disable-plugin": ["cln-xpay", "bookkeeper"]})
+    # Suppress plugins that use the datastore (keep list empty for assertions below).
+    l1 = node_factory.get_node(options={"disable-plugin": ["cln-xpay", "bookkeeper", "bwatch"]})
 
     # Starts empty
     assert l1.rpc.listdatastore() == {'datastore': []}
@@ -4046,8 +4102,8 @@ def test_datastore(node_factory):
 
 
 def test_datastore_keylist(node_factory):
-    # Suppress xpay and bookkeeper which use the datastore
-    l1 = node_factory.get_node(options={"disable-plugin": ["cln-xpay", "bookkeeper"]})
+    # Suppress plugins that use the datastore (keep list empty for assertions below).
+    l1 = node_factory.get_node(options={"disable-plugin": ["cln-xpay", "bookkeeper", "bwatch"]})
 
     # Starts empty
     assert l1.rpc.listdatastore() == {'datastore': []}
@@ -4109,8 +4165,8 @@ def test_datastore_keylist(node_factory):
 
 
 def test_datastoreusage(node_factory):
-    # Suppress xpay and bookkeeper which use the datastore
-    l1: LightningNode = node_factory.get_node(options={"disable-plugin": ["cln-xpay", "bookkeeper"]})
+    # Suppress plugins that use the datastore (same as test_datastore / test_datastore_keylist).
+    l1: LightningNode = node_factory.get_node(options={"disable-plugin": ["cln-xpay", "bookkeeper", "bwatch"]})
     assert l1.rpc.datastoreusage() == {'datastoreusage': {'key': '[]', 'total_bytes': 0}}
 
     data = 'somedatatostoreinthedatastore'  # len 29
@@ -4309,6 +4365,96 @@ def test_create_gossip_mesh(node_factory, bitcoind):
     print("nodeids", nodeids)
     print("scids", scids)
     assert False, "Test failed on purpose, grab the gossip store from /tmp/ltests-..."
+
+
+def test_graceful_no_peers(node_factory):
+    """graceful with no channels returns immediately"""
+    l1 = node_factory.get_node()
+    assert l1.rpc.graceful() == {}
+    # Returns instantly even with timeout.
+    assert l1.rpc.graceful(10000) == {}
+
+
+def test_graceful_idle_peer(node_factory, executor):
+    """graceful with an idle peer disconnects it and completes"""
+    l1, l2 = node_factory.line_graph(2)
+
+    notifications = []
+
+    def run_graceful():
+        def capture(message, **kwargs):
+            if message:
+                notifications.append(message)
+        with l1.rpc.notify(capture):
+            return l1.rpc.graceful()
+
+    fut = executor.submit(run_graceful)
+    result = fut.result(TIMEOUT)
+
+    assert result == {}
+    assert any("peers still connected" in n for n in notifications)
+
+
+def test_graceful_htlc(node_factory, executor):
+    """graceful with an HTLC in flight notifies about expiry and completes after HTLC resolves"""
+    l1, l2, l3 = node_factory.line_graph(3, wait_for_announce=True,
+                                         opts=[{'may_reconnect': True,
+                                                'dev-no-reconnect': None},
+                                               {'may_reconnect': True,
+                                                'dev-no-reconnect': None},
+                                               {'plugin': os.path.join(os.getcwd(), 'tests/plugins/hold_invoice.py')}])
+
+    inv = l3.rpc.invoice(10000, 'hold', 'hold invoice')
+    route = l1.single_route(l3.info['id'], 10000)
+    l1.rpc.sendpay(route, inv['payment_hash'], payment_secret=inv['payment_secret'])
+    wait_for(lambda: len(only_one(l3.rpc.listpeerchannels()['channels'])['htlcs']) == 1)
+
+    notifications = []
+
+    def run_graceful():
+        def capture(message, **kwargs):
+            if message:
+                notifications.append(message)
+        with l2.rpc.notify(capture):
+            return l2.rpc.graceful()
+
+    fut = executor.submit(run_graceful)
+
+    # If graceful catches the commitment dance mid-flight, it notifies
+    # about each transient state (e.g. RCVD_ADD_REVOCATION) on the way,
+    # so match expected notifications as an ordered subsequence.
+    seen = [0]
+
+    def wait_notif(expected):
+        wait_for(lambda: expected in notifications[seen[0]:])
+        seen[0] = notifications.index(expected, seen[0]) + 1
+
+    # Once the HTLC is fully committed, we get told.
+    wait_notif(f'Next HTLC SENT_ADD_ACK_REVOCATION expires at block #118 (10 blocks from now) going to peer {l3.info["id"]} (connected)')
+
+    # This will tell us about htlcs and the peers (peers unordered)
+    ret = l2.rpc.graceful(1)
+    assert ret in ({'pending_htlc_expiries': [118, 124],
+                    'pending_peers': [l1.info['id'], l3.info['id']]},
+                   {'pending_htlc_expiries': [118, 124],
+                    'pending_peers': [l3.info['id'], l1.info['id']]})
+
+    # Close incoming connection, so incoming HTLC gets stuck.
+    l1.rpc.disconnect(l2.info['id'], force=True)
+
+    # Release the hold so the *outgoing* HTLC resolves: the incoming HTLC
+    # can't (peer is disconnected), and becomes the next expiry to report.
+    open(os.path.join(l3.daemon.lightning_dir, TEST_NETWORK, "unhold"), "w").close()
+
+    wait_notif(f'Next HTLC SENT_REMOVE_HTLC expires at block #124 (16 blocks from now) coming from peer {l1.info["id"]} (disconnected)')
+
+    ret = l2.rpc.graceful(1)
+    assert ret == {'pending_htlc_expiries': [124]}
+
+    # Reconnect and it will settle.
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+
+    assert fut.result(TIMEOUT) == {}
 
 
 def test_fast_shutdown(node_factory):
@@ -4645,6 +4791,77 @@ def test_setconfig_changed(node_factory, bitcoind):
         l1.rpc.setconfig(config="min-capacity-sat", val=9999)
 
 
+def test_setconfig_dynamic_multi_option(node_factory, bitcoind):
+    """Test setconfig with multi-value dynamic plugin options (issue #8295)."""
+    pluginpath = os.path.join(os.getcwd(), 'tests/plugins/dynamic_multi_option.py')
+    l1 = node_factory.get_node(options={'plugin': pluginpath})
+
+    configfile = os.path.join(l1.daemon.opts.get("lightning-dir"), TEST_NETWORK, 'config')
+    setconfigfile = configfile + ".setconfig"
+
+    with pytest.raises(RpcError, match='is a multi option.*val must be an array'):
+        l1.rpc.setconfig(config='test-multi-dynamic', val='single-value')
+
+    with pytest.raises(RpcError, match='is not a multi option.*val must not be an array'):
+        l1.rpc.setconfig(config='min-capacity-sat', val=['1000', '2000'])
+
+    assert l1.rpc.call('dynamic-multi-report')['test-multi-dynamic'] is None
+
+    # Transient before any permanent values exist
+    ret = l1.rpc.setconfig(config='test-multi-dynamic', val=['transient1'], transient=True)
+    assert 'transient' in ret['config']['sources'][0]
+    assert l1.rpc.call('dynamic-multi-report')['test-multi-dynamic'] == ['transient1']
+    assert not os.path.exists(setconfigfile)
+
+    # This used to crash with SIGABRT (issue #8295)
+    ret = l1.rpc.setconfig(config='test-multi-dynamic', val=['value1', 'value2'])
+    assert ret['config']['config'] == 'test-multi-dynamic'
+    assert ret['config']['values_str'] == ['value1', 'value2']
+    assert ret['config']['dynamic'] is True
+    assert l1.rpc.call('dynamic-multi-report')['test-multi-dynamic'] == ['value1', 'value2']
+
+    with open(setconfigfile, 'r') as f:
+        lines = f.read().splitlines()
+        assert "test-multi-dynamic=value1" in lines
+        assert "test-multi-dynamic=value2" in lines
+
+    # Replaces, doesn't append
+    ret = l1.rpc.setconfig(config='test-multi-dynamic', val=['new1', 'new2'])
+    assert ret['config']['values_str'] == ['new1', 'new2']
+    assert l1.rpc.call('dynamic-multi-report')['test-multi-dynamic'] == ['new1', 'new2']
+
+    # Empty strings and duplicates are preserved
+    ret = l1.rpc.setconfig(config='test-multi-dynamic', val=['a', '', 'a'])
+    assert ret['config']['values_str'] == ['a', '', 'a']
+    assert l1.rpc.call('dynamic-multi-report')['test-multi-dynamic'] == ['a', '', 'a']
+
+    # Transient overrides permanent
+    ret = l1.rpc.setconfig(config='test-multi-dynamic', val=['transient_override'], transient=True)
+    assert ret['config']['values_str'] == ['transient_override']
+    assert 'transient' in ret['config']['sources'][0]
+    assert l1.rpc.call('dynamic-multi-report')['test-multi-dynamic'] == ['transient_override']
+
+    # Permanent clears transient
+    ret = l1.rpc.setconfig(config='test-multi-dynamic', val=['back_to_perm'])
+    assert ret['config']['values_str'] == ['back_to_perm']
+    assert 'transient' not in ret['config']['sources'][0]
+
+    # Empty array clears all values
+    ret = l1.rpc.setconfig(config='test-multi-dynamic', val=[])
+    assert ret['config']['values_str'] == []
+    assert l1.rpc.call('dynamic-multi-report')['test-multi-dynamic'] == []
+
+    # Persistent!
+    l1.rpc.setconfig(config='test-multi-dynamic', val=['persist1', 'persist2'])
+    l1.restart()
+    assert l1.rpc.call('dynamic-multi-report')['test-multi-dynamic'] == ['persist1', 'persist2']
+
+    # Plugin can reject
+    with pytest.raises(RpcError, match="I don't like reject-me"):
+        l1.rpc.setconfig(config='test-multi-dynamic', val=['reject-me'])
+    assert l1.rpc.call('dynamic-multi-report')['test-multi-dynamic'] == ['persist1', 'persist2']
+
+
 @unittest.skipIf(os.getenv('TEST_DB_PROVIDER', 'sqlite3') != 'sqlite3', "deletes database, which is assumed sqlite3")
 @pytest.mark.parametrize("old_hsmsecret", [False, True])
 def test_recover_command(node_factory, bitcoind, old_hsmsecret):
@@ -4784,8 +5001,16 @@ def test_set_feerate_offset(node_factory, bitcoind):
 def test_low_fd_limit(node_factory, bitcoind):
     limits = resource.getrlimit(resource.RLIMIT_NOFILE)
 
-    # We assume this, otherwise l2 cannot increase limits!
-    if limits[0] == limits[1]:
+    # dev-fd-limit-multiplier is a u32, so values > UINT32_MAX fail option
+    # parsing. macOS also reports RLIM_INFINITY as the hard limit, making
+    # "ask for more than the hard limit" meaningless.  Cap to a bounded
+    # ceiling so the test works on any platform.
+    TEST_CEILING = 65536
+    if limits[1] == resource.RLIM_INFINITY or limits[1] > TEST_CEILING:
+        limits = (TEST_CEILING // 2, TEST_CEILING)
+        resource.setrlimit(resource.RLIMIT_NOFILE, limits)
+    elif limits[0] == limits[1]:
+        # We assume this, otherwise l2 cannot increase limits!
         limits = (limits[1] // 2, limits[1])
         resource.setrlimit(resource.RLIMIT_NOFILE, limits)
 
@@ -4874,9 +5099,11 @@ def test_preapprove(node_factory, bitcoind, preapprove):
     l1.daemon.wait_for_log("preapprove_keysend: check_only=0")
 
 
-def test_preapprove_use(node_factory, bitcoind):
+@pytest.mark.parametrize("xkeysend", [False, True])
+def test_preapprove_use(node_factory, bitcoind, xkeysend):
     """Test preapprove calls implicitly made by pay and keysend"""
-    l1, l2 = node_factory.line_graph(2, opts=[{}, {'dev-hsmd-fail-preapprove': None}])
+    l1, l2 = node_factory.line_graph(2, opts=[{}, {'dev-hsmd-fail-preapprove': None,
+                                                   'allow-deprecated-apis': True}])
 
     # Create some balance, make sure it's entirely settled.
     l1.pay(l2, 200000000)
@@ -4885,17 +5112,23 @@ def test_preapprove_use(node_factory, bitcoind):
     # This will fail at the preapprove step.
     inv = l1.rpc.invoice(123000, 'label', 'description', 3700)['bolt11']
     with pytest.raises(RpcError, match='invoice was declined'):
-        l2.rpc.pay(inv)
+        l2.rpc.xpay(inv)
 
     # This will fail the same way
     with pytest.raises(RpcError, match='invoice was declined'):
-        l2.rpc.check('pay', bolt11=inv)
+        l2.rpc.check('xpay', invstring=inv)
 
     # Now keysend.
     with pytest.raises(RpcError, match='keysend was declined'):
-        l2.rpc.keysend(l1.info['id'], 1000)
+        if xkeysend:
+            l2.rpc.xkeysend(l1.info['id'], 1000)
+        else:
+            l2.rpc.keysend(l1.info['id'], 1000)
     with pytest.raises(RpcError, match='keysend was declined'):
-        l2.rpc.check('keysend', destination=l1.info['id'], amount_msat=1000)
+        if xkeysend:
+            l2.rpc.check('xkeysend', destination=l1.info['id'], amount_msat=1000)
+        else:
+            l2.rpc.check('keysend', destination=l1.info['id'], amount_msat=1000)
 
 
 def test_badparam_discretion(node_factory):
@@ -5142,3 +5375,58 @@ def test_filter_with_invalid_json(node_factory):
                          stdout=subprocess.PIPE)
     assert 'filter: Expected object: invalid token' in out.stdout.decode('utf-8')
     assert out.returncode == 1
+
+
+def test_tracing_socket(node_factory):
+    """Test UDS datagram tracing backend via CLN_TRACE_SOCKET."""
+    l1 = node_factory.get_node(start=False)
+    sock_path = os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, "trace.sock")
+
+    # Create a SOCK_DGRAM UDS listener
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    sock.bind(sock_path)
+    sock.settimeout(5)
+
+    l1.daemon.env["CLN_TRACE_SOCKET"] = sock_path
+    l1.start()
+    l1.stop()
+
+    # Collect all datagrams that were sent
+    spans = []
+    while True:
+        try:
+            data = sock.recv(4096)
+            spans.append(json.loads(data.decode("utf-8")))
+        except socket.timeout:
+            break
+
+    sock.close()
+
+    # We should have received at least some spans from startup
+    assert len(spans) > 0, "No spans received via UDS socket"
+
+    for span_array in spans:
+        # Each datagram is a Zipkin JSON array with one span
+        assert isinstance(span_array, list)
+        assert len(span_array) == 1
+        span = span_array[0]
+
+        # Validate required Zipkin fields are present
+        for key in ("id", "name", "timestamp", "duration", "traceId"):
+            assert key in span, f"Missing key {key} in span {span}"
+        assert span["localEndpoint"] == {"serviceName": "lightningd"}
+
+
+def test_long_logs(node_factory):
+    """A plugin that creates a very long log entry. Lightningd should truncate
+    the output and not crash."""
+
+    def setup(plugin):
+        @plugin.method("produce-log")
+        def prod_log(plugin):
+            """Produce a silly and very long log message."""
+            plugin.log("X" * 300000)
+            return {}
+
+    l1 = node_factory.get_node(inline_plugin=setup)
+    l1.rpc.call("produce-log")

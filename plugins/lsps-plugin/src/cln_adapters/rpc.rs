@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bitcoin::secp256k1::PublicKey;
 use cln_rpc::{
+    ClnRpc,
     model::{
         requests::{
             AddpsbtoutputRequest, CloseRequest, ConnectRequest, DatastoreMode, DatastoreRequest,
@@ -29,8 +30,7 @@ use cln_rpc::{
         },
         responses::{ListdatastoreResponse, ListforwardsForwardsStatus},
     },
-    primitives::{Amount, AmountOrAll, ChannelState, Feerate, Sha256},
-    ClnRpc,
+    primitives::{AmountSat, AmountSatOrAll, ChannelState, Feerate, Sha256},
 };
 use core::fmt;
 use log::warn;
@@ -227,14 +227,14 @@ impl ActionExecutor for ClnActionExecutor {
         let start_res = rpc
             .call_typed(&FundchannelStartRequest {
                 id: pk,
-                amount: Amount::from_sat(channel_sat),
+                amount: AmountSat::from_sat(channel_sat),
                 mindepth: Some(0),
                 channel_type: Some(vec![12, 46, 50]), // zero_conf channel
                 announce: Some(false),
                 close_to: None,
                 feerate: None,
                 push_msat: None,
-                reserve: Some(Amount::from_sat(0)),
+                reserve: Some(AmountSat::from_sat(0)),
             })
             .await
             .with_context(|| "calling fundchannel_start")?;
@@ -244,7 +244,7 @@ impl ActionExecutor for ClnActionExecutor {
         let mut rpc = self.rpc.create_rpc().await?;
         let fundpsbt_res = match rpc
             .call_typed(&FundpsbtRequest {
-                satoshi: AmountOrAll::Amount(Amount::from_sat(channel_sat)),
+                satoshi: AmountSatOrAll::AmountSat(AmountSat::from_sat(channel_sat)),
                 feerate: Feerate::Normal,
                 startweight: 1000,
                 excess_as_change: Some(true),
@@ -266,7 +266,7 @@ impl ActionExecutor for ClnActionExecutor {
 
         let addout_res = match rpc
             .call_typed(&AddpsbtoutputRequest {
-                satoshi: Amount::from_sat(channel_sat),
+                satoshi: AmountSat::from_sat(channel_sat),
                 initialpsbt: Some(fundpsbt_res.psbt.clone()),
                 destination: Some(funding_address),
                 locktime: None,

@@ -17,6 +17,18 @@ PLUGIN_TXPREPARE_OBJS := $(PLUGIN_TXPREPARE_SRC:.c=.o)
 PLUGIN_BCLI_SRC := plugins/bcli.c
 PLUGIN_BCLI_OBJS := $(PLUGIN_BCLI_SRC:.c=.o)
 
+PLUGIN_BWATCH_SRC := plugins/bwatch/bwatch.c \
+	plugins/bwatch/bwatch_store.c \
+	plugins/bwatch/bwatch_scanner.c \
+	plugins/bwatch/bwatch_interface.c \
+	plugins/bwatch/bwatch_wiregen.c
+PLUGIN_BWATCH_HEADER := plugins/bwatch/bwatch.h \
+	plugins/bwatch/bwatch_store.h \
+	plugins/bwatch/bwatch_scanner.h \
+	plugins/bwatch/bwatch_interface.h \
+	plugins/bwatch/bwatch_wiregen.h
+PLUGIN_BWATCH_OBJS := $(PLUGIN_BWATCH_SRC:.c=.o)
+
 PLUGIN_COMMANDO_SRC := plugins/commando.c
 PLUGIN_COMMANDO_OBJS := $(PLUGIN_COMMANDO_SRC:.c=.o)
 
@@ -37,7 +49,7 @@ PLUGIN_PAY_LIB_HEADER := \
 
 PLUGIN_PAY_LIB_OBJS := $(PLUGIN_PAY_LIB_SRC:.c=.o)
 
-PLUGIN_OFFERS_SRC := plugins/offers.c plugins/offers_offer.c plugins/offers_invreq_hook.c plugins/offers_inv_hook.c plugins/establish_onion_path.c plugins/fetchinvoice.c
+PLUGIN_OFFERS_SRC := plugins/offers.c plugins/offers_offer.c plugins/offers_invreq_hook.c plugins/offers_inv_hook.c plugins/establish_onion_path.c plugins/fetchinvoice.c plugins/offers_proof.c
 PLUGIN_OFFERS_OBJS := $(PLUGIN_OFFERS_SRC:.c=.o)
 PLUGIN_OFFERS_HEADER := $(PLUGIN_OFFERS_SRC:.c=.h)
 
@@ -82,6 +94,7 @@ PLUGIN_ALL_SRC :=				\
 	$(PLUGIN_AUTOCLEAN_SRC)			\
 	$(PLUGIN_chanbackup_SRC)		\
 	$(PLUGIN_BCLI_SRC)			\
+	$(PLUGIN_BWATCH_SRC)			\
 	$(PLUGIN_COMMANDO_SRC)			\
 	$(PLUGIN_FUNDER_SRC)			\
 	$(PLUGIN_TOPOLOGY_SRC)			\
@@ -102,12 +115,14 @@ PLUGIN_ALL_HEADER :=				\
 	$(PLUGIN_FUNDER_HEADER)			\
 	$(PLUGIN_PAY_LIB_HEADER)		\
 	$(PLUGIN_OFFERS_HEADER)			\
-	$(PLUGIN_SPENDER_HEADER)
+	$(PLUGIN_SPENDER_HEADER)		\
+	$(PLUGIN_BWATCH_HEADER)
 
 C_PLUGINS :=					\
 	plugins/autoclean			\
 	plugins/chanbackup			\
 	plugins/bcli				\
+	plugins/cln-bwatch			\
 	plugins/commando			\
 	plugins/funder				\
 	plugins/topology			\
@@ -185,6 +200,13 @@ plugins/exposesecret: $(PLUGIN_EXPOSESECRET_OBJS) $(PLUGIN_LIB_OBJS) libcommon.a
 
 plugins/bcli: $(PLUGIN_BCLI_OBJS) $(PLUGIN_LIB_OBJS) libcommon.a
 
+plugins/bwatch/bwatch.o: $(PLUGIN_BWATCH_HEADER)
+plugins/bwatch/bwatch_store.o: $(PLUGIN_BWATCH_HEADER)
+plugins/bwatch/bwatch_scanner.o: $(PLUGIN_BWATCH_HEADER)
+plugins/bwatch/bwatch_interface.o: $(PLUGIN_BWATCH_HEADER)
+plugins/bwatch/bwatch_wiregen.o: $(PLUGIN_BWATCH_HEADER)
+plugins/cln-bwatch: $(PLUGIN_BWATCH_OBJS) $(PLUGIN_LIB_OBJS) libcommon.a
+
 plugins/keysend: $(PLUGIN_KEYSEND_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_PAY_LIB_OBJS) libcommon.a
 $(PLUGIN_KEYSEND_OBJS): $(PLUGIN_PAY_LIB_HEADER) libcommon.a
 
@@ -236,9 +258,6 @@ PLUGIN_BASES := $(PLUGINS:plugins/%=%) $(PY_PLUGINS:plugins/%=%)
 plugins/list_of_builtin_plugins_gen.h: plugins/Makefile Makefile config.vars
 	@$(call VERBOSE,GEN $@,echo "static const char *list_of_builtin_plugins[] = { $(PLUGIN_BASES:%=\"%\",) NULL };" > $@)
 
-$(RUST_TARGET_DIR)/examples/cln-subscribe-wildcard: ${CLN_PLUGIN_SRC} plugins/examples/cln-subscribe-wildcard.rs
-	$(CARGO) build ${CARGO_OPTS} --example cln-subscribe-wildcard
-
 CLN_PLUGIN_EXAMPLES := \
 	$(RUST_TARGET_DIR)/examples/cln-plugin-startup \
 	$(RUST_TARGET_DIR)/examples/cln-plugin-reentrant \
@@ -253,19 +272,26 @@ CLN_WSS_PROXY_PLUGIN_SRC = $(shell find plugins/wss-proxy-plugin/src -name "*.rs
 CLN_BIP353_PLUGIN_SRC = $(shell find plugins/bip353-plugin/src -name "*.rs")
 CLN_CURRENCYRATE_PLUGIN_SRC = $(shell find plugins/currencyrate-plugin/src -name "*.rs")
 
-$(RUST_TARGET_DIR)/cln-grpc: ${CLN_PLUGIN_SRC} ${CLN_GRPC_PLUGIN_SRC} $(MSGGEN_GENALL) $(MSGGEN_GEN_ALL)
+$(RUST_TARGET_DIR)/examples/cln-plugin-startup: ${CLN_RPC_SOURCES} ${CLN_PLUGIN_SRC} plugins/examples/cln-plugin-startup.rs
+	$(CARGO) build ${CARGO_OPTS} --example cln-plugin-startup
+$(RUST_TARGET_DIR)/examples/cln-plugin-reentrant: ${CLN_PLUGIN_SRC} plugins/examples/cln-plugin-reentrant.rs
+	$(CARGO) build ${CARGO_OPTS} --example cln-plugin-reentrant
+$(RUST_TARGET_DIR)/examples/cln-subscribe-wildcard: ${CLN_RPC_SOURCES} ${CLN_PLUGIN_SRC} plugins/examples/cln-subscribe-wildcard.rs
+	$(CARGO) build ${CARGO_OPTS} --example cln-subscribe-wildcard
+
+$(RUST_TARGET_DIR)/cln-grpc: ${CLN_PLUGIN_SRC} ${CLN_GRPC_PLUGIN_SRC} ${CLN_RPC_SOURCES} $(MSGGEN_GENALL) $(MSGGEN_GEN_ALL)
 	$(CARGO) build ${CARGO_OPTS} --bin cln-grpc
-$(RUST_TARGET_DIR)/clnrest: ${CLN_REST_PLUGIN_SRC}
+$(RUST_TARGET_DIR)/clnrest: ${CLN_REST_PLUGIN_SRC} ${CLN_RPC_SOURCES} ${CLN_PLUGIN_SRC}
 	$(CARGO) build ${CARGO_OPTS} --bin clnrest
-$(RUST_TARGET_DIR)/cln-lsps-client: ${CLN_LSPS_PLUGIN_SRC}
+$(RUST_TARGET_DIR)/cln-lsps-client: ${CLN_LSPS_PLUGIN_SRC} ${CLN_RPC_SOURCES} ${CLN_PLUGIN_SRC}
 	$(CARGO) build ${CARGO_OPTS} --bin cln-lsps-client
-$(RUST_TARGET_DIR)/cln-lsps-service: ${CLN_LSPS_PLUGIN_SRC}
+$(RUST_TARGET_DIR)/cln-lsps-service: ${CLN_LSPS_PLUGIN_SRC} ${CLN_RPC_SOURCES} ${CLN_PLUGIN_SRC}
 	$(CARGO) build ${CARGO_OPTS} --bin cln-lsps-service
-$(RUST_TARGET_DIR)/wss-proxy: ${CLN_WSS_PROXY_PLUGIN_SRC}
+$(RUST_TARGET_DIR)/wss-proxy: ${CLN_WSS_PROXY_PLUGIN_SRC} ${CLN_RPC_SOURCES} ${CLN_PLUGIN_SRC}
 	$(CARGO) build ${CARGO_OPTS} --bin wss-proxy
-$(RUST_TARGET_DIR)/cln-bip353: ${CLN_BIP353_PLUGIN_SRC}
+$(RUST_TARGET_DIR)/cln-bip353: ${CLN_BIP353_PLUGIN_SRC} ${CLN_PLUGIN_SRC}
 	$(CARGO) build ${CARGO_OPTS} --bin cln-bip353
-$(RUST_TARGET_DIR)/cln-currencyrate: ${CLN_CURRENCYRATE_PLUGIN_SRC}
+$(RUST_TARGET_DIR)/cln-currencyrate: ${CLN_CURRENCYRATE_PLUGIN_SRC} ${CLN_RPC_SOURCES} ${CLN_PLUGIN_SRC}
 	$(CARGO) build ${CARGO_OPTS} --bin cln-currencyrate
 
 ifneq ($(RUST),0)

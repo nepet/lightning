@@ -166,8 +166,13 @@ static void rebroadcast_txs(struct chain_topology *topo)
 	for (otx = outgoing_tx_map_first(topo->outgoing_txs, &it); otx;
 	     otx = outgoing_tx_map_next(topo->outgoing_txs, &it)) {
 		struct tx_rebroadcast *txrb;
-		/* Already sent? */
-		if (wallet_transaction_height(topo->ld->wallet, &otx->txid))
+		struct bitcoin_txid cur_txid;
+
+		/* Already confirmed?  Use the txid of the current tx, not the
+		 * original otx->txid: refresh() may have replaced otx->tx with
+		 * a higher-fee version whose txid differs from the map key. */
+		bitcoin_txid(otx->tx, &cur_txid);
+		if (wallet_transaction_height(topo->ld->wallet, &cur_txid))
 			continue;
 
 		/* Don't send ones which aren't ready yet.  Note that if the
@@ -380,6 +385,11 @@ static void watch_for_unconfirmed_txs(struct lightningd *ld,
 
 /* Mutual recursion via timer. */
 static void next_updatefee_timer(struct chain_topology *topo);
+
+bool unknown_feerates(const struct chain_topology *topo)
+{
+	return tal_count(topo->feerates[0]) == 0;
+}
 
 static u32 interp_feerate(const struct feerate_est *rates, u32 blockcount)
 {
@@ -612,6 +622,17 @@ u32 opening_feerate(struct chain_topology *topo)
 				    conversions[FEERATE_OPENING].blockcount);
 }
 
+u32 splice_feerate(struct chain_topology *topo, struct lightningd *ld)
+{
+	u32 rate = opening_feerate(topo);
+	if (!rate)
+		return 0;
+	rate += ld->config.feerate_offset;
+	if (rate > feerate_max(ld, NULL))
+		rate = feerate_max(ld, NULL);
+	return rate;
+}
+
 u32 mutual_close_feerate(struct chain_topology *topo)
 {
 	if (topo->ld->force_feerates)
@@ -712,14 +733,9 @@ static struct command_result *json_feerates(struct command *cmd,
 	if (rate)
 		json_add_num(response, "penalty",
 			     feerate_to_style(rate, *style));
-	rate = unilateral_feerate(topo, true);
-	if (rate) {
-		rate += cmd->ld->config.feerate_offset;
-		if (rate > feerate_max(cmd->ld, NULL))
-			rate = feerate_max(cmd->ld, NULL);
-		json_add_num(response, "splice",
-			     feerate_to_style(rate, *style));
-	}
+	rate = splice_feerate(topo, cmd->ld);
+	if (rate)
+		json_add_num(response, "splice", feerate_to_style(rate, *style));
 
 	json_add_u64(response, "min_acceptable",
 		     feerate_to_style(feerate_min(cmd->ld, NULL), *style));

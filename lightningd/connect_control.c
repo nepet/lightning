@@ -719,6 +719,7 @@ int connectd_init(struct lightningd *ld)
 				   ld->tor_service_password ? ld->tor_service_password : "",
 				   ld->config.connection_timeout_secs,
 				   websocket_helper_path,
+				   ld->message_padding,
 				   ld->dev_fast_gossip,
 				   ld->dev_disconnect_fd >= 0,
 				   ld->dev_no_ping_timer,
@@ -727,8 +728,7 @@ int connectd_init(struct lightningd *ld)
 				   !ld->reconnect,
 				   ld->dev_fast_reconnect,
 				   ld->dev_limit_connections_inflight,
-				   ld->dev_keep_nagle,
-				   ld->dev_uniform_padding);
+				   ld->dev_keep_nagle);
 
 	subd_req(ld->connectd, ld->connectd, take(msg), -1, 0,
 		 connect_init_done, NULL);

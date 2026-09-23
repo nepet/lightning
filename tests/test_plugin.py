@@ -20,6 +20,7 @@ from tests.test_wallet import HsmTool, write_all, WAIT_TIMEOUT
 import ast
 import copy
 import json
+import logging
 import os
 import pytest
 import random
@@ -31,6 +32,25 @@ import subprocess
 import sys
 import time
 import unittest
+
+# bwatch is opt-in (--experimental-bwatch); also speed up polling for tests.
+# rescan=0 because a startup rescan re-arms every perennial wallet watch and
+# triggers a rescan loop that drops in-memory reservation state.
+BWATCH_OPTS = {'experimental-bwatch': None, 'bwatch-poll-interval': 500,
+               'rescan': 0}
+
+
+def wait_bwatch_caught_up(node, timeout=TIMEOUT):
+    """Wait until bwatch has caught up to the chain tip and is idle.
+
+    After restart, height replayed from the datastore skips the "First poll"
+    debug line; both paths eventually emit "No block change" once idle.
+    """
+    node.daemon.wait_for_log(
+        r'First poll: init at block|No block change, current_height remains',
+        timeout=timeout,
+    )
+    node.daemon.wait_for_log(r'No block change', timeout=timeout)
 
 
 def test_option_passthrough(node_factory, directory):
@@ -59,8 +79,8 @@ def test_option_passthrough(node_factory, directory):
 
     # Now try to see if it gets accepted, would fail to start if the
     # option didn't exist
-    n = node_factory.get_node(options={'plugin': plugin_path, 'greeting': 'Ciao'})
-    n.stop()
+    l1 = node_factory.get_node(options={'plugin': plugin_path, 'greeting': 'Ciao'})
+    l1.stop()
 
     with pytest.raises(subprocess.CalledProcessError):
         err_out = subprocess.run([
@@ -80,34 +100,34 @@ def test_option_types(node_factory):
        respected in output """
 
     plugin_path = os.path.join(os.getcwd(), 'tests/plugins/options.py')
-    n = node_factory.get_node(options={
+    l1 = node_factory.get_node(options={
         'plugin': plugin_path,
         'str_opt': 'ok',
         'int_opt': 22,
         'bool_opt': True,
     })
 
-    assert n.daemon.is_in_log(r"option str_opt ok <class 'str'>")
-    assert n.daemon.is_in_log(r"option int_opt 22 <class 'int'>")
-    assert n.daemon.is_in_log(r"option bool_opt True <class 'bool'>")
+    assert l1.daemon.is_in_log(r"option str_opt ok <class 'str'>")
+    assert l1.daemon.is_in_log(r"option int_opt 22 <class 'int'>")
+    assert l1.daemon.is_in_log(r"option bool_opt True <class 'bool'>")
     # flag options aren't passed through if not flagged on
-    assert not n.daemon.is_in_log(r"option flag_opt")
-    n.stop()
+    assert not l1.daemon.is_in_log(r"option flag_opt")
+    l1.stop()
 
     # A blank bool_opt should default to false
-    n = node_factory.get_node(options={
+    l1 = node_factory.get_node(options={
         'plugin': plugin_path, 'str_opt': 'ok',
         'int_opt': 22,
         'bool_opt': 'true',
         'flag_opt': None,
     })
 
-    assert n.daemon.is_in_log(r"option bool_opt True <class 'bool'>")
-    assert n.daemon.is_in_log(r"option flag_opt True <class 'bool'>")
-    n.stop()
+    assert l1.daemon.is_in_log(r"option bool_opt True <class 'bool'>")
+    assert l1.daemon.is_in_log(r"option flag_opt True <class 'bool'>")
+    l1.stop()
 
     # What happens if we give it a bad bool-option?
-    n = node_factory.get_node(options={
+    l1 = node_factory.get_node(options={
         'plugin': plugin_path,
         'str_opt': 'ok',
         'int_opt': 22,
@@ -115,12 +135,12 @@ def test_option_types(node_factory):
     }, may_fail=True, start=False)
 
     # the node should fail after start, and we get a stderr msg
-    n.daemon.start(wait_for_initialized=False, stderr_redir=True)
-    assert n.daemon.wait() == 1
-    wait_for(lambda: n.daemon.is_in_stderr("--bool_opt=!: Invalid argument '!'"))
+    l1.daemon.start(wait_for_initialized=False, stderr_redir=True)
+    assert l1.daemon.wait() == 1
+    wait_for(lambda: l1.daemon.is_in_stderr("--bool_opt=!: Invalid argument '!'"))
 
     # What happens if we give it a bad int-option?
-    n = node_factory.get_node(options={
+    l1 = node_factory.get_node(options={
         'plugin': plugin_path,
         'str_opt': 'ok',
         'int_opt': 'notok',
@@ -128,24 +148,24 @@ def test_option_types(node_factory):
     }, may_fail=True, start=False)
 
     # the node should fail after start, and we get a stderr msg
-    n.daemon.start(wait_for_initialized=False, stderr_redir=True)
-    assert n.daemon.wait() == 1
-    assert n.daemon.is_in_stderr("--int_opt=notok: 'notok' is not a number")
+    l1.daemon.start(wait_for_initialized=False, stderr_redir=True)
+    assert l1.daemon.wait() == 1
+    assert l1.daemon.is_in_stderr("--int_opt=notok: 'notok' is not a number")
 
     # We no longer allow '1' or '0' as boolean options
-    n = node_factory.get_node(options={
+    l1 = node_factory.get_node(options={
         'plugin': plugin_path,
         'str_opt': 'ok',
         'bool_opt': '1',
     }, may_fail=True, start=False)
 
     # the node should fail after start, and we get a stderr msg
-    n.daemon.start(wait_for_initialized=False, stderr_redir=True)
-    assert n.daemon.wait() == 1
-    assert n.daemon.is_in_stderr("--bool_opt=1: Invalid argument '1'")
+    l1.daemon.start(wait_for_initialized=False, stderr_redir=True)
+    assert l1.daemon.wait() == 1
+    assert l1.daemon.is_in_stderr("--bool_opt=1: Invalid argument '1'")
 
     # Flag opts shouldn't allow any input
-    n = node_factory.get_node(options={
+    l1 = node_factory.get_node(options={
         'plugin': plugin_path,
         'str_opt': 'ok',
         'int_opt': 11,
@@ -154,33 +174,33 @@ def test_option_types(node_factory):
     }, may_fail=True, start=False)
 
     # the node should fail after start, and we get a stderr msg
-    n.daemon.start(wait_for_initialized=False, stderr_redir=True)
-    assert n.daemon.wait() == 1
-    assert n.daemon.is_in_stderr("--flag_opt=True: doesn't allow an argument")
+    l1.daemon.start(wait_for_initialized=False, stderr_redir=True)
+    assert l1.daemon.wait() == 1
+    assert l1.daemon.is_in_stderr("--flag_opt=True: doesn't allow an argument")
 
-    n = node_factory.get_node(options={
+    l1 = node_factory.get_node(options={
         'plugin': plugin_path,
         'str_optm': ['ok', 'ok2'],
         'int_optm': [11, 12, 13],
     })
 
-    assert n.daemon.is_in_log(r"option str_optm \['ok', 'ok2'\] <class 'list'>")
-    assert n.daemon.is_in_log(r"option int_optm \[11, 12, 13\] <class 'list'>")
-    n.stop()
+    assert l1.daemon.is_in_log(r"option str_optm \['ok', 'ok2'\] <class 'list'>")
+    assert l1.daemon.is_in_log(r"option int_optm \[11, 12, 13\] <class 'list'>")
+    l1.stop()
 
 
 def test_millisatoshi_passthrough(node_factory):
     """ Ensure that Millisatoshi arguments and return work.
     """
     plugin_path = os.path.join(os.getcwd(), 'tests/plugins/millisatoshis.py')
-    n = node_factory.get_node(options={'plugin': plugin_path, 'log-level': 'io'})
+    l1 = node_factory.get_node(options={'plugin': plugin_path, 'log-level': 'io'})
 
     # By keyword (plugin literally returns Millisatoshi, which becomes a string)
-    ret = n.rpc.call('echo', {'msat': Millisatoshi(17), 'not_an_msat': '22msat'})['echo_msat']
+    ret = l1.rpc.call('echo', {'msat': Millisatoshi(17), 'not_an_msat': '22msat'})['echo_msat']
     assert Millisatoshi(ret) == Millisatoshi(17)
 
     # By position
-    ret = n.rpc.call('echo', [Millisatoshi(18), '22msat'])['echo_msat']
+    ret = l1.rpc.call('echo', [Millisatoshi(18), '22msat'])['echo_msat']
     assert Millisatoshi(ret) == Millisatoshi(18)
 
 
@@ -192,29 +212,29 @@ def test_rpc_passthrough(node_factory):
 
     """
     plugin_path = os.path.join(os.getcwd(), 'contrib/plugins/helloworld.py')
-    n = node_factory.get_node(options={'plugin': plugin_path, 'greeting': 'Ciao'})
+    l1 = node_factory.get_node(options={'plugin': plugin_path, 'greeting': 'Ciao'})
 
     # Make sure that the 'hello' command that the helloworld.py plugin
     # has registered is available.
-    cmd = [hlp for hlp in n.rpc.help()['help'] if 'hello' in hlp['command']]
+    cmd = [hlp for hlp in l1.rpc.help()['help'] if 'hello' in hlp['command']]
     assert(len(cmd) == 1)
 
     # Make sure usage message is present.
-    assert only_one(n.rpc.help('hello')['help'])['command'].startswith('hello [name]')
+    assert only_one(l1.rpc.help('hello')['help'])['command'].startswith('hello [name]')
     # While we're at it, let's check that helloworld.py is logging
     # correctly via the notifications plugin->lightningd
-    assert n.daemon.is_in_log('Plugin helloworld.py initialized')
+    assert l1.daemon.is_in_log('Plugin helloworld.py initialized')
 
     # Now try to call it and see what it returns:
-    greet = n.rpc.hello(name='World')
+    greet = l1.rpc.hello(name='World')
     assert(greet == "Ciao World")
     with pytest.raises(RpcError):
-        n.rpc.fail()
+        l1.rpc.fail()
 
     # Try to call a method without enough arguments
     with pytest.raises(RpcError, match="processing bye: missing a required"
                                        " argument"):
-        n.rpc.bye()
+        l1.rpc.bye()
 
 
 def test_plugin_dir(node_factory):
@@ -226,91 +246,91 @@ def test_plugin_dir(node_factory):
 def test_plugin_slowinit(node_factory):
     """Tests that the 'plugin' RPC command times out if plugin doesnt respond"""
     os.environ['SLOWINIT_TIME'] = '121'
-    n = node_factory.get_node()
+    l1 = node_factory.get_node()
 
     with pytest.raises(RpcError, match=': timed out before replying to init'):
-        n.rpc.plugin_start(os.path.join(os.getcwd(), "tests/plugins/slow_init.py"))
+        l1.rpc.plugin_start(os.path.join(os.getcwd(), "tests/plugins/slow_init.py"))
 
     # It's not actually configured yet, see what happens;
     # make sure 'rescan' and 'list' controls dont crash
-    n.rpc.plugin_rescan()
-    n.rpc.plugin_list()
+    l1.rpc.plugin_rescan()
+    l1.rpc.plugin_list()
 
 
 def test_plugin_command(node_factory):
     """Tests the 'plugin' RPC command"""
-    n = node_factory.get_node()
+    l1 = node_factory.get_node()
 
     # Make sure that the 'hello' command from the helloworld.py plugin
     # is not available.
-    cmd = [hlp for hlp in n.rpc.help()["help"] if "hello" in hlp["command"]]
+    cmd = [hlp for hlp in l1.rpc.help()["help"] if "hello" in hlp["command"]]
     assert(len(cmd) == 0)
 
     # Add the 'contrib/plugins' test dir
-    n.rpc.plugin_startdir(directory=os.path.join(os.getcwd(), "contrib/plugins"))
+    l1.rpc.plugin_startdir(directory=os.path.join(os.getcwd(), "contrib/plugins"))
     # Make sure that the 'hello' command from the helloworld.py plugin
     # is now available.
-    cmd = [hlp for hlp in n.rpc.help()["help"] if "hello" in hlp["command"]]
+    cmd = [hlp for hlp in l1.rpc.help()["help"] if "hello" in hlp["command"]]
     assert(len(cmd) == 1)
 
     # Make sure 'rescan' and 'list' subcommands dont crash
-    n.rpc.plugin_rescan()
-    n.rpc.plugin_list()
+    l1.rpc.plugin_rescan()
+    l1.rpc.plugin_list()
 
     # Make sure the plugin behaves normally after stop and restart
     assert("Successfully stopped helloworld.py."
-           == n.rpc.plugin_stop(plugin="helloworld.py")["result"])
-    n.daemon.wait_for_log(r"Killing plugin: stopped by lightningd via RPC")
-    n.rpc.plugin_start(plugin=os.path.join(os.getcwd(), "contrib/plugins/helloworld.py"))
-    n.daemon.wait_for_log(r"Plugin helloworld.py initialized")
-    assert("Hello world" == n.rpc.call(method="hello"))
+           == l1.rpc.plugin_stop(plugin="helloworld.py")["result"])
+    l1.daemon.wait_for_log(r"Killing plugin: stopped by lightningd via RPC")
+    l1.rpc.plugin_start(plugin=os.path.join(os.getcwd(), "contrib/plugins/helloworld.py"))
+    l1.daemon.wait_for_log(r"Plugin helloworld.py initialized")
+    assert("Hello world" == l1.rpc.call(method="hello"))
 
     # Now stop the helloworld plugin
     assert("Successfully stopped helloworld.py."
-           == n.rpc.plugin_stop(plugin="helloworld.py")["result"])
-    n.daemon.wait_for_log(r"Killing plugin: stopped by lightningd via RPC")
+           == l1.rpc.plugin_stop(plugin="helloworld.py")["result"])
+    l1.daemon.wait_for_log(r"Killing plugin: stopped by lightningd via RPC")
     # Make sure that the 'hello' command from the helloworld.py plugin
     # is not available anymore.
-    cmd = [hlp for hlp in n.rpc.help()["help"] if "hello" in hlp["command"]]
+    cmd = [hlp for hlp in l1.rpc.help()["help"] if "hello" in hlp["command"]]
     assert(len(cmd) == 0)
 
     # Test that we cannot start a plugin with 'dynamic' set to False in
     # getmanifest
     with pytest.raises(RpcError, match=r"Not a dynamic plugin"):
-        n.rpc.plugin_start(plugin=os.path.join(os.getcwd(), "tests/plugins/static.py"))
+        l1.rpc.plugin_start(plugin=os.path.join(os.getcwd(), "tests/plugins/static.py"))
 
     # Test that we cannot stop a started plugin with 'dynamic' flag set to
     # False
-    n2 = node_factory.get_node(options={
+    l2 = node_factory.get_node(options={
         "plugin": os.path.join(os.getcwd(), "tests/plugins/static.py")
     })
     with pytest.raises(RpcError, match=r"static.py cannot be managed when lightningd is up"):
-        n2.rpc.plugin_stop(plugin="static.py")
+        l2.rpc.plugin_stop(plugin="static.py")
 
     # Test that we don't crash when starting a broken plugin
     with pytest.raises(RpcError, match=r": exited before replying to getmanifest"):
-        n2.rpc.plugin_start(plugin=os.path.join(os.getcwd(), "tests/plugins/broken.py"))
+        l2.rpc.plugin_start(plugin=os.path.join(os.getcwd(), "tests/plugins/broken.py"))
 
     with pytest.raises(RpcError, match=r': timed out before replying to getmanifest'):
-        n2.rpc.plugin_start(os.path.join(os.getcwd(), 'contrib/plugins/fail/failtimeout.py'))
+        l2.rpc.plugin_start(os.path.join(os.getcwd(), 'contrib/plugins/fail/failtimeout.py'))
 
     # Test that we can add a directory with more than one new plugin in it.
     try:
-        n.rpc.plugin_startdir(os.path.join(os.getcwd(), "contrib/plugins"))
+        l1.rpc.plugin_startdir(os.path.join(os.getcwd(), "contrib/plugins"))
     except RpcError:
         pass
 
     # Usually, it crashes after the above return.
-    n.rpc.stop()
+    l1.rpc.stop()
 
 
 def test_plugin_fail_on_startup(node_factory):
     for crash in ('during_init', 'before_start', 'during_getmanifest'):
         os.environ['BROKEN_CRASH'] = crash
-        n = node_factory.get_node(options={'plugin': os.path.join(os.getcwd(), "tests/plugins/broken.py")})
+        l1 = node_factory.get_node(options={'plugin': os.path.join(os.getcwd(), "tests/plugins/broken.py")})
         # This can happen before 'Server started with public key' msg
-        n.daemon.logsearch_start = 0
-        n.daemon.wait_for_log('plugin-broken.py: Traceback')
+        l1.daemon.logsearch_start = 0
+        l1.daemon.wait_for_log('plugin-broken.py: Traceback')
 
     # Make sure they don't die *after* the message!
     time.sleep(30)
@@ -320,64 +340,64 @@ def test_plugin_disable(node_factory):
     """--disable-plugin works"""
     plugin_dir = os.path.join(os.getcwd(), 'contrib/plugins')
     # We used to need plugin-dir before disable-plugin!
-    n = node_factory.get_node(options=OrderedDict([('plugin-dir', plugin_dir),
-                                                   ('disable-plugin',
-                                                    '{}/helloworld.py'
-                                                    .format(plugin_dir))]))
+    l1 = node_factory.get_node(options=OrderedDict([('plugin-dir', plugin_dir),
+                                                    ('disable-plugin',
+                                                     '{}/helloworld.py'
+                                                     .format(plugin_dir))]))
     with pytest.raises(RpcError):
-        n.rpc.hello(name='Sun')
-    assert n.daemon.is_in_log('helloworld.py: disabled via disable-plugin')
-    n.stop()
+        l1.rpc.hello(name='Sun')
+    assert l1.daemon.is_in_log('helloworld.py: disabled via disable-plugin')
+    l1.stop()
 
     # Also works by basename.
-    n = node_factory.get_node(options=OrderedDict([('plugin-dir', plugin_dir),
-                                                   ('disable-plugin',
-                                                    'helloworld.py')]))
+    l1 = node_factory.get_node(options=OrderedDict([('plugin-dir', plugin_dir),
+                                                    ('disable-plugin',
+                                                     'helloworld.py')]))
     with pytest.raises(RpcError):
-        n.rpc.hello(name='Sun')
-    assert n.daemon.is_in_log('helloworld.py: disabled via disable-plugin')
-    n.stop()
+        l1.rpc.hello(name='Sun')
+    assert l1.daemon.is_in_log('helloworld.py: disabled via disable-plugin')
+    l1.stop()
 
     # Other order also works!
-    n = node_factory.get_node(options=OrderedDict([('disable-plugin',
-                                                    'helloworld.py'),
-                                                   ('plugin-dir', plugin_dir)]))
+    l1 = node_factory.get_node(options=OrderedDict([('disable-plugin',
+                                                     'helloworld.py'),
+                                                    ('plugin-dir', plugin_dir)]))
     with pytest.raises(RpcError):
-        n.rpc.hello(name='Sun')
-    assert n.daemon.is_in_log('helloworld.py: disabled via disable-plugin')
-    n.stop()
+        l1.rpc.hello(name='Sun')
+    assert l1.daemon.is_in_log('helloworld.py: disabled via disable-plugin')
+    l1.stop()
 
     # Both orders of explicit specification work.
-    n = node_factory.get_node(options=OrderedDict([('disable-plugin',
-                                                    'helloworld.py'),
-                                                   ('plugin',
-                                                    '{}/helloworld.py'
-                                                    .format(plugin_dir))]))
+    l1 = node_factory.get_node(options=OrderedDict([('disable-plugin',
+                                                     'helloworld.py'),
+                                                    ('plugin',
+                                                     '{}/helloworld.py'
+                                                     .format(plugin_dir))]))
     with pytest.raises(RpcError):
-        n.rpc.hello(name='Sun')
-    assert n.daemon.is_in_log('helloworld.py: disabled via disable-plugin')
-    n.stop()
+        l1.rpc.hello(name='Sun')
+    assert l1.daemon.is_in_log('helloworld.py: disabled via disable-plugin')
+    l1.stop()
 
     # Both orders of explicit specification work.
-    n = node_factory.get_node(options=OrderedDict([('plugin',
-                                                    '{}/helloworld.py'
-                                                    .format(plugin_dir)),
-                                                   ('disable-plugin',
-                                                    'helloworld.py')]))
+    l1 = node_factory.get_node(options=OrderedDict([('plugin',
+                                                     '{}/helloworld.py'
+                                                     .format(plugin_dir)),
+                                                    ('disable-plugin',
+                                                     'helloworld.py')]))
     with pytest.raises(RpcError):
-        n.rpc.hello(name='Sun')
-    assert n.daemon.is_in_log('helloworld.py: disabled via disable-plugin')
+        l1.rpc.hello(name='Sun')
+    assert l1.daemon.is_in_log('helloworld.py: disabled via disable-plugin')
 
     # Still disabled if we load directory.
-    n.rpc.plugin_startdir(directory=os.path.join(os.getcwd(), "contrib/plugins"))
-    n.daemon.wait_for_log('helloworld.py: disabled via disable-plugin')
-    n.stop()
+    l1.rpc.plugin_startdir(directory=os.path.join(os.getcwd(), "contrib/plugins"))
+    l1.daemon.wait_for_log('helloworld.py: disabled via disable-plugin')
+    l1.stop()
 
     # Check that list works
-    n = node_factory.get_node(options={'disable-plugin':
-                                       ['something-else.py', 'helloworld.py']})
+    l1 = node_factory.get_node(options={'disable-plugin':
+                                        ['something-else.py', 'helloworld.py']})
 
-    assert n.rpc.listconfigs()['configs']['disable-plugin'] == {'values_str': ['something-else.py', 'helloworld.py'], 'sources': ['cmdline', 'cmdline']}
+    assert l1.rpc.listconfigs()['configs']['disable-plugin'] == {'values_str': ['something-else.py', 'helloworld.py'], 'sources': ['cmdline', 'cmdline']}
 
 
 def test_plugin_hook(node_factory, executor):
@@ -441,7 +461,7 @@ def test_pay_plugin(node_factory):
         l1.rpc.call('pay')
 
     # Make sure usage messages are present.
-    msg = 'pay bolt11 [amount_msat] [label] [riskfactor] [maxfeepercent] '\
+    msg = 'pay invstring [amount_msat] [label] [riskfactor] [maxfeepercent] '\
           '[retry_for] [maxdelay] [exemptfee] [localinvreqid] [exclude] '\
           '[maxfee] [description] [partial_msat]'
     # We run with --developer:
@@ -450,13 +470,13 @@ def test_pay_plugin(node_factory):
 
 
 def test_keysend_plugin(node_factory):
-    l1, l2 = node_factory.line_graph(2)
+    l1, l2 = node_factory.line_graph(2, opts={'allow-deprecated-apis': True})
 
     with pytest.raises(RpcError, match=r'missing required parameter'):
         l1.rpc.call('keysend')
 
     # Make sure usage messages are present.
-    msg = 'keysend destination amount_msat [label] [maxfeepercent] [retry_for] '\
+    msg = 'keysend (DEPRECATED!) destination amount_msat [label] [maxfeepercent] [retry_for] '\
           '[maxdelay] [exemptfee] [extratlvs] [routehints] [maxfee]'
     # We run with --developer:
     msg += ' [dev_use_shadow]'
@@ -595,7 +615,8 @@ def test_async_rpcmethod(node_factory, executor):
 def test_db_hook(node_factory, executor):
     """This tests the db hook."""
     dbfile = os.path.join(node_factory.directory, "dblog.sqlite3")
-    l1 = node_factory.get_node(options={'plugin': os.path.join(os.getcwd(), 'tests/plugins/dblog.py'),
+    l1 = node_factory.get_node(options={**BWATCH_OPTS,
+                                        'plugin': os.path.join(os.getcwd(), 'tests/plugins/dblog.py'),
                                         'dblog-file': dbfile})
 
     # It should see the db being created, and sometime later actually get
@@ -606,6 +627,10 @@ def test_db_hook(node_factory, executor):
     l1.daemon.wait_for_log('plugin-dblog.py: replaying pre-init data:')
     l1.daemon.wait_for_log('plugin-dblog.py: CREATE TABLE version \\(version INTEGER\\)')
     l1.daemon.wait_for_log("plugin-dblog.py: initialized.* 'startup': True")
+
+    # bwatch's first block-history write is async; if we stop before it runs,
+    # the main DB can diverge from dblog's mirror (hook may not run in time).
+    wait_bwatch_caught_up(l1)
 
     l1.stop()
 
@@ -620,7 +645,8 @@ def test_db_hook(node_factory, executor):
 def test_db_hook_multiple(node_factory, executor):
     """This tests the db hook for multiple-plugin case."""
     dbfile = os.path.join(node_factory.directory, "dblog.sqlite3")
-    l1 = node_factory.get_node(options={'plugin': os.path.join(os.getcwd(), 'tests/plugins/dblog.py'),
+    l1 = node_factory.get_node(options={**BWATCH_OPTS,
+                                        'plugin': os.path.join(os.getcwd(), 'tests/plugins/dblog.py'),
                                         'important-plugin': os.path.join(os.getcwd(), 'tests/plugins/dbdummy.py'),
                                         'dblog-file': dbfile})
 
@@ -633,6 +659,8 @@ def test_db_hook_multiple(node_factory, executor):
     l1.daemon.wait_for_log('plugin-dblog.py: CREATE TABLE version \\(version INTEGER\\)')
     l1.daemon.wait_for_log("plugin-dblog.py: initialized.* 'startup': True")
 
+    wait_bwatch_caught_up(l1)
+
     l1.stop()
 
     # Databases should be identical.
@@ -643,8 +671,13 @@ def test_db_hook_multiple(node_factory, executor):
 
 
 def test_utf8_passthrough(node_factory, executor):
-    l1 = node_factory.get_node(options={'plugin': os.path.join(os.getcwd(), 'tests/plugins/utf8.py'),
-                                        'log-level': 'io'})
+    def setup(plugin):
+        @plugin.method("utf8")
+        def echo(plugin, utf8):
+            assert '\\u' not in utf8
+            return {'utf8': utf8}
+
+    l1 = node_factory.get_node(inline_plugin=setup, options={'log-level': 'io'})
 
     # This works because Python unmangles.
     res = l1.rpc.call('utf8', ['ナンセンス 1杯'])
@@ -664,12 +697,26 @@ def test_utf8_passthrough(node_factory, executor):
 def test_invoice_payment_hook(node_factory):
     """ l1 uses the reject-payment plugin to reject invoices with odd preimages.
     """
-    opts = [{}, {'plugin': os.path.join(os.getcwd(), 'tests/plugins/reject_some_invoices.py')}]
-    l1, l2 = node_factory.line_graph(2, opts=opts)
+    def setup(plugin):
+        @plugin.hook('invoice_payment')
+        def on_payment(payment, plugin, **kwargs):
+            plugin.log("label={}".format(payment['label']))
+            plugin.log("msat={}".format(payment['msat']))
+            plugin.log("preimage={}".format(payment['preimage']))
+
+            if payment['preimage'].endswith('0'):
+                # WIRE_TEMPORARY_NODE_FAILURE = 0x2002
+                return {'failure_message': "2002"}
+
+            return {'result': 'continue'}
+
+    l1 = node_factory.get_node()
+    l2 = node_factory.get_node(inline_plugin=setup)
+    node_factory.join_nodes([l1, l2])
 
     # This one works
     inv1 = l2.rpc.invoice(1230, 'label', 'description', preimage='1' * 64)
-    l1.rpc.pay(inv1['bolt11'])
+    l1.rpc.xpay(inv1['bolt11'])
 
     l2.daemon.wait_for_log('label=label')
     l2.daemon.wait_for_log('msat=')
@@ -677,11 +724,8 @@ def test_invoice_payment_hook(node_factory):
 
     # This one will be rejected.
     inv2 = l2.rpc.invoice(1230, 'label2', 'description', preimage='0' * 64)
-    with pytest.raises(RpcError):
-        l1.rpc.pay(inv2['bolt11'])
-
-    pstatus = l1.rpc.call('paystatus', [inv2['bolt11']])['pay'][0]
-    assert pstatus['attempts'][-1]['failure']['data']['failcodename'] == 'WIRE_TEMPORARY_NODE_FAILURE'
+    with pytest.raises(RpcError, match=r'Unexpected error \(temporary_node_failure\) from final node'):
+        l1.rpc.xpay(inv2['bolt11'])
 
     l2.daemon.wait_for_log('label=label2')
     l2.daemon.wait_for_log('msat=')
@@ -697,7 +741,7 @@ def test_invoice_payment_hook_hold(node_factory, executor):
     inv1 = l2.rpc.invoice(1230, 'label', 'description', preimage='1' * 64)
 
     # This should block.
-    f = executor.submit(l1.rpc.pay, inv1['bolt11'])
+    f = executor.submit(l1.rpc.xpay, inv1['bolt11'])
     time.sleep(5)
     assert not f.done()
 
@@ -710,8 +754,31 @@ def test_invoice_payment_hook_hold(node_factory, executor):
 def test_openchannel_hook(node_factory, bitcoind):
     """ l2 uses the reject_odd_funding_amounts plugin to reject some openings.
     """
-    opts = [{}, {'plugin': os.path.join(os.getcwd(), 'tests/plugins/reject_odd_funding_amounts.py')}]
-    l1, l2 = node_factory.line_graph(2, fundchannel=False, opts=opts)
+    def setup(plugin):
+        from pyln.client import Millisatoshi
+
+        def run_check(funding_amt_str):
+            if Millisatoshi(funding_amt_str).to_satoshi() % 2 == 1:
+                return {'result': 'reject', 'error_message': "I don't like odd amounts"}
+            return {'result': 'continue'}
+
+        @plugin.hook('openchannel')
+        def on_openchannel(openchannel, plugin, **kwargs):
+            plugin.log("{} VARS".format(len(openchannel.keys())))
+            for k in sorted(openchannel.keys()):
+                plugin.log("{}={}".format(k, openchannel[k]))
+            return run_check(openchannel['funding_msat'])
+
+        @plugin.hook('openchannel2')
+        def on_openchannel2(openchannel2, plugin, **kwargs):
+            plugin.log("{} VARS".format(len(openchannel2.keys())))
+            for k in sorted(openchannel2.keys()):
+                plugin.log("{}={}".format(k, openchannel2[k]))
+            return run_check(openchannel2['their_funding_msat'])
+
+    l1 = node_factory.get_node()
+    l2 = node_factory.get_node(inline_plugin=setup)
+    node_factory.join_nodes([l1, l2], fundchannel=False)
     l1.fundwallet(10**6)
 
     # Even amount: works.
@@ -755,9 +822,9 @@ def test_openchannel_hook(node_factory, bitcoind):
             'push_msat': 0,
         })
 
-    l2.daemon.wait_for_log('reject_odd_funding_amounts.py: {} VARS'.format(len(expected)))
+    l2.daemon.wait_for_log('inline-plugin.py: {} VARS'.format(len(expected)))
     for k, v in expected.items():
-        assert l2.daemon.is_in_log('reject_odd_funding_amounts.py: {}={}'.format(k, v))
+        assert l2.daemon.is_in_log('inline-plugin.py: {}={}'.format(k, v))
 
     # Close it.
     txid = only_one(l1.rpc.close(l2.info['id'])['txids'])
@@ -1202,7 +1269,7 @@ def test_htlc_accepted_hook_fail(node_factory):
     # This must fail
     inv = l2.rpc.invoice(1000, "lbl", "desc")
     phash = inv['payment_hash']
-    route = l1.rpc.getroute(l2.info['id'], 1000, 1)['route']
+    route = l1.single_route(l2.info['id'], 1000)
 
     # Here shouldn't use `pay` command because l2 rejects with WIRE_TEMPORARY_NODE_FAILURE,
     # then it will be excluded when l1 try another pay attempt.
@@ -1220,8 +1287,8 @@ def test_htlc_accepted_hook_fail(node_factory):
     # Now try with forwarded HTLCs: l2 should still fail them
     # This must fail
     inv = l3.rpc.invoice(1000, "lbl", "desc")['bolt11']
-    with pytest.raises(RpcError):
-        l1.rpc.pay(inv)
+    with pytest.raises(RpcError, match=r"We got a weird error \(temporary_node_failure\) for the invoice's route hint"):
+        l1.rpc.xpay(inv)
 
     # And the invoice must still be unpaid
     inv = l3.rpc.listinvoices("lbl")['invoices']
@@ -1231,14 +1298,18 @@ def test_htlc_accepted_hook_fail(node_factory):
 def test_htlc_accepted_hook_resolve(node_factory):
     """l3 creates an invoice, l2 knows the preimage and will shortcircuit.
     """
-    l1, l2, l3 = node_factory.line_graph(3, opts=[
-        {},
-        {'plugin': os.path.join(os.getcwd(), 'tests/plugins/shortcircuit.py')},
-        {}
-    ], wait_for_announce=True)
+    def setup(plugin):
+        @plugin.hook("htlc_accepted")
+        def on_htlc_accepted(onion, htlc, plugin, **kwargs):
+            return {"result": "resolve", "payment_key": "00" * 32}
+
+    l1 = node_factory.get_node()
+    l2 = node_factory.get_node(inline_plugin=setup)
+    l3 = node_factory.get_node()
+    node_factory.join_nodes([l1, l2, l3], wait_for_announce=True)
 
     inv = l3.rpc.invoice(amount_msat=1000, label="lbl", description="desc", preimage="00" * 32)['bolt11']
-    l1.rpc.pay(inv)
+    l1.rpc.xpay(inv)
 
     # And the invoice must still be unpaid
     inv = l3.rpc.listinvoices("lbl")['invoices']
@@ -1255,7 +1326,7 @@ def test_htlc_accepted_hook_direct_restart(node_factory, executor):
     ])
 
     i1 = l2.rpc.invoice(amount_msat=1000, label="direct", description="desc")['bolt11']
-    f1 = executor.submit(l1.rpc.pay, i1)
+    f1 = executor.submit(l1.rpc.xpay, i1)
 
     l2.daemon.wait_for_log(r'Holding onto an incoming htlc for 10 seconds')
 
@@ -1387,41 +1458,62 @@ def test_htlc_accepted_hook_forward_restart(node_factory, executor):
 def test_warning_notification(node_factory):
     """ test 'warning' notifications
     """
-    l1 = node_factory.get_node(options={'plugin': os.path.join(os.getcwd(), 'tests/plugins/pretend_badlog.py')}, broken_log=r'Test warning notification\(for broken event\)|LINE[12]')
+    def setup(plugin):
+        @plugin.init()
+        def init(configuration, options, plugin):
+            plugin.log("initialized")
+
+        @plugin.subscribe("warning")
+        def notify_warning(plugin, warning, **kwargs):
+            plugin.log("Received warning")
+            plugin.log("level: {}".format(warning['level']))
+            plugin.log("time: {}".format(warning['time']))
+            plugin.log("source: {}".format(warning['source']))
+            plugin.log("log: {}".format(warning['log']))
+
+        @plugin.method("pretendbad")
+        def pretend_bad(event, level, plugin):
+            """Log an specified level entry.
+            And in plugin, we use 'warn'/'error' instead of
+            'unusual'/'broken'
+            """
+            plugin.log("{}".format(event), level)
+
+    l1 = node_factory.get_node(inline_plugin=setup, broken_log=r'Test warning notification\(for broken event\)|LINE[12]')
 
     # 1. test 'warn' level
     event = "Test warning notification(for unusual event)"
     l1.rpc.call('pretendbad', {'event': event, 'level': 'warn'})
 
     # ensure an unusual log_entry was produced by 'pretendunusual' method
-    l1.daemon.wait_for_log('plugin-pretend_badlog.py: Test warning notification\\(for unusual event\\)')
+    l1.daemon.wait_for_log('plugin-inline-plugin.py: Test warning notification\\(for unusual event\\)')
 
     # now wait for notification
-    l1.daemon.wait_for_log('plugin-pretend_badlog.py: Received warning')
-    l1.daemon.wait_for_log('plugin-pretend_badlog.py: level: warn')
-    l1.daemon.wait_for_log('plugin-pretend_badlog.py: time: *')
-    l1.daemon.wait_for_log('plugin-pretend_badlog.py: source: plugin-pretend_badlog.py')
-    l1.daemon.wait_for_log('plugin-pretend_badlog.py: log: Test warning notification\\(for unusual event\\)')
+    l1.daemon.wait_for_log('plugin-inline-plugin.py: Received warning')
+    l1.daemon.wait_for_log('plugin-inline-plugin.py: level: warn')
+    l1.daemon.wait_for_log('plugin-inline-plugin.py: time: *')
+    l1.daemon.wait_for_log('plugin-inline-plugin.py: source: plugin-inline-plugin.py')
+    l1.daemon.wait_for_log('plugin-inline-plugin.py: log: Test warning notification\\(for unusual event\\)')
 
     # 2. test 'error' level, steps like above
     event = "Test warning notification(for broken event)"
     l1.rpc.call('pretendbad', {'event': event, 'level': 'error'})
-    l1.daemon.wait_for_log(r'\*\*BROKEN\*\* plugin-pretend_badlog.py: Test warning notification\(for broken event\)')
+    l1.daemon.wait_for_log(r'\*\*BROKEN\*\* plugin-inline-plugin.py: Test warning notification\(for broken event\)')
 
-    l1.daemon.wait_for_log('plugin-pretend_badlog.py: Received warning')
-    l1.daemon.wait_for_log('plugin-pretend_badlog.py: level: error')
-    l1.daemon.wait_for_log('plugin-pretend_badlog.py: time: *')
-    l1.daemon.wait_for_log('plugin-pretend_badlog.py: source: plugin-pretend_badlog.py')
-    l1.daemon.wait_for_log('plugin-pretend_badlog.py: log: Test warning notification\\(for broken event\\)')
+    l1.daemon.wait_for_log('plugin-inline-plugin.py: Received warning')
+    l1.daemon.wait_for_log('plugin-inline-plugin.py: level: error')
+    l1.daemon.wait_for_log('plugin-inline-plugin.py: time: *')
+    l1.daemon.wait_for_log('plugin-inline-plugin.py: source: plugin-inline-plugin.py')
+    l1.daemon.wait_for_log('plugin-inline-plugin.py: log: Test warning notification\\(for broken event\\)')
 
     # Test linesplitting while we're here
     l1.rpc.call('pretendbad', {'event': 'LINE1\nLINE2', 'level': 'error'})
-    l1.daemon.wait_for_log(r'\*\*BROKEN\*\* plugin-pretend_badlog.py: LINE1')
-    l1.daemon.wait_for_log(r'\*\*BROKEN\*\* plugin-pretend_badlog.py: LINE2')
-    l1.daemon.wait_for_log('plugin-pretend_badlog.py: Received warning')
-    l1.daemon.wait_for_log('plugin-pretend_badlog.py: log: LINE1')
-    l1.daemon.wait_for_log('plugin-pretend_badlog.py: Received warning')
-    l1.daemon.wait_for_log('plugin-pretend_badlog.py: log: LINE2')
+    l1.daemon.wait_for_log(r'\*\*BROKEN\*\* plugin-inline-plugin.py: LINE1')
+    l1.daemon.wait_for_log(r'\*\*BROKEN\*\* plugin-inline-plugin.py: LINE2')
+    l1.daemon.wait_for_log('plugin-inline-plugin.py: Received warning')
+    l1.daemon.wait_for_log('plugin-inline-plugin.py: log: LINE1')
+    l1.daemon.wait_for_log('plugin-inline-plugin.py: Received warning')
+    l1.daemon.wait_for_log('plugin-inline-plugin.py: log: LINE2')
 
 
 def test_invoice_payment_notification(node_factory):
@@ -1507,14 +1599,14 @@ def test_forward_event_notification(node_factory, bitcoind, executor):
 
     inv = l3.rpc.invoice(amount, "first", "desc")
     payment_hash13 = inv['payment_hash']
-    route = l1.rpc.getroute(l3.info['id'], amount, 1)['route']
+    route = l1.single_route(l3.info['id'], amount)
 
     # status: offered -> settled
     l1.rpc.sendpay(route, payment_hash13, payment_secret=inv['payment_secret'])
     l1.rpc.waitsendpay(payment_hash13)
 
     # status: offered -> failed
-    route = l1.rpc.getroute(l4.info['id'], amount, 1)['route']
+    route = l1.single_route(l4.info['id'], amount)
     payment_hash14 = "f" * 64
     with pytest.raises(RpcError):
         l1.rpc.sendpay(route, payment_hash14, payment_secret="f" * 64)
@@ -1611,18 +1703,40 @@ def test_forward_event_notification(node_factory, bitcoind, executor):
 def test_sendpay_notifications(node_factory, bitcoind):
     """ test 'sendpay_success' and 'sendpay_failure' notifications
     """
+    def setup(plugin):
+        @plugin.init()
+        def init(configuration, options, plugin):
+            plugin.success_list = []
+            plugin.failure_list = []
+
+        @plugin.subscribe("sendpay_success")
+        def notify_sendpay_success(plugin, sendpay_success):
+            plugin.log("Received a sendpay_success: id={}, payment_hash={}".format(sendpay_success['id'], sendpay_success['payment_hash']))
+            plugin.success_list.append(sendpay_success)
+
+        @plugin.subscribe("sendpay_failure")
+        def notify_sendpay_failure(plugin, sendpay_failure):
+            plugin.log("Received a sendpay_failure: id={}, payment_hash={}".format(sendpay_failure['data']['id'],
+                       sendpay_failure['data']['payment_hash']))
+            plugin.failure_list.append(sendpay_failure)
+
+        @plugin.method('listsendpays_plugin')
+        def record_lookup(plugin):
+            return {'sendpay_success': plugin.success_list,
+                    'sendpay_failure': plugin.failure_list}
+
     amount = 10**8
-    opts = [{'plugin': os.path.join(os.getcwd(), 'tests/plugins/sendpay_notifications.py')},
-            {},
-            {'may_reconnect': False}]
-    l1, l2, l3 = node_factory.line_graph(3, opts=opts, wait_for_announce=True)
+    l1 = node_factory.get_node(inline_plugin=setup)
+    l2 = node_factory.get_node()
+    l3 = node_factory.get_node(may_reconnect=False)
+    node_factory.join_nodes([l1, l2, l3], wait_for_announce=True)
     chanid23 = l2.get_channel_scid(l3)
 
     inv1 = l3.rpc.invoice(amount, "first", "desc")
     payment_hash1 = inv1['payment_hash']
     inv2 = l3.rpc.invoice(amount, "second", "desc")
     payment_hash2 = inv2['payment_hash']
-    route = l1.rpc.getroute(l3.info['id'], amount, 1)['route']
+    route = l1.single_route(l3.info['id'], amount)
 
     l1.rpc.sendpay(route, payment_hash1, payment_secret=inv1['payment_secret'])
     response1 = l1.rpc.waitsendpay(payment_hash1)
@@ -1642,10 +1756,32 @@ def test_sendpay_notifications(node_factory, bitcoind):
 
 
 def test_sendpay_notifications_nowaiter(node_factory):
-    opts = [{'plugin': os.path.join(os.getcwd(), 'tests/plugins/sendpay_notifications.py')},
-            {},
-            {'may_reconnect': False}]
-    l1, l2, l3 = node_factory.line_graph(3, opts=opts, wait_for_announce=True)
+    def setup(plugin):
+        @plugin.init()
+        def init(configuration, options, plugin):
+            plugin.success_list = []
+            plugin.failure_list = []
+
+        @plugin.subscribe("sendpay_success")
+        def notify_sendpay_success(plugin, sendpay_success):
+            plugin.log("Received a sendpay_success: id={}, payment_hash={}".format(sendpay_success['id'], sendpay_success['payment_hash']))
+            plugin.success_list.append(sendpay_success)
+
+        @plugin.subscribe("sendpay_failure")
+        def notify_sendpay_failure(plugin, sendpay_failure):
+            plugin.log("Received a sendpay_failure: id={}, payment_hash={}".format(sendpay_failure['data']['id'],
+                       sendpay_failure['data']['payment_hash']))
+            plugin.failure_list.append(sendpay_failure)
+
+        @plugin.method('listsendpays_plugin')
+        def record_lookup(plugin):
+            return {'sendpay_success': plugin.success_list,
+                    'sendpay_failure': plugin.failure_list}
+
+    l1 = node_factory.get_node(inline_plugin=setup)
+    l2 = node_factory.get_node()
+    l3 = node_factory.get_node(may_reconnect=False)
+    node_factory.join_nodes([l1, l2, l3], wait_for_announce=True)
     chanid23 = l2.get_channel_scid(l3)
     amount = 10**8
 
@@ -1653,7 +1789,7 @@ def test_sendpay_notifications_nowaiter(node_factory):
     payment_hash1 = inv1['payment_hash']
     inv2 = l3.rpc.invoice(amount, "second", "desc")
     payment_hash2 = inv2['payment_hash']
-    route = l1.rpc.getroute(l3.info['id'], amount, 1)['route']
+    route = l1.single_route(l3.info['id'], amount)
 
     l1.rpc.sendpay(route, payment_hash1, payment_secret=inv1['payment_secret'])
     l1.daemon.wait_for_log(r'Received a sendpay_success')
@@ -1666,6 +1802,38 @@ def test_sendpay_notifications_nowaiter(node_factory):
     results = l1.rpc.call('listsendpays_plugin')
     assert len(results['sendpay_success']) == 1
     assert len(results['sendpay_failure']) == 1
+
+
+def test_inline_plugin_wait_for_log_no_selfmatch(node_factory):
+    """On inline-plugin nodes the test process's logging is forwarded into
+    the node's log.  wait_for_log()'s own 'Waiting for [pattern]'
+    announcement embeds the pattern, so with test logging at DEBUG it used
+    to land in the scanned log and match itself, reducing the wait to a
+    no-op (#9343).  A pattern that never appears must genuinely time out.
+    """
+    def setup(plugin):
+        @plugin.method('inline_ping')
+        def inline_ping(plugin):
+            logging.info("AUTHOR_LOG_MARKER_9343")
+            return {'pong': True}
+
+    l1 = node_factory.get_node(inline_plugin=setup)
+
+    root = logging.getLogger()
+    old_level = root.level
+    root.setLevel(logging.DEBUG)
+    try:
+        # The plugin author's own logging must still be forwarded...
+        assert l1.rpc.call('inline_ping') == {'pong': True}
+        l1.daemon.wait_for_log('AUTHOR_LOG_MARKER_9343')
+        # ...but pyln's internal announcements must not be, so a pattern
+        # that never appears genuinely times out instead of matching the
+        # forwarded 'Waiting for [pattern]' line.
+        with pytest.raises(TimeoutError):
+            l1.daemon.wait_for_log('SELFMATCH_SENTINEL_NEVER_LOGGED',
+                                   timeout=5)
+    finally:
+        root.setLevel(old_level)
 
 
 def test_rpc_command_hook(node_factory):
@@ -1761,7 +1929,7 @@ def test_libplugin(node_factory):
     myname = os.path.splitext(os.path.basename(sys.argv[0]))[0]
 
     # getmanifest assumes everyone handles string-based JSON ids:
-    l1.daemon.wait_for_log(r'test_libplugin: "[-A-Za-z0-9:#]*/cln:getmanifest#[0-9]*"\[OUT\]')
+    l1.daemon.wait_for_log(r'test_libplugin: [-A-Za-z0-9:#]*/cln:getmanifest#[0-9]*\[OUT\]')
 
     l1.daemon.wait_for_log("String name from datastore:.*object does not have member string")
     l1.daemon.wait_for_log("Hex name from datastore: 00010203")
@@ -1788,7 +1956,7 @@ def test_libplugin(node_factory):
     # Test hooks and notifications (add plugin, so we can test hook id)
     l2 = node_factory.get_node(options={"plugin": plugin, 'log-level': 'io'})
     l2.connect(l1)
-    l2.daemon.wait_for_log(r': "{}:connect#[0-9]*/cln:peer_connected#[0-9]*"\[OUT\]'.format(myname))
+    l2.daemon.wait_for_log(r': {}:connect#[0-9]*/cln:peer_connected#[0-9]*\[OUT\]'.format(myname))
 
     l1.daemon.wait_for_log("{} peer_connected".format(l2.info["id"]))
     l1.daemon.wait_for_log("{} connected".format(l2.info["id"]))
@@ -1940,7 +2108,7 @@ def test_hook_chaining(node_factory):
 
     inv = l2.rpc.invoice(123, 'odd', "Odd payment handled by the first plugin",
                          preimage="AA" * 32)['bolt11']
-    l1.rpc.pay(inv)
+    l1.rpc.xpay(inv)
 
     # The first plugin will handle this, the second one should not be called.
     assert(l2.daemon.is_in_log(
@@ -1956,7 +2124,7 @@ def test_hook_chaining(node_factory):
     inv = l2.rpc.invoice(
         123, 'even', "Even payment handled by the second plugin", preimage="BB" * 32
     )['bolt11']
-    l1.rpc.pay(inv)
+    l1.rpc.xpay(inv)
     assert(l2.daemon.is_in_log(
         r'plugin-hook-chain-odd.py: htlc_accepted called for payment_hash {}'.format(hash2)
     ))
@@ -1968,7 +2136,7 @@ def test_hook_chaining(node_factory):
     # by the internal invoice handling.
     inv = l2.rpc.invoice(123, 'neither', "Neither plugin handles this",
                          preimage="CC" * 32)['bolt11']
-    l1.rpc.pay(inv)
+    l1.rpc.xpay(inv)
     assert(l2.daemon.is_in_log(
         r'plugin-hook-chain-odd.py: htlc_accepted called for payment_hash {}'.format(hash3)
     ))
@@ -2113,8 +2281,7 @@ def test_bcli_concurrent(node_factory, bitcoind, executor):
 
     def mock_getblock(r):
         if getblockfrompeer_count >= retry_count:
-            conf_file = os.path.join(bitcoind.bitcoin_dir, "bitcoin.conf")
-            brpc = RawProxy(btc_conf_file=conf_file)
+            brpc = RawProxy(btc_conf_file=bitcoind.conf_file)
             return {
                 "result": brpc._call(r["method"], *r["params"]),
                 "error": None,
@@ -2255,7 +2422,7 @@ def test_hook_crash(node_factory, executor, bitcoind):
     futures = []
     for n in nodes:
         inv = n.rpc.invoice(123, "lbl", "desc")['bolt11']
-        futures.append(executor.submit(l1.rpc.pay, inv))
+        futures.append(executor.submit(l1.rpc.xpay, inv))
 
     for n in nodes:
         n.daemon.wait_for_logs([
@@ -2298,14 +2465,14 @@ def test_replacement_payload(node_factory):
     # Replace with an invalid payload.
     l2.rpc.call('setpayload', ['0000'])
     inv = l2.rpc.invoice(123, 'test_replacement_payload', 'test_replacement_payload')['bolt11']
-    with pytest.raises(RpcError, match=r"WIRE_INVALID_ONION_PAYLOAD \(reply from remote\)"):
-        l1.rpc.pay(inv)
+    with pytest.raises(RpcError, match=r"Unexpected error \(invalid_onion_payload\) from final node"):
+        l1.rpc.xpay(inv)
 
     # Replace with valid payload, but corrupt payment_secret
     l2.rpc.call('setpayload', ['corrupt_secret'])
 
-    with pytest.raises(RpcError, match=r"WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS \(reply from remote\)"):
-        l1.rpc.pay(inv)
+    with pytest.raises(RpcError, match=r"Destination said it doesn't know invoice: incorrect_or_unknown_payment_details"):
+        l1.rpc.xpay(inv)
 
     assert l2.daemon.wait_for_log("Attempt to pay.*with wrong payment_secret")
 
@@ -2329,12 +2496,12 @@ def test_watchtower(node_factory, bitcoind, directory, chainparams):
     channel_id = l1.rpc.listpeerchannels()['channels'][0]['channel_id']
 
     # Force a new commitment
-    l1.rpc.pay(l2.rpc.invoice(25000000, 'lbl1', 'desc1')['bolt11'])
+    l1.rpc.xpay(l2.rpc.invoice(25000000, 'lbl1', 'desc1')['bolt11'])
 
     tx = l1.rpc.dev_sign_last_tx(l2.info['id'])['tx']
 
     # Now make sure it is out of date
-    l1.rpc.pay(l2.rpc.invoice(25000000, 'lbl2', 'desc2')['bolt11'])
+    l1.rpc.xpay(l2.rpc.invoice(25000000, 'lbl2', 'desc2')['bolt11'])
 
     # l2 stops watching the chain, allowing the watchtower to react
     l2.stop()
@@ -2446,14 +2613,14 @@ def test_coin_movement_notices(node_factory, bitcoind, chainparams):
 
     inv = l3.rpc.invoice(amount, "first", "desc")
     payment_hash13 = inv['payment_hash']
-    route = l1.rpc.getroute(l3.info['id'], amount, 1)['route']
+    route = l1.single_route(l3.info['id'], amount)
 
     # status: offered -> settled
     l1.rpc.sendpay(route, payment_hash13, payment_secret=inv['payment_secret'])
     l1.rpc.waitsendpay(payment_hash13)
 
     # status: offered -> failed
-    route = l1.rpc.getroute(l3.info['id'], amount, 1)['route']
+    route = l1.single_route(l3.info['id'], amount)
     payment_hash13 = "f" * 64
     with pytest.raises(RpcError):
         l1.rpc.sendpay(route, payment_hash13, payment_secret=inv['payment_secret'])
@@ -2462,14 +2629,14 @@ def test_coin_movement_notices(node_factory, bitcoind, chainparams):
     # go the other direction
     inv = l1.rpc.invoice(amount // 2, "first", "desc")
     payment_hash31 = inv['payment_hash']
-    route = l3.rpc.getroute(l1.info['id'], amount // 2, 1)['route']
+    route = l3.single_route(l1.info['id'], amount // 2)
     l3.rpc.sendpay(route, payment_hash31, payment_secret=inv['payment_secret'])
     l3.rpc.waitsendpay(payment_hash31)
 
     # receive a payment (endpoint)
     inv = l2.rpc.invoice(amount, "first", "desc")
     payment_hash12 = inv['payment_hash']
-    route = l1.rpc.getroute(l2.info['id'], amount, 1)['route']
+    route = l1.single_route(l2.info['id'], amount)
     l1.rpc.sendpay(route, payment_hash12, payment_secret=inv['payment_secret'])
     l1.rpc.waitsendpay(payment_hash12)
 
@@ -2478,7 +2645,7 @@ def test_coin_movement_notices(node_factory, bitcoind, chainparams):
     payment_hash21 = inv['payment_hash']
     # Make sure previous completely settled
     wait_for(lambda: only_one(l2.rpc.listpeerchannels(l1.info['id'])['channels'])['htlcs'] == [])
-    route = l2.rpc.getroute(l1.info['id'], amount // 2, 1)['route']
+    route = l2.single_route(l1.info['id'], amount // 2)
     l2.rpc.sendpay(route, payment_hash21, payment_secret=inv['payment_secret'])
     l2.rpc.waitsendpay(payment_hash21)
 
@@ -2530,66 +2697,66 @@ def test_important_plugin(node_factory):
     # Cache it here.
     pluginsdir = os.path.join(os.path.dirname(__file__), "plugins")
 
-    n = node_factory.get_node(options={"important-plugin": os.path.join(pluginsdir, "nonexistent")},
-                              may_fail=True, expect_fail=True,
-                              # Other plugins can complain as lightningd stops suddenly:
-                              broken_log='Plugin marked as important, shutting down lightningd|Reading sync lightningd: Connection reset by peer|Lost connection to the RPC socket|Plugin terminated before replying to RPC call|plugin-cln-xpay: askrene-create-layer failed with.*Unkown command',
-                              start=False)
+    l1 = node_factory.get_node(options={"important-plugin": os.path.join(pluginsdir, "nonexistent")},
+                               may_fail=True, expect_fail=True,
+                               # Other plugins can complain as lightningd stops suddenly:
+                               broken_log='Plugin marked as important, shutting down lightningd|Reading sync lightningd: Connection reset by peer|Reading sync lightningd: Bad file descriptor|Lost connection to the RPC socket|Plugin terminated before replying to RPC call|plugin-cln-xpay: askrene-create-layer failed with.*Unknown command',
+                               start=False)
 
-    n.daemon.start(wait_for_initialized=False, stderr_redir=True)
+    l1.daemon.start(wait_for_initialized=False, stderr_redir=True)
     # Will exit with failure code.
-    assert n.daemon.wait() == 1
-    assert n.daemon.is_in_stderr(r"Failed to register .*nonexistent: No such file or directory")
+    assert l1.daemon.wait() == 1
+    assert l1.daemon.is_in_stderr(r"Failed to register .*nonexistent: No such file or directory")
 
     # Check we exit if the important plugin dies.
-    n.daemon.opts['important-plugin'] = os.path.join(pluginsdir, "fail_by_itself.py")
+    l1.daemon.opts['important-plugin'] = os.path.join(pluginsdir, "fail_by_itself.py")
 
-    n.daemon.start(wait_for_initialized=False)
+    l1.daemon.start(wait_for_initialized=False)
     # Will exit with failure code.
-    assert n.daemon.wait() == 1
-    n.daemon.wait_for_log(r'fail_by_itself.py: Plugin marked as important, shutting down lightningd')
+    assert l1.daemon.wait() == 1
+    l1.daemon.wait_for_log(r'fail_by_itself.py: Plugin marked as important, shutting down lightningd')
 
     # Check if the important plugin is disabled, we run as normal.
-    n.daemon.opts['disable-plugin'] = "fail_by_itself.py"
-    n.daemon.start()
+    l1.daemon.opts['disable-plugin'] = "fail_by_itself.py"
+    l1.daemon.start()
     # Make sure we can call into a plugin RPC (this is from `bcli`) even
     # if fail_by_itself.py is disabled.
-    n.rpc.call("estimatefees", {})
-    n.stop()
+    l1.rpc.call("estimatefees", {})
+    l1.stop()
 
     # Check if an important plugin dies later, we fail.
-    del n.daemon.opts['disable-plugin']
-    n.daemon.opts['important-plugin'] = os.path.join(pluginsdir, "suicidal_plugin.py")
+    del l1.daemon.opts['disable-plugin']
+    l1.daemon.opts['important-plugin'] = os.path.join(pluginsdir, "suicidal_plugin.py")
 
-    n.start()
+    l1.start()
 
     with pytest.raises(RpcError):
-        n.rpc.call("die", {})
+        l1.rpc.call("die", {})
 
     # Should exit with exitcode 1
-    n.daemon.wait_for_log('suicidal_plugin.py: Plugin marked as important, shutting down lightningd')
-    assert n.daemon.wait() == 1
-    n.stop()
+    l1.daemon.wait_for_log('suicidal_plugin.py: Plugin marked as important, shutting down lightningd')
+    assert l1.daemon.wait() == 1
+    l1.stop()
 
     # Check that if a builtin plugin dies, we fail.
-    start = n.daemon.logsearch_start
-    n.start()
+    start = l1.daemon.logsearch_start
+    l1.start()
     # Reset logsearch_start, since this will predate message that start() looks for.
-    n.daemon.logsearch_start = start
-    line = n.daemon.wait_for_log(r'.*started\([0-9]*\).*plugins/pay')
+    l1.daemon.logsearch_start = start
+    line = l1.daemon.wait_for_log(r'.*started\([0-9]*\).*plugins/pay')
     pidstr = re.search(r'.*started\(([0-9]*)\).*plugins/pay', line).group(1)
 
     # Kill pay.
     os.kill(int(pidstr), signal.SIGKILL)
-    n.daemon.wait_for_log('pay: Plugin marked as important, shutting down lightningd')
+    l1.daemon.wait_for_log('pay: Plugin marked as important, shutting down lightningd')
     # Should exit with exitcode 1
-    assert n.daemon.wait() == 1
-    n.stop()
+    assert l1.daemon.wait() == 1
+    l1.stop()
 
 
 def test_dev_builtin_plugins_unimportant(node_factory):
-    n = node_factory.get_node(options={"dev-builtin-plugins-unimportant": None})
-    n.rpc.plugin_stop(plugin="pay")
+    l1 = node_factory.get_node(options={"dev-builtin-plugins-unimportant": None})
+    l1.rpc.plugin_stop(plugin="pay")
 
 
 def test_htlc_accepted_hook_crash(node_factory, executor):
@@ -2610,15 +2777,15 @@ def test_htlc_accepted_hook_crash(node_factory, executor):
 
     # This should still succeed
 
-    f = executor.submit(l1.rpc.pay, i)
+    f = executor.submit(l1.rpc.xpay, i)
 
     l2.daemon.wait_for_log(r'Crashing on purpose...')
     l2.daemon.wait_for_log(
         r'Hook handler for htlc_accepted failed with an exception.'
     )
 
-    with pytest.raises(RpcError, match=r'failed: WIRE_TEMPORARY_NODE_FAILURE'):
-        f.result(10)
+    with pytest.raises(RpcError, match=r'Unexpected error \(temporary_node_failure\) from final node: disabling'):
+        f.result(TIMEOUT)
 
 
 def test_notify(node_factory):
@@ -2693,17 +2860,17 @@ def test_htlc_accepted_hook_failmsg(node_factory):
     # First let's test the newer failure_message, which should get passed
     # through without being mapped.
     tests = {
-        '2002': 'WIRE_TEMPORARY_NODE_FAILURE',
-        '400F' + 12 * '00': 'WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS',
-        '4009': 'WIRE_REQUIRED_CHANNEL_FEATURE_MISSING',
-        '4016' + 3 * '00': 'WIRE_INVALID_ONION_PAYLOAD',
+        '2002': 'temporary_node_failure',
+        '400F' + 12 * '00': 'incorrect_or_unknown_payment_details',
+        '4009': 'required_channel_feature_missing',
+        '4016' + 3 * '00': 'invalid_onion_payload',
     }
 
     for failmsg, expected in tests.items():
         l2.rpc.setfailmsg(msg=failmsg)
         inv = l2.rpc.invoice(42, 'failmsg{}'.format(failmsg), '')['bolt11']
-        with pytest.raises(RpcError, match=r'failcodename.: .{}.'.format(expected)):
-            l1.rpc.pay(inv)
+        with pytest.raises(RpcError, match=expected):
+            l1.rpc.xpay(inv)
 
 
 def test_htlc_accepted_hook_customtlvs(node_factory):
@@ -2718,14 +2885,14 @@ def test_htlc_accepted_hook_customtlvs(node_factory):
     single_tlv = "fe00010001012a"  # represents type: 65537, lenght: 1, value: 42
     l2.rpc.setcustomtlvs(tlvs=single_tlv)
     inv = l3.rpc.invoice(1000, 'customtlvs-singletlv', '')['bolt11']
-    l1.rpc.pay(inv)
+    l1.rpc.xpay(inv)
     l3.daemon.wait_for_log(f"called htlc accepted hook with extra_tlvs: {single_tlv}")
 
     # Mutliple tlvs - Check that we recieve multiple extra tlvs at l3 attached by l2.
     multi_tlv = "fdffff012afe00010001020539"  # represents type: 65535, length: 1, value: 42 and type: 65537, length: 2, value: 1337
     l2.rpc.setcustomtlvs(tlvs=multi_tlv)
     inv = l3.rpc.invoice(1000, 'customtlvs-multitlvs', '')['bolt11']
-    l1.rpc.pay(inv)
+    l1.rpc.xpay(inv)
     l3.daemon.wait_for_log(f"called htlc accepted hook with extra_tlvs: {multi_tlv}")
 
 
@@ -2741,7 +2908,7 @@ def test_htlc_accepted_hook_malformedtlvs(node_factory):
     l2.rpc.setcustomtlvs(tlvs=mal_tlv)
     inv = l3.rpc.invoice(1000, 'customtlvs-maltlvs', '')
     phash = inv['payment_hash']
-    route = l1.rpc.getroute(l3.info['id'], 1000, 1)['route']
+    route = l1.single_route(l3.info['id'], 1000)
 
     # Here shouldn't use `pay` command because l2 should fail with a broken log.
     l1.rpc.sendpay(route, phash, payment_secret=inv['payment_secret'])
@@ -2825,7 +2992,7 @@ def test_htlc_accepted_hook_failonion(node_factory):
     l2.rpc.setfailonion('0' * (292 * 2))
     inv = l2.rpc.invoice(42, 'failonion000', '')['bolt11']
     with pytest.raises(RpcError):
-        l1.rpc.pay(inv)
+        l1.rpc.xpay(inv)
 
 
 @pytest.mark.slow_test  # VALGRIND running generally too slow to trigger race we need.
@@ -2867,14 +3034,14 @@ def test_htlc_accepted_hook_fwdto(node_factory):
     l1, l2, l3 = node_factory.line_graph(3, opts=[{}, {'plugin': plugin}, {}], wait_for_announce=True)
 
     # Add some balance
-    l1.rpc.pay(l2.rpc.invoice(10**9 // 2, 'balance', '')['bolt11'])
+    l1.rpc.xpay(l2.rpc.invoice(10**9 // 2, 'balance', '')['bolt11'])
     wait_for(lambda: only_one(l1.rpc.listpeerchannels()['channels'])['htlcs'] == [])
 
     # make it forward back down same channel.
     l2.rpc.setfwdto(only_one(l1.rpc.listpeerchannels()['channels'])['channel_id'])
     inv = l3.rpc.invoice(42, 'fwdto', '')['bolt11']
-    with pytest.raises(RpcError, match="WIRE_INVALID_ONION_HMAC"):
-        l1.rpc.pay(inv)
+    with pytest.raises(RpcError, match=r"Unexpected error \(invalid_onion_hmac\) from intermediate node: disabling the invoice's route hint"):
+        l1.rpc.xpay(inv)
 
     assert l2.rpc.listforwards()['forwards'][0]['out_channel'] == only_one(l1.rpc.listpeerchannels()['channels'])['short_channel_id']
 
@@ -2891,6 +3058,108 @@ def test_dynamic_args(node_factory):
 
     l1.rpc.plugin_stop(plugin_path)
     assert 'greeting' not in l1.rpc.listconfigs()['configs']
+
+
+def test_dynamic_args_options_array(node_factory):
+    """plugin start accepts options as an explicit array, matching the schema."""
+    plugin_path = os.path.join(os.getcwd(), "tests/plugins/dynamic_option.py")
+
+    l1 = node_factory.get_node()
+
+    # Positionally, an options array is a valid 3rd argument, covering every
+    # option type: string, int, bool and flag (which has no '=').
+    l1.rpc.call(
+        "plugin",
+        [
+            "start",
+            plugin_path,
+            [
+                "test-dynamic-config=Test options array",
+                "test-dynamic-int=42",
+                "test-dynamic-bool=false",
+                "test-dynamic-flag",
+            ],
+        ],
+    )
+    assert l1.rpc.dynamic_option_report() == {
+        "test-dynamic-config": "Test options array",
+        "test-dynamic-int": 42,
+        "test-dynamic-bool": False,
+        "test-dynamic-flag": True,
+    }
+    l1.rpc.plugin_stop(plugin_path)
+
+    l1.rpc.call(
+        "plugin",
+        {
+            "subcommand": "start",
+            "plugin": plugin_path,
+            "options": [
+                "test-dynamic-config=Test options array",
+                "test-dynamic-int=42",
+                "test-dynamic-bool=false",
+                "test-dynamic-flag",
+            ],
+        },
+    )
+    assert l1.rpc.dynamic_option_report() == {
+        "test-dynamic-config": "Test options array",
+        "test-dynamic-int": 42,
+        "test-dynamic-bool": False,
+        "test-dynamic-flag": True,
+    }
+    l1.rpc.plugin_stop(plugin_path)
+
+    l1.rpc.call(
+        "plugin",
+        {
+            "subcommand": "start",
+            "plugin": plugin_path,
+            "test-dynamic-config": "Test options array",
+            "test-dynamic-int": 42,
+            "test-dynamic-bool": False,
+            "test-dynamic-flag": None,
+        },
+    )
+    assert l1.rpc.dynamic_option_report() == {
+        "test-dynamic-config": "Test options array",
+        "test-dynamic-int": 42,
+        "test-dynamic-bool": False,
+        "test-dynamic-flag": None,
+    }
+    l1.rpc.plugin_stop(plugin_path)
+
+    # Entries must be strings, not e.g. numbers.
+    with pytest.raises(RpcError, match="options array entries must be strings"):
+        l1.rpc.call("plugin", ["start", plugin_path, [42]])
+
+    # ...but any trailing positional args are ambiguous, so must be rejected.
+    with pytest.raises(RpcError, match="Extra parameters must be in object"):
+        l1.rpc.call(
+            "plugin",
+            [
+                "start",
+                plugin_path,
+                ["test-dynamic-config=Test options array"],
+                "test-dynamic-config=yikes",
+            ],
+        )
+
+    # The same applies if there is no options array at all.
+    with pytest.raises(RpcError, match="Extra parameters must be in object"):
+        l1.rpc.call("plugin", ["start", plugin_path, None, "test-dynamic-config=yikes"])
+
+    # ...and flattened keyword options cannot be mixed with an options array.
+    with pytest.raises(RpcError, match="Cannot mix"):
+        l1.rpc.call(
+            "plugin",
+            {
+                "subcommand": "start",
+                "plugin": plugin_path,
+                "options": ["test-dynamic-config=Test options array"],
+                "test-dynamic-config": "yikes",
+            },
+        )
 
 
 def test_pyln_request_notify(node_factory):
@@ -2953,31 +3222,11 @@ def test_self_disable(node_factory):
     with pytest.raises(RpcError, match="Disabled via selfdisable option"):
         l1.rpc.plugin_start(p2, selfdisable=True)
 
+    with pytest.raises(RpcError, match="init saying disable"):
+        l1.rpc.plugin_start(pydisable)
 
-def test_custom_notification_topics(node_factory):
-    plugin = os.path.join(
-        os.path.dirname(__file__), "plugins", "custom_notifications.py"
-    )
-    l1, l2 = node_factory.line_graph(2, opts=[{'plugin': plugin}, {}])
-    l1.rpc.emit()
-    l1.daemon.wait_for_log("Got a custom notification Hello world from plugin custom_notifications.py")
-
-    inv = l2.rpc.invoice(42, "lbl", "desc")['bolt11']
-    l1.rpc.pay(inv)
-
-    l1.daemon.wait_for_log(r'Got a pay_success notification from plugin pay for payment_hash [0-9a-f]{64}')
-
-    # And now make sure that we drop unannounced notifications
-    l1.rpc.faulty_emit()
-    l1.daemon.wait_for_log(
-        r"Plugin attempted to send a notification to topic .* not forwarding"
-    )
-    time.sleep(1)
-    assert not l1.daemon.is_in_log(r'Got the ididntannouncethis event')
-
-    # The plugin just dist what previously was a fatal mistake (emit
-    # an unknown notification), make sure we didn't kill it.
-    assert str(plugin) in [p['name'] for p in l1.rpc.plugin_list()['plugins']]
+    with pytest.raises(RpcError, match="init saying disable"):
+        l1.rpc.plugin_start(pydisable, **{"dummy-option": True})
 
 
 def test_restart_on_update(node_factory):
@@ -2995,11 +3244,11 @@ plugin.run()
     """
 
     # get a node that is not started so we can put a plugin in its lightning_dir
-    n = node_factory.get_node(start=False)
-    if "dev-no-plugin-checksum" in n.daemon.opts:
-        del n.daemon.opts["dev-no-plugin-checksum"]
+    l1 = node_factory.get_node(start=False)
+    if "dev-no-plugin-checksum" in l1.daemon.opts:
+        del l1.daemon.opts["dev-no-plugin-checksum"]
 
-    lndir = n.daemon.lightning_dir
+    lndir = l1.daemon.lightning_dir
 
     # write hello world plugin to lndir/plugins
     os.makedirs(os.path.join(lndir, 'plugins'), exist_ok=True)
@@ -3009,13 +3258,13 @@ plugin.run()
     os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
 
     # now fire up the node and wait for the plugin to print hello
-    n.daemon.start()
-    n.daemon.logsearch_start = 0
-    n.daemon.wait_for_log(r"test_restart_on_update 1")
+    l1.daemon.start()
+    l1.daemon.logsearch_start = 0
+    l1.daemon.wait_for_log(r"test_restart_on_update 1")
 
     # a rescan should not yet reload the plugin on the same file
-    n.rpc.plugin_rescan()
-    assert not n.daemon.is_in_log(r"Plugin changed, needs restart.")
+    l1.rpc.plugin_rescan()
+    assert not l1.daemon.is_in_log(r"Plugin changed, needs restart.")
 
     # modify the file
     with open(path, 'w+') as file:
@@ -3023,10 +3272,10 @@ plugin.run()
     os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
 
     # rescan and check
-    n.rpc.plugin_rescan()
-    n.daemon.wait_for_log(r"Plugin changed, needs restart.")
-    n.daemon.wait_for_log(r"test_restart_on_update 2")
-    n.stop()
+    l1.rpc.plugin_rescan()
+    l1.daemon.wait_for_log(r"Plugin changed, needs restart.")
+    l1.daemon.wait_for_log(r"test_restart_on_update 2")
+    l1.stop()
 
 
 def test_plugin_shutdown(node_factory):
@@ -3083,7 +3332,7 @@ def test_commando(node_factory, executor):
 
     # Check JSON id is as expected (unfortunately pytest does not use a reliable name
     # for itself: with -k it calls itself `-c` here, instead of `pytest`).
-    l2.daemon.wait_for_log(r'plugin-commando: "[^:/]*:commando#[0-9]*/cln:commando#[0-9]*"\[OUT\]')
+    l2.daemon.wait_for_log(r'plugin-commando: [^:/]*:commando#[0-9]*/cln:commando#[0-9]*\[OUT\]')
     l1.daemon.wait_for_log(r'jsonrpc#[0-9]*: "[^:/]*:commando#[0-9]*/cln:commando#[0-9]*/commando:listpeers#[0-9]*"\[IN\]')
 
     res = l2.rpc.call(method='commando',
@@ -3292,12 +3541,12 @@ def test_autoclean(node_factory):
 
     # Reconnect, l1 pays invoice, we test paid expiry.
     l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
-    l1.rpc.pay(inv4['bolt11'])
+    l1.rpc.xpay(inv4['bolt11'])
 
     # We manually delete inv5 so we can have l1 fail a payment.
     l3.rpc.delinvoice('inv5', 'unpaid')
-    with pytest.raises(RpcError, match='WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS'):
-        l1.rpc.pay(inv5['bolt11'])
+    with pytest.raises(RpcError, match="Destination said it doesn't know invoice: incorrect_or_unknown_payment_details"):
+        l1.rpc.xpay(inv5['bolt11'])
 
     assert l3.rpc.autoclean_status()['autoclean']['paidinvoices']['enabled'] is False
     assert l3.rpc.autoclean_status()['autoclean']['paidinvoices']['cleaned'] == 0
@@ -3373,10 +3622,10 @@ def test_autoclean_once(node_factory):
     inv2 = l3.rpc.invoice(amount_msat=12300, label='inv2', description='description4')
     inv3 = l3.rpc.invoice(amount_msat=12300, label='inv3', description='description5')
 
-    l1.rpc.pay(inv2['bolt11'])
+    l1.rpc.xpay(inv2['bolt11'])
     l3.rpc.delinvoice('inv3', 'unpaid')
-    with pytest.raises(RpcError, match='WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS'):
-        l1.rpc.pay(inv3['bolt11'])
+    with pytest.raises(RpcError, match="Destination said it doesn't know invoice: incorrect_or_unknown_payment_details"):
+        l1.rpc.xpay(inv3['bolt11'])
 
     # Default status
     default_status = {'autoclean': {'failedpays': {'enabled': False,
@@ -3433,10 +3682,26 @@ def test_autoclean_once(node_factory):
 def test_block_added_notifications(node_factory, bitcoind):
     """Test if a plugin gets notifications when a new block is found"""
     base = bitcoind.rpc.getblockchaininfo()["blocks"]
-    plugin = [
-        os.path.join(os.getcwd(), "tests/plugins/block_added.py"),
-    ]
-    l1 = node_factory.get_node(options={"plugin": plugin})
+
+    def make_setup():
+        blocks_catched = []
+
+        def setup(plugin):
+            @plugin.init()
+            def on_init(plugin, options, configuration, **kwargs):
+                blocks_catched.clear()
+
+            @plugin.subscribe("block_added")
+            def notify_block_added(plugin, block_added, **kwargs):
+                blocks_catched.append(block_added["height"])
+
+            @plugin.method("blockscatched")
+            def return_moves(plugin):
+                return blocks_catched
+
+        return setup
+
+    l1 = node_factory.get_node(inline_plugin=make_setup())
     ret = l1.rpc.call("blockscatched")
     assert len(ret) == 1 and ret[0] == base + 0
 
@@ -3445,7 +3710,7 @@ def test_block_added_notifications(node_factory, bitcoind):
     ret = l1.rpc.call("blockscatched")
     assert len(ret) == 3 and ret[0] == base + 0 and ret[2] == base + 2
 
-    l2 = node_factory.get_node(options={"plugin": plugin})
+    l2 = node_factory.get_node(inline_plugin=make_setup())
     ret = l2.rpc.call("blockscatched")
     assert len(ret) == 1 and ret[0] == base + 2
 
@@ -3725,6 +3990,8 @@ def test_sql(node_factory, bitcoind):
                          'type': 'boolean'},
                         {'name': 'single_use',
                          'type': 'boolean'},
+                        {'name': 'force_paths',
+                         'type': 'boolean'},
                         {'name': 'bolt12',
                          'type': 'string'},
                         {'name': 'description',
@@ -3886,9 +4153,6 @@ def test_sql(node_factory, bitcoind):
                          'type': 'u32'},
                         {'name': 'dust_limit_msat',
                          'type': 'msat'},
-                        {'name': 'max_total_htlc_in_msat',
-                         'type': 'msat',
-                         'deprecated': True},
                         {'name': 'their_max_htlc_value_in_flight_msat',
                          'type': 'msat'},
                         {'name': 'our_max_htlc_value_in_flight_msat',
@@ -4239,18 +4503,23 @@ def test_sql(node_factory, bitcoind):
     # Make sure we have a node_announcement for l1
     wait_for(lambda: l2.rpc.listnodes(l1.info['id'])['nodes'] != [])
 
+    # Under valgrind, the senders can still be digesting the blocks
+    # above and pick a stale blockheight for the payments below, which
+    # the caught-up peers reject as expiry_too_soon.
+    sync_blockheight(bitcoind, [l1, l2, l3])
+
     # This should create a forward through l2
-    l1.rpc.pay(l3.rpc.invoice(amount_msat=12300, label='inv1', description='description')['bolt11'])
+    l1.rpc.xpay(l3.rpc.invoice(amount_msat=12300, label='inv1', description='description')['bolt11'])
 
     # Very rough checks of other list commands (make sure l2 has one of each)
     l2.rpc.offer(1, 'desc')
     l2.rpc.invoice(1, 'label', 'desc')
-    l2.rpc.pay(l3.rpc.invoice(amount_msat=12300, label='inv2', description='description')['bolt11'])
+    l2.rpc.xpay(l3.rpc.invoice(amount_msat=12300, label='inv2', description='description')['bolt11'])
 
     # And I need at least one HTLC in-flight so listpeers.channels.htlcs isn't empty:
     l3.rpc.plugin_start(os.path.join(os.getcwd(), 'tests/plugins/hold_invoice.py'))
     inv = l3.rpc.invoice(amount_msat=12300, label='inv3', description='description')
-    route = l1.rpc.getroute(l3.info['id'], 12300, 1)['route']
+    route = l1.single_route(l3.info['id'], 12300)
     l1.rpc.sendpay(route, inv['payment_hash'], payment_secret=inv['payment_secret'])
     # And an in-flight channel open...
     l2.openchannel(l3, confirm=False, wait_for_announce=False)
@@ -4318,7 +4587,7 @@ def test_sql(node_factory, bitcoind):
     # This has to wait for the hold_invoice plugin to let go!
     open(os.path.join(l3.daemon.lightning_dir, TEST_NETWORK, "unhold"), "w").close()
     txid = only_one(l1.rpc.close(l2.info['id'])['txids'])
-    bitcoind.generate_block(13, wait_for_mempool=txid)
+    bitcoind.generate_block(73, wait_for_mempool=txid)
     wait_for(lambda: len(l3.rpc.listchannels(source=l1.info['id'])['channels']) == 0)
     assert len(l3.rpc.sql("SELECT * FROM channels WHERE source = X'{}';".format(l1.info['id']))['rows']) == 0
     l3.daemon.wait_for_log("Deleting channel: {}".format(scid))
@@ -4368,7 +4637,7 @@ def test_sql(node_factory, bitcoind):
 
     # Test json functions
     scidl1l3, _ = l1.fundchannel(l3)
-    l1.rpc.pay(l3.rpc.invoice(amount_msat=1000000, label='inv1000', description='description 1000 msat')['bolt11'])
+    l1.rpc.xpay(l3.rpc.invoice(amount_msat=1000000, label='inv1000', description='description 1000 msat')['bolt11'])
 
     # Two channels, l1->l3 *may* have an HTLC in flight.
     ret = l1.rpc.sql("SELECT json_object('peer_id', hex(pc.peer_id), 'alias', alias, 'scid', short_channel_id, 'htlcs',"
@@ -4393,19 +4662,25 @@ def test_sql(node_factory, bitcoind):
 
 
 def test_sql_deprecated(node_factory, bitcoind):
-    l1, l2 = node_factory.line_graph(2, opts=[{'allow-deprecated-apis': True, "broken_log": "DEPRECATED API USED: listpeerchannels.max_total_htlc_in_msat"}, {}])
+    l1, l2 = node_factory.line_graph(2, opts=[{'allow-deprecated-apis': True}, {}])
 
-    # With deprecated APIs, this is there.
-    ret = l1.rpc.sql("SELECT max_total_htlc_in_msat FROM peerchannels;")
-    assert ret == {'rows': [[-1]]}
-
-    # It's deprecated in l2, so that will fail!
-    with pytest.raises(RpcError, match="Deprecated column table peerchannels.max_total_htlc_in_msat"):
-        l2.rpc.sql("SELECT max_total_htlc_in_msat FROM peerchannels;")
+    # Even with deprecated APIs, this isn't there.
+    with pytest.raises(RpcError, match="query failed with no such column: max_total_htlc_in_msat"):
+        l1.rpc.sql("SELECT max_total_htlc_in_msat FROM peerchannels;")
 
     # But we can use a wildcard fine.
     ret = l2.rpc.sql("SELECT COUNT(*) FROM peerchannels;")
     assert ret == {'rows': [[1]]}
+
+
+def test_sql_limit_per_list(node_factory):
+    l1, l2, l3 = node_factory.line_graph(
+        3, wait_for_announce=True, opts=[{}, {"dev-sqllistlimit": 10}, {}]
+    )
+    for i in range(20):
+        inv = l3.rpc.invoice(1000, f"inv-{i}", f"inv-{i}")["bolt11"]
+        l1.rpc.xpay(inv)
+    l2.rpc.sql("SELECT created_index, payment_hash FROM channelmoves")
 
 
 def test_plugin_persist_option(node_factory):
@@ -4482,25 +4757,25 @@ def test_all_subscription(node_factory, directory):
 
 def test_dynamic_option_python_plugin(node_factory):
     plugin = os.path.join(os.getcwd(), "tests/plugins/dynamic_option.py")
-    ln = node_factory.get_node(options={"plugin": plugin})
-    result = ln.rpc.listconfigs("test-dynamic-config")
+    l1 = node_factory.get_node(options={"plugin": plugin})
+    result = l1.rpc.listconfigs("test-dynamic-config")
 
     assert result["configs"]["test-dynamic-config"]["value_str"] == "initial"
 
-    assert ln.rpc.dynamic_option_report() == {'test-dynamic-config': 'initial'}
-    result = ln.rpc.setconfig("test-dynamic-config", "changed")
+    assert l1.rpc.dynamic_option_report()['test-dynamic-config'] == 'initial'
+    result = l1.rpc.setconfig("test-dynamic-config", "changed")
     assert result["config"]["value_str"] == "changed"
-    assert ln.rpc.dynamic_option_report() == {'test-dynamic-config': 'changed'}
+    assert l1.rpc.dynamic_option_report()['test-dynamic-config'] == 'changed'
 
-    ln.daemon.wait_for_log(
+    l1.daemon.wait_for_log(
         'dynamic_option.py:.*Setting config test-dynamic-config to changed'
     )
 
     with pytest.raises(RpcError, match="I don't like bad values!"):
-        ln.rpc.setconfig("test-dynamic-config", "bad value")
+        l1.rpc.setconfig("test-dynamic-config", "bad value")
 
     # Does not alter value!
-    assert ln.rpc.dynamic_option_report() == {'test-dynamic-config': 'changed'}
+    assert l1.rpc.dynamic_option_report()['test-dynamic-config'] == 'changed'
 
 
 def test_renepay_not_important(node_factory):
@@ -4917,12 +5192,11 @@ def test_peer_storage(node_factory, bitcoind):
     assert not l2.daemon.is_in_log(r'PeerStorageFailed')
 
 
-@pytest.mark.parametrize("deprecated", [False, True])
-def test_pay_plugin_notifications(node_factory, bitcoind, chainparams, deprecated):
+def test_pay_plugin_notifications(node_factory, bitcoind, chainparams):
     plugin = os.path.join(os.getcwd(), 'tests/plugins/all_notifications.py')
-    opts = {"plugin": plugin}
-    if deprecated:
-        opts['allow-deprecated-apis'] = True
+    opts = {"plugin": plugin,
+            "xpay-handle-pay": False,
+            "allow-deprecated-apis": True}
 
     l1, l2, l3 = node_factory.line_graph(3, opts=[opts, {}, {}],
                                          wait_for_announce=True)
@@ -4955,9 +5229,8 @@ def test_pay_plugin_notifications(node_factory, bitcoind, chainparams, deprecate
                                 'enabled': True}
     channel_hint_update = {'origin': 'pay',
                            'channel_hint_update': channel_hint_update_core}
-    if deprecated:
-        # pyln-client's plugin.py duplicated payload into same name as update.
-        channel_hint_update['payload'] = {'channel_hint': channel_hint_update_core}
+    # pyln-client's plugin.py duplicated payload into same name as update.
+    channel_hint_update['payload'] = {'channel_hint': channel_hint_update_core}
 
     assert data == channel_hint_update
 
@@ -4969,9 +5242,8 @@ def test_pay_plugin_notifications(node_factory, bitcoind, chainparams, deprecate
                     'bolt11': inv1['bolt11']}
     success = {'origin': 'pay',
                'pay_success': success_core}
-    if deprecated:
-        # pyln-client's plugin.py duplicated payload into same name as update.
-        success['payload'] = success_core
+    # pyln-client's plugin.py duplicated payload into same name as update.
+    success['payload'] = success_core
     assert data == success
 
     inv2 = l3.rpc.invoice(10000, "second", "desc")
@@ -4985,9 +5257,8 @@ def test_pay_plugin_notifications(node_factory, bitcoind, chainparams, deprecate
     failure_core = {'payment_hash': inv2['payment_hash'], 'bolt11': inv2['bolt11'], 'error': {'message': 'failed: WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS (reply from remote)'}}
     failure = {'origin': 'pay',
                'pay_failure': failure_core}
-    if deprecated:
-        # pyln-client's plugin.py duplicated payload into same name as update.
-        failure['payload'] = failure_core
+    # pyln-client's plugin.py duplicated payload into same name as update.
+    failure['payload'] = failure_core
     assert data == failure
 
 
@@ -5003,3 +5274,1000 @@ def test_openchannel_hook_channel_type(node_factory, bitcoind):
         l2.daemon.wait_for_log(r"plugin-openchannel_hook_accepter.py: accept by design: channel_type {'bits': \[12, 22\], 'names': \['static_remotekey/even', 'anchors/even'\]}")
     else:
         l2.daemon.wait_for_log(r"plugin-openchannel_hook_accepter.py: accept by design: channel_type {'bits': \[12\], 'names': \['static_remotekey/even'\]}")
+
+
+def reverse_bitcoin_hash(hash_hex):
+    """Convert Bitcoin hash between display format and wire format.
+
+    Bitcoin hashes are stored in reverse byte order in the wire protocol
+    compared to how they're displayed in RPC calls.
+    """
+    return ''.join(reversed([hash_hex[i:i + 2] for i in range(0, len(hash_hex), 2)]))
+
+
+def test_bwatch_add_watch_creates_datastore_entry(node_factory, bitcoind):
+    """Test that adding a watch creates a datastore entry"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+    # Use an outpoint watch (scriptpubkey, outpoint, scid, blockdepth are the
+    # four watch types; there is no standalone txid type).
+    test_txid = "0" * 64
+    test_outpoint = f"{test_txid}:0"
+    l1.rpc.addoutpointwatch(owner='wallet/p2wpkh/0', outpoint=test_outpoint, start_block=100)
+
+    # Verify it's in the datastore
+    ds = l1.rpc.listdatastore(['bwatch', 'outpoint'])
+    assert any(d['key'] == ['bwatch', 'outpoint', test_outpoint] for d in ds['datastore'])
+
+
+def test_bwatch_multiple_owners_same_watch(node_factory, bitcoind):
+    """Test that multiple owners can watch the same thing"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    test_txid = "1" * 64
+    test_outpoint = f"{test_txid}:0"
+
+    # Add watch with two different owners for the same outpoint
+    l1.rpc.addoutpointwatch(owner='wallet/p2wpkh/0', outpoint=test_outpoint, start_block=100)
+    l1.rpc.addoutpointwatch(owner='wallet/p2tr/0', outpoint=test_outpoint, start_block=200)
+
+    # Should still be one datastore entry (one outpoint, two owners)
+    ds = l1.rpc.listdatastore(['bwatch', 'outpoint'])
+    assert sum(1 for d in ds['datastore'] if d['key'] == ['bwatch', 'outpoint', test_outpoint]) == 1
+
+
+def test_bwatch_same_owner_adds_twice(node_factory, bitcoind):
+    """Test that the same owner adding the same watch twice is idempotent"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    test_txid = "6" * 64
+    test_outpoint = f"{test_txid}:0"
+
+    # Add watch with start_block 100
+    l1.rpc.addoutpointwatch(owner='wallet/p2wpkh/0', outpoint=test_outpoint, start_block=100)
+
+    # Add same watch again with different start_block
+    l1.rpc.addoutpointwatch(owner='wallet/p2wpkh/0', outpoint=test_outpoint, start_block=200)
+
+    # Should log that owner already exists
+    l1.daemon.wait_for_log(r'Owner wallet/p2wpkh/0 already watching')
+
+    # Should still be just one datastore entry
+    ds = l1.rpc.listdatastore(['bwatch', 'outpoint'])
+    assert sum(1 for d in ds['datastore'] if d['key'] == ['bwatch', 'outpoint', test_outpoint]) == 1
+
+    # Removing once should delete the watch (only one owner, not two)
+    l1.rpc.deloutpointwatch(owner='wallet/p2wpkh/0', outpoint=test_outpoint)
+
+    ds = l1.rpc.listdatastore(['bwatch', 'outpoint'])
+    assert not any(d['key'] == ['bwatch', 'outpoint', test_outpoint] for d in ds['datastore'])
+
+
+def test_bwatch_remove_one_owner_keeps_watch(node_factory, bitcoind):
+    """Test that removing one owner doesn't remove the watch if others remain"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    test_txid = "2" * 64
+    test_outpoint = f"{test_txid}:0"
+
+    # Add watch with two owners
+    l1.rpc.addoutpointwatch(owner='wallet/p2wpkh/0', outpoint=test_outpoint, start_block=100)
+    l1.rpc.addoutpointwatch(owner='wallet/p2tr/0', outpoint=test_outpoint, start_block=100)
+
+    # Remove first owner
+    l1.rpc.deloutpointwatch(owner='wallet/p2wpkh/0', outpoint=test_outpoint)
+
+    # Watch should still exist (wallet/p2tr/0 is still watching)
+    ds = l1.rpc.listdatastore(['bwatch', 'outpoint'])
+    assert any(d['key'] == ['bwatch', 'outpoint', test_outpoint] for d in ds['datastore'])
+
+
+def test_bwatch_remove_last_owner_deletes_watch(node_factory, bitcoind):
+    """Test that removing the last owner deletes the datastore entry"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    test_txid = "3" * 64
+    test_outpoint = f"{test_txid}:0"
+
+    # Add watch with one owner
+    l1.rpc.addoutpointwatch(owner='wallet/p2wpkh/0', outpoint=test_outpoint, start_block=100)
+
+    # Verify it exists
+    ds = l1.rpc.listdatastore(['bwatch', 'outpoint'])
+    assert any(d['key'] == ['bwatch', 'outpoint', test_outpoint] for d in ds['datastore'])
+
+    # Remove the only owner
+    l1.rpc.deloutpointwatch(owner='wallet/p2wpkh/0', outpoint=test_outpoint)
+
+    # Watch should be gone
+    ds = l1.rpc.listdatastore(['bwatch', 'outpoint'])
+    assert not any(d['key'] == ['bwatch', 'outpoint', test_outpoint] for d in ds['datastore'])
+
+
+def test_bwatch_scriptpubkey_watch(node_factory, bitcoind):
+    """Test scriptpubkey watch datastore operations"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    # A simple P2PKH scriptpubkey — not used by the wallet (which uses P2WPKH/P2TR/P2SH-P2WPKH)
+    test_spk = "76a914" + "00" * 20 + "88ac"
+    expected_key = ['bwatch', 'scriptpubkey', test_spk]
+
+    l1.rpc.addscriptpubkeywatch(owner='wallet/p2wpkh/0', scriptpubkey=test_spk, start_block=100)
+
+    # Verify our specific key is in the datastore (wallet also has scriptpubkey entries)
+    ds = l1.rpc.listdatastore(['bwatch', 'scriptpubkey'])
+    assert any(d['key'] == expected_key for d in ds['datastore'])
+
+    # Remove it
+    l1.rpc.delscriptpubkeywatch(owner='wallet/p2wpkh/0', scriptpubkey=test_spk)
+
+    ds = l1.rpc.listdatastore(['bwatch', 'scriptpubkey'])
+    assert not any(d['key'] == expected_key for d in ds['datastore'])
+
+
+def test_bwatch_outpoint_watch(node_factory, bitcoind):
+    """Test outpoint watch datastore operations"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+    test_txid = "4" * 64
+    test_outpoint = f"{test_txid}:0"
+
+    l1.rpc.addoutpointwatch(owner='wallet/p2wpkh/0', outpoint=test_outpoint, start_block=100)
+
+    # Verify it's in the datastore (use any() since wallet may have its own outpoints)
+    ds = l1.rpc.listdatastore(['bwatch', 'outpoint'])
+    assert any(d['key'] == ['bwatch', 'outpoint', test_outpoint] for d in ds['datastore'])
+
+    # Remove it
+    l1.rpc.deloutpointwatch(owner='wallet/p2wpkh/0', outpoint=test_outpoint)
+
+    ds = l1.rpc.listdatastore(['bwatch', 'outpoint'])
+    assert not any(d['key'] == ['bwatch', 'outpoint', test_outpoint] for d in ds['datastore'])
+
+
+def test_bwatch_rescan_triggered_for_past_start_block(node_factory, bitcoind):
+    """Test that adding a watch with start_block in the past triggers a rescan"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    # Wait for bwatch to fully sync to chain tip
+    l1.daemon.wait_for_log(r'No block change')
+
+    # Get current height (now bwatch is synced)
+    info = l1.rpc.getinfo()
+    current_height = info['blockheight']
+
+    test_txid = "7" * 64
+    test_outpoint = f"{test_txid}:0"
+
+    # Add watch with start_block in the past (before current height)
+    start_block = current_height - 5
+    l1.rpc.addoutpointwatch(owner='wallet/p2wpkh/0', outpoint=test_outpoint, start_block=start_block)
+
+    # Should trigger a rescan
+    l1.daemon.wait_for_log(rf'Starting rescan for outpoint watch: blocks {start_block}-{current_height}')
+
+    # Rescan should complete
+    l1.daemon.wait_for_log(r'Rescan complete')
+
+
+def test_bwatch_no_rescan_for_future_start_block(node_factory, bitcoind):
+    """Test that adding a watch with start_block in the future doesn't trigger rescan"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    # Wait for bwatch to sync
+    wait_bwatch_caught_up(l1)
+
+    info = l1.rpc.getinfo()
+    current_height = info['blockheight']
+
+    test_txid = "8" * 64
+    test_outpoint = f"{test_txid}:0"
+
+    # Add watch with start_block in the future
+    future_block = current_height + 100
+    l1.rpc.addoutpointwatch(owner='wallet/p2wpkh/0', outpoint=test_outpoint, start_block=future_block)
+
+    # Should NOT trigger a rescan - give it a moment then check logs
+    import time
+    time.sleep(0.5)
+
+    # Check that no rescan was started for this watch
+    assert not l1.daemon.is_in_log(rf'Starting rescan.*blocks.*{future_block}')
+
+
+def test_bwatch_rescan_scriptpubkey(node_factory, bitcoind):
+    """Test that scriptpubkey watches also trigger rescan"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    # Wait for bwatch to fully sync
+    l1.daemon.wait_for_log(r'No block change')
+
+    info = l1.rpc.getinfo()
+    current_height = info['blockheight']
+
+    test_spk = "76a914" + "11" * 20 + "88ac"
+    start_block = current_height - 3
+
+    l1.rpc.addscriptpubkeywatch(owner='wallet/p2wpkh/0', scriptpubkey=test_spk, start_block=start_block)
+
+    l1.daemon.wait_for_log(rf'Starting rescan for scriptpubkey watch: blocks {start_block}-{current_height}')
+    l1.daemon.wait_for_log(r'Rescan complete')
+
+
+@pytest.mark.slow_test
+def test_bwatch_scriptpubkey_watch_notifies_lightningd(node_factory, bitcoind):
+    """Test that a matching scriptpubkey triggers watch_found to lightningd"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    # Wait for bwatch to fully sync
+    wait_bwatch_caught_up(l1)
+
+    # Get an address and its scriptpubkey
+    addr = l1.rpc.newaddr('bech32')['bech32']
+    addr_info = bitcoind.rpc.getaddressinfo(addr)
+    scriptpubkey = addr_info['scriptPubKey']
+
+    # Add a watch for this scriptpubkey with a wallet owner (p2wpkh uses keyindex 0 by default for newaddr)
+    l1.rpc.addscriptpubkeywatch(owner='wallet/p2wpkh/0', scriptpubkey=scriptpubkey, start_block=100)
+
+    # Send coins to that address (creates tx with matching scriptpubkey)
+    bitcoind.rpc.sendtoaddress(addr, 0.01)
+    bitcoind.generate_block(1)
+
+    # Wait for bwatch to process the block and send watch_found notification
+    l1.daemon.wait_for_log(r'watch_found at block', timeout=60)
+
+
+def test_bwatch_outpoint_watch_notifies_lightningd(node_factory, bitcoind):
+    """Test that spending a watched outpoint triggers watch_found to lightningd"""
+    l1, l2 = node_factory.get_nodes(2, opts=[dict(BWATCH_OPTS), dict(BWATCH_OPTS)])
+
+    # Wait for bwatch to be ready so wallet scriptpubkey watches are active
+    # before we mine the funding block.
+    l1.daemon.wait_for_log(r'No block change')
+    l2.daemon.wait_for_log(r'No block change')
+
+    # Fund l1 manually using listfunds to detect confirmation (bwatch populates
+    # the outputs table via watch_found when the scriptpubkey watch fires).
+    addr = l1.rpc.newaddr('bech32')['bech32']
+    bitcoind.rpc.sendtoaddress(addr, 10.0)
+    bitcoind.generate_block(1)
+    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0, timeout=60)
+
+    l1.connect(l2)
+    l1.fundchannel(l2, 1_000_000)
+
+    # Get the channel's funding outpoint (first channel has dbid 1)
+    channels = l1.rpc.listpeerchannels(l2.info['id'])['channels']
+    ch = only_one([c for c in channels if c['state'] == 'CHANNELD_NORMAL'])
+    outpoint = f"{ch['funding_txid']}:{ch['funding_outnum']}"
+
+    # channel/funding_spent/<dbid> is the real handler — the channel already
+    # registered it, so addoutpointwatch may report "already watching"; either
+    # way the watch exists and will fire when the funding is spent.
+    l1.rpc.addoutpointwatch(owner='channel/funding_spent/1', outpoint=outpoint, start_block=100)
+
+    txid = only_one(l1.rpc.close(l2.info['id'])['txids'])
+    bitcoind.generate_block(1, wait_for_mempool=txid)
+
+    l1.daemon.wait_for_log(r'watch_found at block', timeout=60)
+
+
+@pytest.mark.slow_test
+def test_bwatch_rescan_notifies_lightningd(node_factory, bitcoind):
+    """Test that matches found during rescan also trigger watch_found"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    # Get an address
+    addr = l1.rpc.newaddr('bech32')['bech32']
+    addr_info = bitcoind.rpc.getaddressinfo(addr)
+    scriptpubkey = addr_info['scriptPubKey']
+
+    # Send coins FIRST (before adding the watch)
+    bitcoind.rpc.sendtoaddress(addr, 0.01)
+    bitcoind.generate_block(1)
+
+    # Wait for bwatch to fully sync to the new block
+    import time
+    time.sleep(2)
+    l1.daemon.wait_for_log(r'No block change')
+
+    # Now get current height and add watch with start_block in the past
+    info = l1.rpc.getinfo()
+    start_block = info['blockheight'] - 1  # The block we just mined
+
+    # Add watch - should trigger rescan and find the tx
+    l1.rpc.addscriptpubkeywatch(owner='wallet/p2wpkh/0', scriptpubkey=scriptpubkey,
+                                start_block=start_block)
+
+    # Should trigger rescan
+    l1.daemon.wait_for_log(r'Starting rescan')
+
+    # Rescan should find the match and notify lightningd
+    l1.daemon.wait_for_log(r'watch_found at block', timeout=60)
+
+
+def test_bwatch_watches_persist_across_restart(node_factory, bitcoind):
+    """Test that watches are restored from datastore after restart"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+    test_txid = "5" * 64
+    test_outpoint = f"{test_txid}:0"
+
+    # Add an outpoint watch (persisted in bwatch datastore)
+    l1.rpc.addoutpointwatch(owner='wallet/p2wpkh/0', outpoint=test_outpoint, start_block=500)
+
+    # Restart the node
+    l1.restart()
+
+    # The watch should still be in the datastore after restart
+    ds = l1.rpc.listdatastore(['bwatch', 'outpoint'])
+    assert any(d['key'] == ['bwatch', 'outpoint', test_outpoint] for d in ds['datastore'])
+
+
+def test_bwatch_reorg_1_block(node_factory, bitcoind):
+    """Test bwatch handles a 1-block reorg correctly"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    # Wait for bwatch to initialize and sync to initial tip
+    wait_bwatch_caught_up(l1)
+
+    # Mine a few blocks to establish history
+    bitcoind.generate_block(5)
+    expected_height = bitcoind.rpc.getblockcount()
+    # Wait for bwatch to fully catch up (important: bwatch must have the block
+    # that will be reorged, otherwise it can't detect the reorg)
+    l1.daemon.wait_for_log(rf'Added block {expected_height} to history', timeout=60)
+    wait_for(lambda: any(e['key'][-1] == f"{expected_height:010d}"
+                         for e in l1.rpc.listdatastore(['bwatch', 'block_history'])['datastore']),
+             timeout=60)
+
+    # Get the actual number of blocks bwatch has stored before reorg
+    ds_before = l1.rpc.listdatastore(['bwatch', 'block_history'])
+    blocks_before = len(ds_before['datastore'])
+
+    # Get the hash of the last block (the one we'll reorg out)
+    height = bitcoind.rpc.getblockcount()
+    old_block_hash = bitcoind.rpc.getblockhash(height)
+    common_ancestor_hash = bitcoind.rpc.getblockhash(height - 1)
+
+    # Invalidate the last block (1-block reorg)
+    bitcoind.rpc.invalidateblock(old_block_hash)
+
+    # Mine 2 new blocks on the new chain
+    bitcoind.generate_block(2)
+
+    # bwatch should detect and handle the reorg
+    l1.daemon.wait_for_log(r'Reorg detected', timeout=60)
+    # Persisting rolled-forward blocks is async; don't assert immediately after
+    # "Reorg detected" (see test_bwatch_reorg_2_blocks).
+    l1.daemon.wait_for_log(r'No block change', timeout=60)
+
+    # Verify bwatch's block history matches bitcoind's new chain
+    new_height = bitcoind.rpc.getblockcount()
+    # After reorg: removed 1 old block, added 2 new blocks, so net +1
+    wait_for(lambda: len(l1.rpc.listdatastore(['bwatch', 'block_history'])['datastore'])
+             == blocks_before + 1,
+             timeout=60)
+
+    ds = l1.rpc.listdatastore(['bwatch', 'block_history'])
+
+    # Verify the common ancestor is still present with correct hash
+    ancestor_entry = next((e for e in ds['datastore']
+                          if e['key'][-1] == f"{height - 1:010d}"), None)
+    assert ancestor_entry is not None
+    # Decode the block record and verify hash matches
+    assert reverse_bitcoin_hash(common_ancestor_hash) in str(ancestor_entry['hex'])
+
+    # Verify the old block hash is not in datastore
+    for entry in ds['datastore']:
+        assert reverse_bitcoin_hash(old_block_hash) not in str(entry['hex'])
+
+    # Verify the new tip matches bitcoind
+    new_tip_hash = bitcoind.rpc.getblockhash(new_height)
+    tip_entry = next((e for e in ds['datastore']
+                     if e['key'][-1] == f"{new_height:010d}"), None)
+    assert tip_entry is not None
+    assert reverse_bitcoin_hash(new_tip_hash) in str(tip_entry['hex'])
+
+
+@pytest.mark.slow_test
+def test_bwatch_reorg_2_blocks(node_factory, bitcoind):
+    """Test bwatch handles a 2-block reorg correctly"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    # Wait for bwatch to initialize
+    wait_bwatch_caught_up(l1)
+
+    # Mine some blocks
+    bitcoind.generate_block(5)
+    expected_height = bitcoind.rpc.getblockcount()
+    l1.daemon.wait_for_log(rf'Added block {expected_height} to history')
+
+    # Get the hash of block to reorg from (2 blocks back)
+    height = bitcoind.rpc.getblockcount()
+    old_block1_hash = bitcoind.rpc.getblockhash(height - 1)
+    old_block2_hash = bitcoind.rpc.getblockhash(height)
+    common_ancestor_hash = bitcoind.rpc.getblockhash(height - 2)
+
+    # Invalidate to cause 2-block reorg
+    bitcoind.rpc.invalidateblock(old_block1_hash)
+
+    # Mine longer chain
+    bitcoind.generate_block(4)
+    time.sleep(2)
+
+    # bwatch should detect and handle the reorg
+    l1.daemon.wait_for_log(r'Reorg detected', timeout=60)
+    # Wait for bwatch to finish processing the new chain
+    l1.daemon.wait_for_log(r'No block change')
+
+    # Verify bwatch's block history matches bitcoind's new chain
+    new_height = bitcoind.rpc.getblockcount()
+
+    # Check that bwatch has correct number of blocks (from its start height, not genesis)
+    initial_height = 101  # regtest starts at this height
+    expected_blocks = new_height - initial_height + 1
+
+    # Wait for datastore to be fully updated
+    wait_for(lambda: len(l1.rpc.listdatastore(['bwatch', 'block_history'])['datastore']) == expected_blocks, timeout=60)
+
+    ds = l1.rpc.listdatastore(['bwatch', 'block_history'])
+
+    # Verify the common ancestor is still present with correct hash
+    ancestor_entry = next((e for e in ds['datastore']
+                          if e['key'][-1] == f"{height - 2:010d}"), None)
+    assert ancestor_entry is not None
+    assert reverse_bitcoin_hash(common_ancestor_hash) in str(ancestor_entry['hex'])
+
+    # Verify the old block hashes are not in datastore
+    for entry in ds['datastore']:
+        assert reverse_bitcoin_hash(old_block1_hash) not in str(entry['hex'])
+        assert reverse_bitcoin_hash(old_block2_hash) not in str(entry['hex'])
+
+    # Verify the new tip matches bitcoind
+    new_tip_hash = bitcoind.rpc.getblockhash(new_height)
+    tip_entry = next((e for e in ds['datastore']
+                     if e['key'][-1] == f"{new_height:010d}"), None)
+    assert tip_entry is not None
+    assert reverse_bitcoin_hash(new_tip_hash) in str(tip_entry['hex'])
+
+
+def test_bwatch_reorg_long_chain(node_factory, bitcoind):
+    """Test bwatch handles a longer reorg (5+ blocks)"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    # Wait for bwatch to initialize and sync to initial tip
+    wait_bwatch_caught_up(l1)
+
+    # Mine 10 blocks and wait for bwatch to fully catch up
+    bitcoind.generate_block(10)
+    expected_height = bitcoind.rpc.getblockcount()
+    l1.daemon.wait_for_log(rf'Added block {expected_height} to history')
+
+    # Reorg 5 blocks - save hashes of blocks that will be reorged out
+    height = bitcoind.rpc.getblockcount()
+    common_ancestor_height = height - 5
+    common_ancestor_hash = bitcoind.rpc.getblockhash(common_ancestor_height)
+    old_hashes = [bitcoind.rpc.getblockhash(h)
+                  for h in range(common_ancestor_height + 1, height + 1)]
+
+    reorg_from_hash = bitcoind.rpc.getblockhash(
+        common_ancestor_height + 1)
+    bitcoind.rpc.invalidateblock(reorg_from_hash)
+
+    # Mine longer replacement chain
+    bitcoind.generate_block(8)
+    time.sleep(3)
+
+    # Should handle the deep reorg
+    l1.daemon.wait_for_log(r'Reorg detected')
+
+    # Verify bwatch's block history matches bitcoind's new chain
+    new_height = bitcoind.rpc.getblockcount()
+
+    # Wait for bwatch to fully sync to the new chain height
+    # bwatch stores blocks from initial height (101), not genesis
+    initial_height = 101  # regtest starts at this height
+    expected_blocks = new_height - initial_height + 1
+    wait_for(lambda: len(l1.rpc.listdatastore(['bwatch', 'block_history'])['datastore']) == expected_blocks)
+
+    ds = l1.rpc.listdatastore(['bwatch', 'block_history'])
+
+    # Check that bwatch has correct number of blocks
+    assert len(ds['datastore']) == expected_blocks
+
+    # Verify the common ancestor is still present with correct hash
+    ancestor_entry = next((e for e in ds['datastore']
+                          if e['key'][-1] == f"{common_ancestor_height:010d}"),
+                          None)
+    assert ancestor_entry is not None
+    assert reverse_bitcoin_hash(common_ancestor_hash) in str(ancestor_entry['hex'])
+
+    # Verify none of the old block hashes are in datastore
+    for entry in ds['datastore']:
+        for old_hash in old_hashes:
+            assert reverse_bitcoin_hash(old_hash) not in str(entry['hex'])
+
+    # Verify the new tip matches bitcoind
+    new_tip_hash = bitcoind.rpc.getblockhash(new_height)
+    tip_entry = next((e for e in ds['datastore']
+                     if e['key'][-1] == f"{new_height:010d}"), None)
+    assert tip_entry is not None
+    assert reverse_bitcoin_hash(new_tip_hash) in str(tip_entry['hex'])
+
+
+@pytest.mark.slow_test
+def test_bwatch_reorg_at_startup(node_factory, bitcoind):
+    """Test bwatch handles reorg that happened while node was down"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    # Wait for bwatch to initialize and fully sync
+    wait_bwatch_caught_up(l1)
+
+    bitcoind.generate_block(5)
+    expected_height = bitcoind.rpc.getblockcount()
+    # Wait for bwatch to catch up to these new blocks
+    l1.daemon.wait_for_log(rf'Added block {expected_height} to history', timeout=60)
+
+    # Get block hash before stopping
+    height = bitcoind.rpc.getblockcount()
+    reorg_from_hash = bitcoind.rpc.getblockhash(height - 2)
+
+    # Stop the node
+    l1.stop()
+
+    # Cause a reorg while node is down
+    bitcoind.rpc.invalidateblock(reorg_from_hash)
+    bitcoind.generate_block(5)
+
+    # Restart the node
+    l1.start()
+
+    # bwatch should detect the chain changed and handle reorg during catch-up
+    # (reorg detection happens during catch-up, before "initialized" message)
+    l1.daemon.wait_for_log(r'Reorg detected', timeout=60)
+
+    # Wait for it to finish syncing
+    l1.daemon.wait_for_log(r'No block change')
+
+    # Verify the node is tracking the correct chain
+    info = l1.rpc.getinfo()
+    assert info['blockheight'] == bitcoind.rpc.getblockcount()
+
+
+@pytest.mark.slow_test
+def test_bwatch_block_history_rollback(node_factory, bitcoind):
+    """Test that block history is correctly rolled back during reorg"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    # Wait for bwatch to fully sync
+    wait_bwatch_caught_up(l1)
+
+    # Mine blocks
+    bitcoind.generate_block(5)
+    expected_height = bitcoind.rpc.getblockcount()
+
+    # Wait for bwatch to process the new blocks
+    l1.daemon.wait_for_log(rf'Added block {expected_height} to history', timeout=60)
+
+    # Check block history exists in datastore
+    initial_height = 101  # regtest starts at this height
+    expected_initial_blocks = expected_height - initial_height + 1
+    wait_for(lambda: len(l1.rpc.listdatastore(['bwatch', 'block_history'])['datastore']) == expected_initial_blocks, timeout=60)
+
+    ds = l1.rpc.listdatastore(['bwatch', 'block_history'])
+    initial_count = len(ds['datastore'])
+    # bwatch stores blocks from its start height (101), so we should have at least 5 new blocks
+    assert initial_count >= 5
+
+    # Cause a 3-block reorg - save hashes of blocks that will be reorged
+    height = bitcoind.rpc.getblockcount()
+    common_ancestor_height = height - 3
+    common_ancestor_hash = bitcoind.rpc.getblockhash(common_ancestor_height)
+    old_hashes = [bitcoind.rpc.getblockhash(h)
+                  for h in range(common_ancestor_height + 1, height + 1)]
+
+    reorg_from_hash = bitcoind.rpc.getblockhash(
+        common_ancestor_height + 1)
+    bitcoind.rpc.invalidateblock(reorg_from_hash)
+    bitcoind.generate_block(5)
+
+    # Verify reorg was handled
+    l1.daemon.wait_for_log(r'Reorg detected', timeout=60)
+    # Wait for bwatch to finish syncing to the new chain
+    l1.daemon.wait_for_log(r'No block change')
+
+    # Verify block history after reorg
+    ds = l1.rpc.listdatastore(['bwatch', 'block_history'])
+    new_height = bitcoind.rpc.getblockcount()
+
+    # Should have correct number of blocks (from its start height, not genesis)
+    initial_height = 101  # regtest starts at this height
+    expected_blocks = new_height - initial_height + 1
+    assert len(ds['datastore']) == expected_blocks
+
+    # Verify the common ancestor is still present with correct hash
+    ancestor_entry = next((e for e in ds['datastore']
+                          if e['key'][-1] == f"{common_ancestor_height:010d}"),
+                          None)
+    assert ancestor_entry is not None
+    assert reverse_bitcoin_hash(common_ancestor_hash) in str(ancestor_entry['hex'])
+
+    # Verify old block hashes are not present
+    for entry in ds['datastore']:
+        for old_hash in old_hashes:
+            assert reverse_bitcoin_hash(old_hash) not in str(entry['hex'])
+
+    # Verify all blocks from common ancestor to tip match bitcoind
+    for h in range(common_ancestor_height, new_height + 1):
+        expected_hash = bitcoind.rpc.getblockhash(h)
+        block_entry = next((e for e in ds['datastore']
+                           if e['key'][-1] == f"{h:010d}"), None)
+        assert block_entry is not None
+        assert reverse_bitcoin_hash(expected_hash) in str(block_entry['hex'])
+
+
+def test_bwatch_spk_watch_reorg_demotes_outputs(node_factory, bitcoind):
+    """A reorg that disconnects a deposit's block must undo the confirmation:
+    the wallet's scriptpubkey watch_revert handler demotes the rows in
+    our_outputs/our_txs to unconfirmed (it must not delete them, or state
+    like reservations would be lost), matching the legacy output demoted
+    via its blocks FK.  The funds show as unconfirmed until the tx
+    confirms again.
+    """
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+    wait_bwatch_caught_up(l1)
+
+    addr = l1.rpc.newaddr('bech32')['bech32']
+    txid = bitcoind.rpc.sendtoaddress(addr, 1.0)
+    bitcoind.generate_block(1, wait_for_mempool=txid)
+    deposit_height = bitcoind.rpc.getblockcount()
+
+    # The perennial wallet scriptpubkey watch discovers the deposit.
+    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == 1)
+    output = only_one(l1.rpc.listfunds()['outputs'])
+    assert output['txid'] == txid
+    assert output['status'] == 'confirmed'
+    assert output['blockheight'] == deposit_height
+    assert output['amount_msat'] == 100_000_000_000
+
+    assert l1.db_query('SELECT blockheight, spendheight FROM our_outputs') \
+        == [{'blockheight': deposit_height, 'spendheight': None}]
+    assert (l1.db_query('SELECT blockheight FROM our_txs')
+            == [{'blockheight': deposit_height}])
+    assert l1.db_query('SELECT COUNT(*) AS c FROM outputs')[0]['c'] == 1
+
+    # bwatch must have observed the deposit block before we reorg it away:
+    # if it's height-based fetch grabs the replacement block instead, it never
+    # sees a reorg.
+    l1.daemon.wait_for_log(rf'Added block {deposit_height} to history', timeout=60)
+
+    # Reorg the deposit block away.  Deprioritize the returned mempool tx
+    # (same trick as simple_reorg) so the replacement blocks don't just
+    # re-confirm it.
+    bitcoind.rpc.invalidateblock(bitcoind.rpc.getblockhash(deposit_height))
+    memp = bitcoind.rpc.getrawmempool()
+    assert txid in memp
+    for t in memp:
+        bitcoind.rpc.prioritisetransaction(t, None, -1000000)
+    bitcoind.generate_block(2)
+
+    l1.daemon.wait_for_log(r'Reorg detected', timeout=60)
+
+    # watch_revert demotes the discovered output and its tx to unconfirmed
+    # (the 0 sentinel); the rows survive, keeping reservations and close
+    # metadata intact.  The legacy mirror row is demoted the same way by
+    # the blocks FK when chaintopology removes the block.
+    wait_for(lambda: l1.db_query('SELECT blockheight, spendheight FROM our_outputs')
+             == [{'blockheight': 0, 'spendheight': None}])
+    wait_for(lambda: l1.db_query('SELECT blockheight FROM our_txs')
+             == [{'blockheight': 0}])
+    wait_for(lambda: l1.db_query('SELECT confirmation_height AS h FROM outputs')
+             == [{'h': None}])
+    assert only_one(l1.rpc.listfunds()['outputs'])['status'] == 'unconfirmed'
+
+    # Re-confirm the same tx on the new chain: the (still armed) perennial
+    # watch rediscovers it at its new height.
+    for t in memp:
+        bitcoind.rpc.prioritisetransaction(t, None, 1000000)
+    bitcoind.generate_block(1, wait_for_mempool=txid)
+    new_height = bitcoind.rpc.getblockcount()
+    assert new_height != deposit_height
+
+    # The demoted row is still listed (unconfirmed), so wait for the
+    # re-confirmation to promote it rather than for it to appear.
+    wait_for(lambda: only_one(l1.rpc.listfunds()['outputs'])['status'] == 'confirmed')
+    output = only_one(l1.rpc.listfunds()['outputs'])
+    assert output['txid'] == txid
+    assert output['blockheight'] == new_height
+
+    assert l1.db_query('SELECT blockheight, spendheight FROM our_outputs') \
+        == [{'blockheight': new_height, 'spendheight': None}]
+    assert (l1.db_query('SELECT blockheight FROM our_txs')
+            == [{'blockheight': new_height}])
+
+    # Coin movements are append-only across the reorg: the re-confirmed
+    # deposit must be deduplicated, not recorded twice.
+    assert l1.db_query('SELECT COUNT(*) AS c FROM chain_moves')[0]['c'] == 1
+
+
+@pytest.mark.slow_test
+def test_bwatch_listwatch(node_factory, bitcoind):
+    """Test that listwatch RPC returns all active watches"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    # Add an outpoint watch — clearly not a real UTXO.
+    test_outpoint_a_txid = "a" * 64
+    test_outpoint_a = f"{test_outpoint_a_txid}:0"
+    l1.rpc.addoutpointwatch(owner='wallet/p2wpkh/0', outpoint=test_outpoint_a, start_block=100)
+
+    # Add a P2PKH scriptpubkey watch — not used by the wallet (P2WPKH/P2TR/P2SH-P2WPKH only).
+    test_scriptpubkey = "76a914" + "b" * 40 + "88ac"
+    l1.rpc.addscriptpubkeywatch(owner='wallet/p2tr/0', scriptpubkey=test_scriptpubkey, start_block=200)
+
+    # Add a second outpoint watch
+    test_outpoint_c_txid = "c" * 64
+    test_outpoint_c = f"{test_outpoint_c_txid}:1"
+    l1.rpc.addoutpointwatch(owner='wallet/p2sh_p2wpkh/0', outpoint=test_outpoint_c, start_block=150)
+
+    # Add a second owner to the first outpoint watch
+    l1.rpc.addoutpointwatch(owner='wallet/p2tr/0', outpoint=test_outpoint_a, start_block=50)
+
+    # The wallet registers its own scriptpubkey watches at startup, and on a
+    # slow machine that registration can land at any point during the test,
+    # so a total-count baseline races it.  Count only this test's watches,
+    # which no background registration can perturb.
+    def our_watches(watches):
+        return [w for w in watches
+                if w.get('outpoint') in (test_outpoint_a, test_outpoint_c)
+                or w.get('scriptpubkey') == test_scriptpubkey]
+
+    result = l1.rpc.listwatch()
+    watches = result['watches']
+
+    # 3 unique watches: the two adds for the same outpoint merged into one
+    assert len(our_watches(watches)) == 3
+
+    # Find each test watch by its unique identifier
+    outpoint_a_watch = next((w for w in watches if w.get('outpoint') == test_outpoint_a), None)
+    scriptpubkey_watch = next((w for w in watches if w.get('scriptpubkey') == test_scriptpubkey), None)
+    outpoint_c_watch = next((w for w in watches if w.get('outpoint') == test_outpoint_c), None)
+
+    # Verify first outpoint watch (two owners, start_block is the minimum)
+    assert outpoint_a_watch is not None
+    assert outpoint_a_watch['start_block'] == 50  # minimum of 100 and 50
+    assert len(outpoint_a_watch['owners']) == 2
+    assert 'wallet/p2wpkh/0' in outpoint_a_watch['owners']
+    assert 'wallet/p2tr/0' in outpoint_a_watch['owners']
+
+    # Verify scriptpubkey watch
+    assert scriptpubkey_watch is not None
+    assert scriptpubkey_watch['start_block'] == 200
+    assert len(scriptpubkey_watch['owners']) == 1
+    assert scriptpubkey_watch['owners'][0] == 'wallet/p2tr/0'
+
+    # Verify second outpoint watch
+    assert outpoint_c_watch is not None
+    assert outpoint_c_watch['start_block'] == 150
+    assert len(outpoint_c_watch['owners']) == 1
+    assert outpoint_c_watch['owners'][0] == 'wallet/p2sh_p2wpkh/0'
+
+    # Remove one owner from first outpoint watch — watch itself should remain
+    l1.rpc.deloutpointwatch(owner='wallet/p2wpkh/0', outpoint=test_outpoint_a)
+
+    watches = l1.rpc.listwatch()['watches']
+    assert len(our_watches(watches)) == 3
+    outpoint_a_watch = next(w for w in watches if w.get('outpoint') == test_outpoint_a)
+    assert len(outpoint_a_watch['owners']) == 1
+    assert outpoint_a_watch['owners'][0] == 'wallet/p2tr/0'
+
+    # Remove the last owner — outpoint watch should disappear entirely
+    l1.rpc.deloutpointwatch(owner='wallet/p2tr/0', outpoint=test_outpoint_a)
+
+    watches = l1.rpc.listwatch()['watches']
+    assert len(our_watches(watches)) == 2
+    assert not any(w.get('outpoint') == test_outpoint_a for w in watches)
+
+
+# =============================================================================
+# Blockdepth watch tests
+# =============================================================================
+
+def test_bwatch_blockdepth_watch_creates_datastore_entry(node_factory, bitcoind):
+    """Test that adding a blockdepth watch creates a datastore entry"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    # Wait for bwatch to sync
+    l1.daemon.wait_for_log(r'No block change')
+
+    info = l1.rpc.getinfo()
+    start_block = info['blockheight']
+
+    owner = "channel/funding_depth/999"
+    l1.rpc.addblockdepthwatch(owner=owner, start_block=start_block)
+
+    # Blockdepth watches are stored under ['bwatch', 'blockdepth', <start_block>]
+    ds = l1.rpc.listdatastore(['bwatch', 'blockdepth'])
+    blockdepth_keys = [d.get('key') for d in ds['datastore'] if d.get('key', [])[:2] == ['bwatch', 'blockdepth']]
+    assert any(
+        k[-1] == str(start_block) for k in blockdepth_keys
+    ), f"Expected blockdepth watch for start_block {start_block}, got keys: {blockdepth_keys}"
+
+    # Also verify via listwatch
+    watches = l1.rpc.listwatch()['watches']
+    bdw = [w for w in watches if w.get('type') == 'blockdepth' and owner in w.get('owners', [])]
+    assert len(bdw) == 1, f"Expected one blockdepth watch with owner {owner}, got: {watches}"
+    assert bdw[0]['start_block'] == start_block
+
+
+def test_bwatch_blockdepth_watch_remove(node_factory, bitcoind):
+    """Test that deleting a blockdepth watch removes it from the datastore"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    l1.daemon.wait_for_log(r'No block change')
+
+    info = l1.rpc.getinfo()
+    start_block = info['blockheight']
+
+    owner = f"channel/funding_depth/888"
+    l1.rpc.addblockdepthwatch(owner=owner, start_block=start_block)
+
+    # Verify it's present
+    watches = l1.rpc.listwatch()['watches']
+    assert any(owner in w.get('owners', []) for w in watches if w.get('type') == 'blockdepth')
+
+    # Delete it
+    l1.rpc.delblockdepthwatch(owner=owner, start_block=start_block)
+
+    watches = l1.rpc.listwatch()['watches']
+    assert not any(owner in w.get('owners', []) for w in watches if w.get('type') == 'blockdepth')
+
+
+def test_bwatch_blockdepth_watch_multiple_owners(node_factory, bitcoind):
+    """Test that multiple owners can share a blockdepth watch at the same start_block"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    l1.daemon.wait_for_log(r'No block change')
+
+    info = l1.rpc.getinfo()
+    start_block = info['blockheight']
+
+    owner_a = "channel/funding_depth/777"
+    owner_b = "channel/funding_depth/778"
+
+    l1.rpc.addblockdepthwatch(owner=owner_a, start_block=start_block)
+    l1.rpc.addblockdepthwatch(owner=owner_b, start_block=start_block)
+
+    watches = l1.rpc.listwatch()['watches']
+    bdw = [w for w in watches if w.get('type') == 'blockdepth'
+           and (owner_a in w.get('owners', []) or owner_b in w.get('owners', []))]
+    # Both owners may share one watch entry or appear in separate entries depending
+    # on whether bwatch merges same-start_block watches; either way both owners present.
+    all_owners = [o for w in bdw for o in w.get('owners', [])]
+    assert owner_a in all_owners
+    assert owner_b in all_owners
+
+    # Removing one owner keeps the watch (the other remains)
+    l1.rpc.delblockdepthwatch(owner=owner_a, start_block=start_block)
+    watches = l1.rpc.listwatch()['watches']
+    assert not any(owner_a in w.get('owners', []) for w in watches if w.get('type') == 'blockdepth')
+    assert any(owner_b in w.get('owners', []) for w in watches if w.get('type') == 'blockdepth')
+
+    # Removing the last owner deletes the entry entirely
+    l1.rpc.delblockdepthwatch(owner=owner_b, start_block=start_block)
+    watches = l1.rpc.listwatch()['watches']
+    assert not any(owner_b in w.get('owners', []) for w in watches if w.get('type') == 'blockdepth')
+
+
+@pytest.mark.slow_test
+def test_bwatch_blockdepth_watch_fires_each_block(node_factory, bitcoind):
+    """Test that a blockdepth watch fires watch_found for every block >= start_block"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    l1.daemon.wait_for_log(r'No block change')
+
+    info = l1.rpc.getinfo()
+    start_block = info['blockheight'] + 1  # watch starts at the next block
+
+    # Use a channel/funding_depth/ owner so watchman dispatches it
+    owner = "channel/funding_depth/42"
+    l1.rpc.addblockdepthwatch(owner=owner, start_block=start_block)
+
+    # Mine the block that triggers the watch
+    bitcoind.generate_block(1)
+
+    # watch_found (blockdepth) should be logged — depth==1 at start_block
+    l1.daemon.wait_for_log(r'watch_found at block.*blockdepth', timeout=60)
+
+    # Mine another block — the watch fires again (it fires every block until deleted)
+    bitcoind.generate_block(1)
+    l1.daemon.wait_for_log(r'watch_found at block.*blockdepth', timeout=60)
+
+    # Clean up
+    l1.rpc.delblockdepthwatch(owner=owner, start_block=start_block)
+
+
+@pytest.mark.slow_test
+def test_bwatch_blockdepth_watch_persists_across_restart(node_factory, bitcoind):
+    """Test that a blockdepth watch survives a node restart"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    l1.daemon.wait_for_log(r'No block change')
+
+    info = l1.rpc.getinfo()
+    start_block = info['blockheight']
+
+    owner = "channel/funding_depth/55"
+    l1.rpc.addblockdepthwatch(owner=owner, start_block=start_block)
+
+    # Verify present before restart
+    watches = l1.rpc.listwatch()['watches']
+    assert any(owner in w.get('owners', []) for w in watches if w.get('type') == 'blockdepth')
+
+    l1.restart()
+    l1.daemon.wait_for_log(r'No block change')
+
+    # Watch should be reloaded from bwatch's datastore after restart
+    watches = l1.rpc.listwatch()['watches']
+    assert any(owner in w.get('owners', []) for w in watches if w.get('type') == 'blockdepth')
+
+    # Clean up
+    l1.rpc.delblockdepthwatch(owner=owner, start_block=start_block)
+
+
+def test_bwatch_blockdepth_watch_no_fire_before_start_block(node_factory, bitcoind):
+    """Test that a blockdepth watch with a future start_block doesn't fire early"""
+    l1 = node_factory.get_node(options=BWATCH_OPTS)
+
+    l1.daemon.wait_for_log(r'No block change')
+
+    info = l1.rpc.getinfo()
+    # Set start_block well in the future so it cannot fire during this test
+    future_start = info['blockheight'] + 1000
+
+    owner = "channel/funding_depth/11"
+    l1.rpc.addblockdepthwatch(owner=owner, start_block=future_start)
+
+    # Mine a block — watch must NOT fire (start_block is 1000 blocks away)
+    bitcoind.generate_block(1)
+    import time
+    time.sleep(1)
+
+    # No blockdepth watch_found should have been logged for our start_block
+    assert not l1.daemon.is_in_log(
+        rf'watch_found at block.*blockdepth.*{future_start}'
+    )
+
+    # Verify watch is still present
+    watches = l1.rpc.listwatch()['watches']
+    assert any(owner in w.get('owners', []) for w in watches if w.get('type') == 'blockdepth')
+
+    # Clean up
+    l1.rpc.delblockdepthwatch(owner=owner, start_block=future_start)
+
+
+def test_command_collision(node_factory):
+    """We add a new method with the inline plugin. Then try to register the same
+    method with another dynamic plugin. lightningd should report back a name
+    collision."""
+
+    def some_plugin(plugin):
+        @plugin.method("myrpcmethod")
+        def on_mymethod(plugin):
+            return {}
+
+    l1 = node_factory.get_node(inline_plugin=some_plugin)
+
+    # try register plugin with "myrpcmethod" collision
+    with pytest.raises(
+        RpcError, match="a method with that name is already registered by plugin"
+    ):
+        l1.rpc.plugin_start(
+            plugin=os.path.join(os.getcwd(), "tests/plugins/method_collision.py")
+        )
+
+    # try register plugin with "getinfo" method which is builtin
+    with pytest.raises(
+        RpcError, match="a builtin method with that name is already registered"
+    ):
+        l1.rpc.plugin_start(
+            plugin=os.path.join(os.getcwd(), "tests/plugins/builtin_collision.py")
+        )

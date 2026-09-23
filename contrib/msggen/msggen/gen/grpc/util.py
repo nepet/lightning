@@ -9,8 +9,8 @@ typemap = {
     "msat": "Amount",
     "msat_or_all": "AmountOrAll",
     "msat_or_any": "AmountOrAny",
-    "sat": "Amount",
-    "sat_or_all": "AmountOrAll",
+    "sat": "AmountSat",
+    "sat_or_all": "AmountSatOrAll",
     "currency": "string",
     "number": "double",
     "pubkey": "bytes",
@@ -36,6 +36,9 @@ typemap = {
     "bip340sig": "string",
     "hash": "bytes",
     "string_map": "map<string, string>",
+    "json_object_or_array": "JsonObjectOrArray",
+    "json_scalar": "JsonScalar",
+    "proof_field": "ProofField",
 }
 
 

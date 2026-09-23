@@ -114,10 +114,15 @@ static struct command_result *param_layer_names(struct command *cmd,
 
 		/* Must be a known layer name */
 		if (streq((*arr)[i], "auto.localchans")
-		    || streq((*arr)[i], "auto.no_mpp_support")
 		    || streq((*arr)[i], "auto.sourcefree")
 		    || streq((*arr)[i], "auto.include_fees"))
 			continue;
+
+		if (streq((*arr)[i], "auto.no_mpp_support")
+		    && command_deprecated_in_ok(cmd, "layers.auto.no_mpp_support",
+						"v26.06", "v27.03"))
+			continue;
+
 		if (!find_layer(get_askrene(cmd->plugin), (*arr)[i])) {
 			return command_fail_badparam(cmd, name, buffer, t,
 						     "unknown layer");
@@ -264,7 +269,8 @@ static struct layer *remove_small_channel_layer(const tal_t *ctx,
 						struct amount_msat min_amount,
 						struct gossmap_localmods *localmods)
 {
-	struct layer *layer = new_temp_layer(ctx, askrene, "auto.no_mpp_support");
+	/* We use the prefix auto. to avoid clashing */
+	struct layer *layer = new_temp_layer(ctx, askrene, "auto.remove_small_channels");
 	struct gossmap *gossmap = askrene->gossmap;
 	struct gossmap_chan *c;
 
@@ -311,7 +317,7 @@ static const char *cmd_log(const tal_t *ctx,
 	if (level != LOG_DBG)
 		plugin_log(cmd->plugin,
 			   level == LOG_BROKEN ? level : level - 1,
-			   "%s: %s", cmd->id, msg);
+			   "%s: %s", cmd->idstr, msg);
 	return msg;
 }
 
@@ -355,12 +361,26 @@ struct getroutes_info {
 	u32 maxparts;
 };
 
+static void add_layer(const struct layer ***layers,
+		      const struct layer *l,
+		      const struct gossmap *gossmap,
+		      struct gossmap_localmods *localmods,
+		      fp16_t *capacities)
+{
+	tal_arr_expand(layers, l);
+	/* FIXME: Implement localmods_merge, and cache this in layer? */
+	layer_add_localmods(l, gossmap, localmods);
+
+	/* Clear any entries in capacities array if we
+	 * override them (incl local channels) */
+	layer_clear_overridden_capacities(l, gossmap, capacities);
+}
+
 /* Gather layers, clear capacities where layers contains info */
 static const struct layer **apply_layers(const tal_t *ctx,
 					 struct askrene *askrene,
 					 struct command *cmd,
 					 const struct node_id *source,
-					 struct amount_msat amount,
 					 struct gossmap_localmods *localmods,
 					 const char **layernames,
 					 const struct layer *local_layer,
@@ -375,8 +395,8 @@ static const struct layer **apply_layers(const tal_t *ctx,
 				cmd_log(tmpctx, cmd, LOG_DBG, "Adding auto.localchans");
 				l = local_layer;
 			} else if (streq(layernames[i], "auto.no_mpp_support")) {
-				cmd_log(tmpctx, cmd, LOG_DBG, "Adding auto.no_mpp_support, sorry");
-				l = remove_small_channel_layer(layernames, askrene, amount, localmods);
+				/* deprecated */
+				continue;
 			} else if (streq(layernames[i], "auto.include_fees")) {
 				cmd_log(tmpctx, cmd, LOG_DBG, "Adding auto.include_fees");
 				/* This layer takes effect when converting flows
@@ -388,15 +408,9 @@ static const struct layer **apply_layers(const tal_t *ctx,
 				l = source_free_layer(layernames, askrene, source, localmods);
 			}
 		}
-
-		tal_arr_expand(&layers, l);
-		/* FIXME: Implement localmods_merge, and cache this in layer? */
-		layer_add_localmods(l, askrene->gossmap, localmods);
-
-		/* Clear any entries in capacities array if we
-		 * override them (incl local channels) */
-		layer_clear_overridden_capacities(l, askrene->gossmap, capacities);
+		add_layer(&layers, l, askrene->gossmap, localmods, capacities);
 	}
+
 	return layers;
 }
 
@@ -405,6 +419,7 @@ static struct command_result *reap_child(struct router_child *child)
 	int child_status;
 	struct timerel time_delta;
 	const char *err;
+	enum jsonrpc_errcode ecode;
 
 	waitpid(child->pid, &child_status, 0);
 	time_delta = timemono_between(time_mono(), child->start);
@@ -422,7 +437,17 @@ static struct command_result *reap_child(struct router_child *child)
 
 	/* This is how it indicates an error message */
 	if (WEXITSTATUS(child_status) != 0 && child->reply_bytes) {
-		err = tal_strndup(child, child->reply_buf, child->reply_bytes);
+		if (child->reply_bytes <= sizeof(ecode)) {
+			plugin_log(child->cmd->plugin, LOG_BROKEN, "Truncated child reply (%zu) bytes, exited %i",
+				   child->reply_bytes, WEXITSTATUS(child_status));
+			ecode = LIGHTNINGD;
+			err = "Truncated child result";
+		} else {
+			memcpy(&ecode, child->reply_buf, sizeof(ecode));
+			err = tal_strndup(child,
+					  child->reply_buf + sizeof(ecode),
+					  child->reply_bytes - sizeof(ecode));
+		}
 		goto fail;
 	}
 	if (child->reply_bytes == 0) {
@@ -437,10 +462,11 @@ static struct command_result *reap_child(struct router_child *child)
 
 fail_broken:
 	plugin_log(child->cmd->plugin, LOG_BROKEN, "%s", err);
+	ecode = LIGHTNINGD;
 fail:
 	assert(err);
 	/* Frees child, since it's a child of cmd */
-	return command_fail(child->cmd, PAY_ROUTE_NOT_FOUND, "%s", err);
+	return command_fail(child->cmd, ecode, "%s", err);
 }
 
 /* Last one out finalizes */
@@ -529,6 +555,7 @@ static struct command_result *do_getroutes(struct command *cmd,
 	const struct layer **layers;
 	s8 *biases;
 	fp16_t *capacities;
+	bool include_next_node_id, include_amount_msat, include_delay;
 
 	/* update the gossmap */
 	if (gossmap_refresh(askrene->gossmap)) {
@@ -564,10 +591,25 @@ static struct command_result *do_getroutes(struct command *cmd,
 		}
 	}
 
+	/* auto.no_mpp_support layer forces maxparts == 1. */
+	if (have_layer(info->layers, "auto.no_mpp_support")) {
+		cmd_log(tmpctx, cmd, LOG_DBG, "Adding auto.no_mpp_support, sorry");
+		info->maxparts = 1;
+	}
+
 	/* apply selected layers to the localmods */
 	layers = apply_layers(cmd, askrene, cmd,
-			      &info->source, info->amount, localmods,
+			      &info->source, localmods,
 			      info->layers, info->local_layer, capacities);
+
+
+	/* no parallel payments means we can drop any smaller channels */
+	if (info->maxparts == 1) {
+		add_layer(&layers,
+			  remove_small_channel_layer(layers, askrene, info->amount, localmods),
+			  askrene->gossmap,
+			  localmods, capacities);
+	}
 
 	/* Clear scids with reservations, too, so we don't have to look up
 	 * all the time! */
@@ -605,14 +647,6 @@ static struct command_result *do_getroutes(struct command *cmd,
 		goto fail;
 	}
 
-	/* auto.no_mpp_support layer overrides any choice of algorithm. */
-	if (have_layer(info->layers, "auto.no_mpp_support") &&
-	    info->dev_algo != ALGO_SINGLE_PATH) {
-		info->dev_algo = ALGO_SINGLE_PATH;
-		cmd_log(tmpctx, cmd, LOG_DBG,
-		       "Layer no_mpp_support is active we switch to a "
-		       "single path algorithm.");
-	}
 	if (info->maxparts == 1 &&
 	    info->dev_algo != ALGO_SINGLE_PATH) {
 		info->dev_algo = ALGO_SINGLE_PATH;
@@ -622,6 +656,19 @@ static struct command_result *do_getroutes(struct command *cmd,
 
 	include_fees = have_layer(info->layers, "auto.include_fees");
 
+	/* Figure out what deprecated fields to include */
+	include_next_node_id = notification_deprecated_out_ok(askrene->plugin,
+							      "getroutes",
+							      "next_node_id",
+							      "v26.06", "v27.06");
+	include_amount_msat = notification_deprecated_out_ok(askrene->plugin,
+							     "getroutes",
+							     "amount_msat",
+							     "v26.06", "v27.06");
+	include_delay = notification_deprecated_out_ok(askrene->plugin,
+						       "getroutes",
+						       "delay",
+						       "v26.06", "v27.06");
 	child = tal(cmd, struct router_child);
 	child->start = time_mono();
 	deadline = timemono_add(child->start,
@@ -671,7 +718,11 @@ static struct command_result *do_getroutes(struct command *cmd,
 			  deadline, srcnode, dstnode, info->amount,
 			  info->maxfee, info->finalcltv, info->maxdelay, info->maxparts,
 			  include_fees,
-			  cmd->id, cmd->filter, replyfds[1]);
+			  cmd->idstr, cmd->filter,
+			  include_next_node_id,
+			  include_amount_msat,
+			  include_delay,
+			  replyfds[1]);
 		abort();
 	}
 
@@ -892,6 +943,11 @@ static struct command_result *json_getroutes(struct command *cmd,
 				    maxdelay_allowed);
 	}
 
+	if (node_id_eq(source, dest)) {
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "source and destination must be different");
+	}
+
 	if (command_check_only(cmd))
 		return command_check_done(cmd);
 
@@ -933,7 +989,7 @@ static struct command_result *json_askrene_reserve(struct command *cmd,
 		   json_tok_full_len(params), json_tok_full(buffer, params));
 
 	for (size_t i = 0; i < tal_count(path); i++)
-		reserve_add(askrene->reserved, &path[i], cmd->id);
+		reserve_add(askrene->reserved, &path[i], cmd->idstr);
 
 	response = jsonrpc_stream_success(cmd);
 	return command_finished(cmd, response);
@@ -1015,6 +1071,10 @@ static struct command_result *json_askrene_create_channel(struct command *cmd,
 	plugin_log(cmd->plugin, LOG_TRACE, "%s called: %.*s", __func__,
 		   json_tok_full_len(params), json_tok_full(buffer, params));
 
+	if (node_id_cmp(src, dst) == 0)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "source and destination must be different");
+
 	if (layer_find_local_channel(layer, *scid)) {
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				    "channel already exists");
@@ -1064,6 +1124,29 @@ static struct command_result *json_askrene_update_channel(struct command *cmd,
 	return command_finished(cmd, response);
 }
 
+static struct command_result *
+json_askrene_remove_channel_update(struct command *cmd, const char *buffer,
+				   const jsmntok_t *params)
+{
+	struct layer *layer;
+	struct short_channel_id_dir *scidd;
+	struct json_stream *response;
+
+	if (!param(cmd, buffer, params,
+		   p_req("layer", param_known_layer, &layer),
+		   p_req("short_channel_id_dir", param_short_channel_id_dir,
+			 &scidd),
+		   NULL))
+		return command_param_failed();
+	plugin_log(cmd->plugin, LOG_TRACE, "%s called: %.*s", __func__,
+		   json_tok_full_len(params), json_tok_full(buffer, params));
+
+	layer_remove_channel_update(layer, scidd);
+
+	response = jsonrpc_stream_success(cmd);
+	return command_finished(cmd, response);
+}
+
 enum inform {
 	INFORM_CONSTRAINED,
 	INFORM_UNCONSTRAINED,
@@ -1084,7 +1167,7 @@ static struct command_result *param_inform(struct command *cmd,
 	else if (json_tok_streq(buffer, tok, "succeeded"))
 		**inform = INFORM_SUCCEEDED;
 	else
-		command_fail_badparam(cmd, name, buffer, tok,
+		return command_fail_badparam(cmd, name, buffer, tok,
 				      "must be constrained/unconstrained/succeeded");
 	return NULL;
 }
@@ -1100,6 +1183,7 @@ static struct command_result *json_askrene_inform_channel(struct command *cmd,
 	struct amount_msat *amount;
 	enum inform *inform;
 	const struct constraint *c;
+	const struct impression *imp;
 
 	if (!param_check(cmd, buffer, params,
 			 p_req("layer", param_known_layer, &layer),
@@ -1122,6 +1206,7 @@ static struct command_result *json_askrene_inform_channel(struct command *cmd,
 			*amount = AMOUNT_MSAT(0);
 		if (command_check_only(cmd))
 			return command_check_done(cmd);
+		imp = NULL;
 		c = layer_add_constraint(layer, scidd, clock_time().ts.tv_sec,
 					 NULL, amount);
 		goto output;
@@ -1130,12 +1215,16 @@ static struct command_result *json_askrene_inform_channel(struct command *cmd,
 		 * that no reserves were used) */
 		if (command_check_only(cmd))
 			return command_check_done(cmd);
+		imp = NULL;
 		c = layer_add_constraint(layer, scidd, clock_time().ts.tv_sec,
 					 amount, NULL);
 		goto output;
 	case INFORM_SUCCEEDED:
-		/* FIXME: We could do something useful here! */
+		if (command_check_only(cmd))
+			return command_check_done(cmd);
 		c = NULL;
+		imp = layer_add_impression(layer, scidd, clock_time().ts.tv_sec,
+					   *amount);
 		goto output;
 	}
 	abort();
@@ -1145,6 +1234,10 @@ output:
 	json_array_start(response, "constraints");
 	if (c)
 		json_add_constraint(response, NULL, c, layer);
+	json_array_end(response);
+	json_array_start(response, "impressions");
+	if (imp)
+		json_add_impression(response, NULL, imp, layer);
 	json_array_end(response);
 	return command_finished(cmd, response);
 }
@@ -1396,6 +1489,10 @@ static const struct plugin_command commands[] = {
 	{
 		"askrene-update-channel",
 		json_askrene_update_channel,
+	},
+	{
+		"askrene-remove-channel-update",
+		json_askrene_remove_channel_update,
 	},
 	{
 		"askrene-inform-channel",

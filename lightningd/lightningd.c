@@ -46,6 +46,7 @@
 
 /*~ This is common code: routines shared by one or more executables
  *  (separate daemons, or the lightning-cli program). */
+#include <common/configvar.h>
 #include <common/daemon.h>
 #include <common/deprecation.h>
 #include <common/ecdh_hsmd.h>
@@ -75,6 +76,7 @@
 #include <lightningd/plugin_hook.h>
 #include <lightningd/runes.h>
 #include <lightningd/subd.h>
+#include <lightningd/watchman.h>
 #include <sys/resource.h>
 #include <wallet/invoices.h>
 #include <wally_bip32.h>
@@ -150,7 +152,6 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->dev_strict_forwarding = false;
 	ld->dev_limit_connections_inflight = false;
 	ld->dev_keep_nagle = false;
-	ld->dev_uniform_padding = false;
 
 	/*~ We try to ensure enough fds for twice the number of channels
 	 * we start with.  We have a developer option to change that factor
@@ -239,6 +240,7 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	list_head_init(&ld->splice_commands);
 	list_head_init(&ld->waitblockheight_commands);
 	list_head_init(&ld->wait_commands);
+	list_head_init(&ld->graceful_commands);
 
 	/*~ Tal also explicitly supports arrays: it stores the number of
 	 * elements, which can be accessed with tal_count() (or tal_bytelen()
@@ -286,6 +288,11 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	/*~ This is initialized later, but the plugin loop examines this,
 	 * so set it to NULL explicitly now. */
 	ld->wallet = NULL;
+
+	/*~ Only created if the user opts into --experimental-bwatch, but
+	 * plugin startup (watchman_notify_plugin_ready) examines it, so set
+	 * it to NULL explicitly now. */
+	ld->watchman = NULL;
 
 	/*~ Behavioral options */
 	ld->accept_extra_tlv_types = tal_arr(ld, u64, 0);
@@ -373,6 +380,12 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->autoconnect_seeker_peers = 10;
 
 	ld->fronting_nodes = tal_arr(ld, struct node_id, 0);
+
+	/*~ connectd usually uses "no-reply" pings to fill out messages
+	 * where needed to make them uniform length.  Some implementations
+	 * don't like it, so it can be disabled. */
+	ld->message_padding = false;
+
 	return ld;
 }
 
@@ -878,12 +891,27 @@ static struct io_plan *sigchld_rfd_in(struct io_conn *conn,
  * features later, or adding them when supplied by plugins. */
 static struct feature_set *default_features(const tal_t *ctx)
 {
-	/* BOLT PR https://github.com/lightning/bolts/pull/1092
+	/* Proposed BOLT PR https://github.com/lightning/bolts/pull/1092
 	 * suggests making the following compulsory:
 	 *     var_onion_optin (all but 6 nodes)
 	 *     gossip_queries (all but 11 nodes)
 	 *     option_data_loss_protect (all but 11 nodes)
 	 *     option_static_remotekey (all but 16 nodes)
+	 */
+	/* BOLT #9:
+	 * The origin node:
+	 *   * If it supports a feature above, SHOULD set the corresponding odd
+	 *     bit in all feature fields indicated by the Context column unless
+	 * 	indicated that it must set the even feature bit instead.
+	 *   * If it requires a feature above, MUST set the corresponding even
+	 *     feature bit in all feature fields indicated by the Context column,
+	 *     unless indicated that it must set the odd feature bit instead.
+	 *   * MUST NOT set feature bits it does not support.
+	 *   * MUST NOT set feature bits in fields not specified by the table above.
+	 *   * MUST NOT set both the optional and mandatory bits.
+	 *   * MUST set all transitive feature dependencies.
+	 *   * MUST support:
+	 *     * `var_onion_optin`
 	 */
 	struct feature_set *ret = NULL;
 	static const u32 features[] = {
@@ -907,6 +935,7 @@ static struct feature_set *default_features(const tal_t *ctx)
 		OPTIONAL_FEATURE(OPT_PROVIDE_STORAGE),
 		/* Removed later for elements */
 		OPTIONAL_FEATURE(OPT_ANCHORS_ZERO_FEE_HTLC_TX),
+		OPTIONAL_FEATURE(OPT_SPLICE),
 	};
 
 	for (size_t i = 0; i < ARRAY_SIZE(features); i++) {
@@ -1141,6 +1170,18 @@ static void setup_fd_limit(struct lightningd *ld, size_t num_channels)
 	}
 }
 
+/*~ Has the user opted into the experimental bwatch chain watcher?  The
+ * --experimental-bwatch flag is registered by the bwatch plugin, not by
+ * lightningd, so we look for it in the parsed configvars rather than
+ * keeping our own copy. */
+static bool bwatch_enabled(const struct lightningd *ld)
+{
+	const char **names = tal_arr(tmpctx, const char *, 1);
+
+	names[0] = "experimental-bwatch";
+	return configvar_first(ld->configvars, names) != NULL;
+}
+
 int main(int argc, char *argv[])
 {
 	struct lightningd *ld;
@@ -1324,6 +1365,30 @@ int main(int argc, char *argv[])
 	trace_span_start("setup_topology", ld->topology);
 	setup_topology(ld->topology);
 	trace_span_end(ld->topology);
+
+	/*~ Stand up the watchman: it queues bwatch RPC requests until the
+	 * bwatch plugin reports ready, then replays them.  Must come before
+	 * init_wallet_scriptpubkey_watches so the watches have somewhere to
+	 * enqueue, and after setup_topology so start_block reflects the
+	 * last-processed height.
+	 *
+	 * bwatch is opt-in for now: the --experimental-bwatch flag is
+	 * registered by the bwatch plugin, so peek at the configvar to gate
+	 * the lightningd side too.  Without it, ld->watchman stays NULL and
+	 * the watchman_* entry points are no-ops, leaving chain_topology as
+	 * the only chain watcher. */
+	if (bwatch_enabled(ld)) {
+		ld->watchman = watchman_new(ld, ld);
+
+		/*~ Reads intvars and the addresses table, so needs a
+		 * transaction (the datastore writes it triggers self-wrap
+		 * when necessary). */
+		db_begin_transaction(ld->wallet->db);
+		trace_span_start("init_wallet_scriptpubkey_watches", ld->wallet);
+		init_wallet_scriptpubkey_watches(ld->wallet);
+		trace_span_end(ld->wallet);
+		db_commit_transaction(ld->wallet->db);
+	}
 
 	db_begin_transaction(ld->wallet->db);
 	trace_span_start("delete_old_htlcs", ld->wallet);

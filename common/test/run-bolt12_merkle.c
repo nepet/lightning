@@ -7,6 +7,7 @@
 #include <ccan/array_size/array_size.h>
 #include <common/channel_type.h>
 #include <common/features.h>
+#include <common/randbytes.h>
 #include <common/setup.h>
 #include <secp256k1_schnorrsig.h>
 
@@ -48,8 +49,7 @@ static LAST_ARG_NULL void *concat_(const void *p, ...)
 
 	va_start(ap, p);
 	do {
-		tal_resize(&ret, len + tal_bytelen(p));
-		memcpy(ret + len, p, tal_bytelen(p));
+		tal_arr_append(&ret, p);
 		len += tal_bytelen(p);
 	} while ((p = va_arg(ap, const void *)) != NULL);
 	va_end(ap);
@@ -150,7 +150,7 @@ int main(int argc, char *argv[])
 	struct pubkey alice, bob;
 	struct sha256 sha;
 	secp256k1_keypair kp;
-	char *fail;
+	const char *fail;
 
 	common_setup(argv[0]);
 	/* Note: no nul term */

@@ -4,6 +4,7 @@ LIGHTNINGD_SRC :=				\
 	lightningd/anchorspend.c		\
 	lightningd/bitcoind.c			\
 	lightningd/chaintopology.c		\
+	lightningd/watchman.c			\
 	lightningd/channel.c			\
 	lightningd/channel_control.c		\
 	lightningd/channel_gossip.c		\
@@ -42,6 +43,7 @@ LIGHTNINGD_SRC :=				\
 	lightningd/plugin_hook.c		\
 	lightningd/routehint.c			\
 	lightningd/runes.c			\
+	lightningd/simple_close_control.c \
 	lightningd/subd.c			\
 	lightningd/wait.c			\
 	lightningd/watch.c

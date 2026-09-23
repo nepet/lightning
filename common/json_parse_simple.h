@@ -2,6 +2,7 @@
 #ifndef LIGHTNING_COMMON_JSON_PARSE_SIMPLE_H
 #define LIGHTNING_COMMON_JSON_PARSE_SIMPLE_H
 #include "config.h"
+#include <ccan/endian/endian.h>
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
 
@@ -51,6 +52,12 @@ bool json_to_double(const char *buffer, const jsmntok_t *tok, double *num);
 /* Extract boolean from this */
 bool json_to_bool(const char *buffer, const jsmntok_t *tok, bool *b);
 
+/* Extract big-endian 32-bit from hex string (for datastore) */
+bool json_hex_to_be32(const char *buffer, const jsmntok_t *tok, be32 *val);
+
+/* Extract big-endian 64-bit from hex string (for datastore) */
+bool json_hex_to_be64(const char *buffer, const jsmntok_t *tok, be64 *val);
+
 /* Is this a number? [0..9]+ */
 bool json_tok_is_num(const char *buffer, const jsmntok_t *tok);
 
@@ -75,10 +82,6 @@ static inline const jsmntok_t *json_get_member(const char *buffer,
 
 /* Get index'th array member. */
 const jsmntok_t *json_get_arr(const jsmntok_t tok[], size_t index);
-
-/* Helper to get "id" field from object (including any quotes!). */
-const char *json_get_id(const tal_t *ctx,
-			const char *buffer, const jsmntok_t *obj);
 
 /* Allocate a starter array of tokens for json_parse_input */
 jsmntok_t *toks_alloc(const tal_t *ctx);

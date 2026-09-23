@@ -7,10 +7,10 @@ VERSION ?= $(shell git describe --tags --always --dirty=-modded --abbrev=7 2>/de
 $(info Building version $(VERSION))
 
 # Next release.
-CLN_NEXT_VERSION := v26.04
+CLN_NEXT_VERSION := v26.09
 
 # Previous release (for downgrade testing)
-CLN_PREV_VERSION := v25.12
+CLN_PREV_VERSION := v26.06
 
 # --quiet / -s means quiet, dammit!
 ifeq ($(findstring s,$(word 1, $(MAKEFLAGS))),s)
@@ -33,7 +33,7 @@ CCANDIR := ccan
 
 # Where we keep the BOLT RFCs
 BOLTDIR := ../bolts/
-DEFAULT_BOLTVERSION := 68881992b97f20aca29edf7a4d673b8e6a70379a
+DEFAULT_BOLTVERSION := 4b539711d4726f274482051150bc6612e370b4e2
 # Can be overridden on cmdline.
 BOLTVERSION := $(DEFAULT_BOLTVERSION)
 
@@ -439,6 +439,7 @@ GRPC_GEN = \
 	$(GRPC_PATH)/node_pb2_grpc.py \
 	$(GRPC_PATH)/primitives_pb2.py
 
+CLN_GRPC_GENALL += $(GRPC_GEN)
 ALL_TEST_GEN += $(GRPC_GEN)
 
 $(GRPC_GEN) &: cln-grpc/proto/node.proto cln-grpc/proto/primitives.proto
@@ -560,31 +561,50 @@ print-hdr-to-check:
 # If you want to check a specific variant of quotes use:
 #   make check-source-bolt BOLTVERSION=xxx
 ifeq ($(BOLTVERSION),$(DEFAULT_BOLTVERSION))
-CHECK_BOLT_PREFIX=
+CHECK_BOLT_COMMIT=
 else
-CHECK_BOLT_PREFIX=--prefix="BOLT-$(BOLTVERSION)"
+CHECK_BOLT_COMMIT=--include-commit=$(BOLTVERSION)
 endif
 
+CHECK_QUOTES := devtools/check_quotes.py
+
+BOLT_COVERAGE_FLAGS=$(if $(COVERAGE_FILE),--coverage=$(COVERAGE_FILE),)
+
 # Any mention of BOLT# must be followed by an exact quote, modulo whitespace.
-bolt-check/%: % bolt-precheck devtools/check-bolt
-	@if [ -d .tmp.lightningrfc ]; then devtools/check-bolt $(CHECK_BOLT_PREFIX) .tmp.lightningrfc $<; else echo "Not checking BOLTs: BOLTDIR $(BOLTDIR) does not exist" >&2; fi
+bolt-check/%: % bolt-precheck
+	@if [ -d .tmp.lightningrfc ]; then uv run $(CHECK_QUOTES) -k $(CHECK_BOLT_COMMIT) --comment-start "/* " --comment-continue "*" --comment-end "*/" --boltdir .tmp.lightningrfc $(BOLT_COVERAGE_FLAGS) $<; else echo "Not checking BOLTs: BOLTDIR $(BOLTDIR) does not exist" >&2; fi
+
+bolt-check-py/%: % bolt-precheck
+	@if [ -d .tmp.lightningrfc ]; then uv run $(CHECK_QUOTES) -k $(CHECK_BOLT_COMMIT) --boltdir .tmp.lightningrfc $(BOLT_COVERAGE_FLAGS) $<; else echo "Not checking BOLTs: BOLTDIR $(BOLTDIR) does not exist" >&2; fi
+
+bolt-check-rs/%: % bolt-precheck
+	@if [ -d .tmp.lightningrfc ]; then uv run $(CHECK_QUOTES) -k $(CHECK_BOLT_COMMIT) --comment-start "// " --comment-continue "//" --boltdir .tmp.lightningrfc $(BOLT_COVERAGE_FLAGS) $<; else echo "Not checking BOLTs: BOLTDIR $(BOLTDIR) does not exist" >&2; fi
 
 LOCAL_BOLTDIR=.tmp.lightningrfc
 
 bolt-precheck:
 	@[ -d $(BOLTDIR) ] || exit 0; set -e; if [ -z "$(BOLTVERSION)" ]; then rm -rf $(LOCAL_BOLTDIR); ln -sf $(BOLTDIR) $(LOCAL_BOLTDIR); exit 0; fi; [ "$$(git -C $(LOCAL_BOLTDIR) rev-list --max-count=1 HEAD 2>/dev/null)" != "$(BOLTVERSION)" ] || exit 0; rm -rf $(LOCAL_BOLTDIR) && git clone -q $(BOLTDIR) $(LOCAL_BOLTDIR) && cd $(LOCAL_BOLTDIR) && git checkout -q $(BOLTVERSION)
 
-check-source-bolt: $(ALL_NONGEN_SRCFILES:%=bolt-check/%)
+PYSRC=$(shell git ls-files "*.py" | grep -v /text.py)
+RUSTSRC=$(shell git ls-files "*.rs")
+
+check-source-bolt: $(ALL_NONGEN_SRCFILES:%=bolt-check/%) $(PYSRC:%=bolt-check-py/%) $(RUSTSRC:%=bolt-check-rs/%)
+
+check-requirements-coverage: bolt-precheck
+	@if [ ! -d .tmp.lightningrfc ]; then echo "Not checking BOLTs: BOLTDIR $(BOLTDIR) does not exist" >&2; exit 1; fi
+	@f=/tmp/cln-bolt-coverage.$$$$; \
+	 rm -f $$f; \
+	 $(MAKE) check-source-bolt COVERAGE_FILE=$$f && \
+	 uv run devtools/bolt-coverage.py --coverage $$f --boltdir .tmp.lightningrfc; \
+	 rc=$$?; rm -f $$f; exit $$rc
 
 check-whitespace/%: %
 	@if grep -Hn '[ 	]$$' $<; then echo Extraneous whitespace found >&2; exit 1; fi
 
-check-whitespace: check-whitespace/Makefile check-whitespace/devtools/check-bolt.c $(ALL_NONGEN_SRCFILES:%=check-whitespace/%)
+check-whitespace: check-whitespace/Makefile $(ALL_NONGEN_SRCFILES:%=check-whitespace/%)
 
 check-spelling:
 	@tools/check-spelling.sh
-
-PYSRC=$(shell git ls-files "*.py" | grep -v /text.py)
 
 # Some tests in pyln will need to find lightningd to run, so have a PATH that
 # allows it to find that
@@ -625,28 +645,46 @@ check-bad-sprintf:
 # Don't access amount_msat and amount_sat members directly without a good reason
 # since it risks overflow.
 check-amount-access:
-	@! (git grep -nE "(->|\.)(milli)?satoshis" -- "*.c" "*.h" ":(exclude)common/amount.*" ":(exclude)*/test/*" | grep -v '/* Raw:')
-	@! git grep -nE "\\(struct amount_(m)?sat\\)" -- "*.c" "*.h" ":(exclude)common/amount.*" ":(exclude)*/test/*" | grep -vE "sizeof.struct amount_(m)?sat."
+	@! (git grep -nE "(->|\.)(milli)?satoshis" -- "*.c" "*.h" ":(exclude)common/amount.*" ":(exclude)*/test/*" ":(exclude)tests/fuzz/*" | grep -v '/* Raw:')
+	@! git grep -nE "\\(struct amount_(m)?sat\\)" -- "*.c" "*.h" ":(exclude)common/amount.*" ":(exclude)*/test/*" ":(exclude)tests/fuzz/*" | grep -vE "sizeof.struct amount_(m)?sat."
+
+# Examples must be generated with this tree's binaries to use plugins and tools
+DOC_EXAMPLES_PATH = $(CURDIR)/lightningd:$(CURDIR)/cli:$(CURDIR)/tools:$(PATH)
 
 repeat-doc-examples:
 	@for i in $$(seq 1 $(n)); do \
+		PORT_OFFSET=$$((i * 100)); \
+		BASE_PORTNUM=$$((30000 + PORT_OFFSET)); \
 		echo "----------------------------------" >> tests/autogenerate-examples-repeat.log; \
-		echo "Iteration $$i" >> tests/autogenerate-examples-repeat.log; \
+		echo "Iteration $$i on Base Port $$BASE_PORTNUM" >> tests/autogenerate-examples-repeat.log; \
 		echo "----------------------------------" >> tests/autogenerate-examples-repeat.log; \
-		VALGRIND=0 TIMEOUT=40 TEST_DEBUG=1 GENERATE_EXAMPLES=1 pytest -vvv tests/autogenerate-rpc-examples.py; \
+		PATH="$(DOC_EXAMPLES_PATH)" TEST_DEBUG=1 VALGRIND=0 GENERATE_EXAMPLES=1 CLN_NEXT_VERSION=$(CLN_NEXT_VERSION) BASE_PORTNUM=$$BASE_PORTNUM pytest -vvv --timeout=1200 tests/autogenerate-rpc-examples.py; \
 		git diff >> tests/autogenerate-examples-repeat.log; \
 		git reset --hard; \
 		echo "----------------------------------" >> tests/autogenerate-examples-repeat.log; \
 	done
 
 update-doc-examples:
-	TEST_DEBUG=1 VALGRIND=0 GENERATE_EXAMPLES=1 $(PYTEST) $(PYTEST_OPTS) --timeout=1200 tests/autogenerate-rpc-examples.py && $(MAKE) $(MSGGEN_GEN_ALL)
+	PATH="$(DOC_EXAMPLES_PATH)" TEST_DEBUG=1 VALGRIND=0 GENERATE_EXAMPLES=1 CLN_NEXT_VERSION=$(CLN_NEXT_VERSION) $(PYTEST) $(PYTEST_OPTS) --timeout=1200 tests/autogenerate-rpc-examples.py && $(MAKE) $(MSGGEN_GEN_ALL)
+
+# If you changed tests/autogenerate-rpc-examples.py to require new blocks, you have to run this:
+update-doc-examples-newchain:
+	PATH="$(DOC_EXAMPLES_PATH)" TEST_DEBUG=1 VALGRIND=0 GENERATE_EXAMPLES=1 CLN_NEXT_VERSION=$(CLN_NEXT_VERSION) REGENERATE_BLOCKCHAIN=1 $(PYTEST) $(PYTEST_OPTS) --timeout=1200 tests/autogenerate-rpc-examples.py && $(MAKE) $(MSGGEN_GEN_ALL)
 
 check-doc-examples: update-doc-examples
-	git diff --exit-code HEAD
+	git diff --exit-code HEAD -- doc
+
+check-wire-format: bolt-precheck
+	@if [ -d .tmp.lightningrfc ]; then $(MAKE) extract-bolt-csv; else echo "Not checking BOLTs: BOLTDIR $(BOLTDIR) does not exist" >&2; fi
+	git diff --exit-code HEAD -- wire
+
+# SECURITY.md and doc/contribute-to-core-lightning/security-policy.md must be
+# synced. So far we do this manually.
+check-security:
+	@bash -lc 'diff -u <(tail -n +3 -- SECURITY.md) <(tail -n +9 -- doc/contribute-to-core-lightning/security-policy.md)'
 
 # This should NOT compile things!
-check-source: check-makefile check-whitespace check-spelling check-python-flake8 check-includes check-shellcheck check-setup_locale check-tmpctx check-discouraged-functions check-amount-access check-bad-sprintf
+check-source: check-makefile check-whitespace check-spelling check-python-flake8 check-includes check-shellcheck check-setup_locale check-tmpctx check-discouraged-functions check-amount-access check-bad-sprintf check-wire-format check-source-bolt check-security
 
 full-check: check check-source
 
@@ -674,7 +712,7 @@ gen:  $(CHECK_GEN_ALL)
 
 check-gen-updated:  $(CHECK_GEN_ALL)
 	@echo "Checking for generated files being changed by make"
-	git diff --exit-code HEAD
+	git diff --text --exit-code HEAD
 
 coverage/coverage.info: check pytest
 	mkdir coverage || true
@@ -803,7 +841,7 @@ update-ccan:
 	cp ../ccan/tools/configurator/configurator.c ../ccan/doc/configurator.1 ccan/tools/configurator/
 	$(MAKE) ccan/config.h
 	grep -v '^CCAN version:' ccan.old/README > ccan/README
-	echo CCAN version: `git -C ../ccan describe` >> ccan/README
+	echo CCAN version: `git -C ../ccan rev-parse --short HEAD` >> ccan/README
 	$(RM) -r ccan.old
 	$(RM) -r ccan/ccan/hash/ ccan/ccan/tal/talloc/	# Unnecessary deps
 

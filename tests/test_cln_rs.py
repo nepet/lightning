@@ -78,6 +78,39 @@ def test_plugin_start(node_factory):
     assert not l1.rpc.listconfigs("test-dynamic-option")["configs"]["test-dynamic-option"]["value_bool"]
     wait_for(lambda: l1.daemon.is_in_log(r'cln-plugin-startup: Got dynamic option change: test-dynamic-option "false"'))
 
+    with pytest.raises(RpcError, match="context given: .* Unknown command"):
+        l1.rpc.test_error()
+
+
+def test_plugin_bad_json(node_factory):
+    bin_path = Path.cwd() / "target" / RUST_PROFILE / "examples" / "cln-plugin-startup"
+    l1 = node_factory.get_node(options={"plugin": str(bin_path)})
+
+    names = [p["name"] for p in l1.rpc.plugin_list()["plugins"]]
+    assert any("cln-plugin-startup" in n for n in names)
+
+    cli_cmd = [
+        "cli/lightning-cli",
+        f"--lightning-dir={l1.daemon.lightning_dir}",
+        f"--network={l1.daemon.opts.get('network', 'regtest')}",
+        "-k",
+        "testmethod",
+        "channels=[123456x1x0]",  # unquoted scid in array -> malformed JSON
+    ]
+    result = subprocess.run(cli_cmd, capture_output=True, text=True, check=False)
+
+    # We don't care whether this particular call succeeds -- a parse
+    # error for the bad request is fine. We care that it doesn't take
+    # the plugin down.
+    assert "Plugin terminated before replying" not in result.stdout + result.stderr
+
+    # Plugin must still be alive and answering ordinary requests.
+    names_after = [p["name"] for p in l1.rpc.plugin_list()["plugins"]]
+    assert any("cln-plugin-startup" in n for n in names_after)
+    assert l1.rpc.call("testmethod", {"channels": []}) is not None
+
+    assert not l1.daemon.is_in_log(r"Killing plugin.*exited during normal operation")
+
 
 def test_plugin_options_handle_defaults(node_factory):
     """Start a minimal plugin and ensure it is well-behaved
@@ -306,8 +339,8 @@ def test_cln_plugin_reentrant(node_factory, executor):
     i1 = l1.rpc.invoice(label='lbl1', amount_msat='42sat', description='desc')['bolt11']
     i2 = l1.rpc.invoice(label='lbl2', amount_msat='31337sat', description='desc')['bolt11']
 
-    f1 = executor.submit(l2.rpc.pay, i1)
-    f2 = executor.submit(l2.rpc.pay, i2)
+    f1 = executor.submit(l2.rpc.xpay, i1)
+    f2 = executor.submit(l2.rpc.xpay, i2)
 
     l1.daemon.wait_for_logs(["plugin-cln-plugin-reentrant: Holding on to incoming HTLC Object"] * 2)
 
@@ -328,6 +361,7 @@ def test_grpc_keysend_routehint(bitcoind, node_factory):
     l1, l2, l3 = node_factory.line_graph(
         3,
         announce_channels=True,  # Do not enforce scid-alias
+        opts={'allow-deprecated-apis': True}
     )
     bitcoind.generate_block(3)
     sync_blockheight(bitcoind, [l1, l2, l3])
@@ -368,6 +402,8 @@ def test_grpc_listpeerchannels(bitcoind, node_factory):
         2,
         announce_channels=True,  # Do not enforce scid-alias
     )
+
+    wait_for_grpc_start(l1)
 
     stub = l1.grpc
     res = stub.ListPeerChannels(clnpb.ListpeerchannelsRequest(id=None))
@@ -418,6 +454,8 @@ def test_rust_plugin_subscribe_wildcard(node_factory):
 def test_grpc_block_added_notifications(node_factory, bitcoind):
     l1 = node_factory.get_node()
 
+    wait_for_grpc_start(l1)
+
     # Test the block_added notification
     # Start listening to block added events over grpc
     block_added_stream = l1.grpc.SubscribeBlockAdded(clnpb.StreamBlockAddedRequest())
@@ -434,6 +472,8 @@ def test_grpc_block_added_notifications(node_factory, bitcoind):
 def test_grpc_connect_notification(node_factory):
     l1, l2 = node_factory.get_nodes(2)
 
+    wait_for_grpc_start(l1)
+
     # Test the connect notification
     connect_stream = l1.grpc.SubscribeConnect(clnpb.StreamConnectRequest())
 
@@ -449,6 +489,8 @@ def test_grpc_connect_notification(node_factory):
 
 def test_grpc_custommsg_notification(node_factory):
     l1, l2 = node_factory.get_nodes(2)
+
+    wait_for_grpc_start(l1)
 
     # Test the connect notification
     custommsg_stream = l1.grpc.SubscribeCustomMsg(clnpb.StreamCustomMsgRequest())

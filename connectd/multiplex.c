@@ -355,7 +355,7 @@ static bool is_urgent(enum peer_wire type)
 	case WIRE_PEER_STORAGE:
 	case WIRE_PEER_STORAGE_RETRIEVAL:
 	case WIRE_STFU:
-	case WIRE_SPLICE:
+	case WIRE_SPLICE_INIT:
 	case WIRE_SPLICE_ACK:
 	case WIRE_SPLICE_LOCKED:
 	case WIRE_PING:
@@ -376,7 +376,6 @@ static bool is_urgent(enum peer_wire type)
 static u8 *process_batch_elements(const tal_t *ctx, struct peer *peer, const u8 *msg TAKES)
 {
 	u8 *ret = tal_arr(ctx, u8, 0);
-	size_t ret_size = 0;
 	const u8 *cursor = msg;
 	size_t plen = tal_count(msg);
 
@@ -422,9 +421,7 @@ static u8 *process_batch_elements(const tal_t *ctx, struct peer *peer, const u8 
 		enc_msg = cryptomsg_encrypt_msg(tmpctx, &peer->cs,
 						take(element_bytes));
 
-		tal_resize(&ret, ret_size + tal_bytelen(enc_msg));
-		memcpy(&ret[ret_size], enc_msg, tal_bytelen(enc_msg));
-		ret_size += tal_bytelen(enc_msg);
+		tal_arr_append(&ret, enc_msg);
 
 	} while(plen);
 
@@ -481,14 +478,33 @@ static bool have_empty_encrypted_queue(const struct peer *peer)
 	return membuf_num_elems(&peer->encrypted_peer_out) == 0;
 }
 
+/* Funny story: we discovered an LND bug, where they hung up if we sent
+ * "no reply" ping messages.  This was fixed in (the upcoming) v21, which
+ * Laolu pointed out also supports onion messages.  Hence we use that
+ * to detect if we should pad packets. */
+
+/* Funnier story: Eclair had the same bug, and have also committed a
+ * fix.  They currently use a boutique feature bit 154, which is
+ * "Phoenix-specific custom splices implementation" which Tbast
+ * indicates is being phased out.  So if they offer that, don't send
+ * such pings. */
+
+/* Oh, and then there was a node running LND master.  And those running
+ * LND with LNDK: so we added global disable. */
+static bool use_uniform_writes(const struct peer *peer)
+{
+	return peer->daemon->message_padding
+		&& feature_offered(peer->their_features, OPT_ONION_MESSAGES)
+		&& !feature_offered(peer->their_features, 154);
+}
+
 /* (Continue) writing the encrypted_peer_out array */
 static struct io_plan *write_encrypted_to_peer(struct peer *peer)
 {
 	size_t avail = membuf_num_elems(&peer->encrypted_peer_out);
 	/* With padding: always a full uniform-size chunk.
 	 * Without: flush whatever we have (caller ensures non-zero). */
-	size_t write_size = peer->daemon->dev_uniform_padding
-		? UNIFORM_MESSAGE_SIZE : avail;
+	size_t write_size = use_uniform_writes(peer) ? UNIFORM_MESSAGE_SIZE : avail;
 
 	assert(avail >= write_size && write_size > 0);
 	return io_write_partial(peer->to_peer,
@@ -1250,8 +1266,8 @@ static struct io_plan *write_to_peer(struct io_conn *peer_conn,
 				/* Wait for them to wake us */
 				return msg_queue_wait(peer_conn, peer->peer_outq, write_to_peer, peer);
 			}
-			/* OK, add padding (only if --dev-uniform-padding enabled). */
-			if (peer->daemon->dev_uniform_padding)
+			/* OK, add padding (only if supported). */
+			if (use_uniform_writes(peer))
 				pad_encrypted_queue(peer);
 			else
 				break;
@@ -1713,7 +1729,16 @@ void peer_connect_subd(struct daemon *daemon, const u8 *msg, int fd)
 						       fmt_node_id(tmpctx, &id)));
 	}
 
-	assert(!subd->conn);
+	/* We only keep one connection per channel_id.  If one is already
+	 * attached for this channel_id, drop this fd rather than replacing
+	 * it. */
+	if (subd->conn) {
+		status_peer_debug(&id,
+				  "Already have a subd for channel_id %s: ignoring",
+				  fmt_channel_id(tmpctx, &channel_id));
+		close(fd);
+		return;
+	}
 
 	/* This sets subd->conn inside subd_conn_init, and reparents subd! */
 	io_new_conn(peer, fd, subd_conn_init, subd);

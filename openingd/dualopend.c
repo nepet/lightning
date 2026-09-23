@@ -1237,12 +1237,10 @@ static char *do_commit_signed_received(const tal_t *ctx,
 			  &state->their_funding_pubkey, remote_sig)) {
 		/* BOLT #1:
 		 *
-		 * ### The `error` and `warning` Messages
-		 *...
 		 * - when failure was caused by an invalid signature check:
-		 *    - SHOULD include the raw, hex-encoded transaction in reply
-		 *      to a `funding_created`, `funding_signed`,
-		 *      `closing_signed`, or `commitment_signed` message.
+		 *   - SHOULD include the raw, hex-encoded transaction in reply
+		 *     to a `funding_created`, `funding_signed`,
+		 *     `closing_signed`, or `commitment_signed` message.
 		 */
 		/*~ This verbosity is not only useful for our own testing, but
 		 * a courtesy to other implementaters whose brains may be so
@@ -1306,7 +1304,7 @@ static void handle_tx_sigs(struct state *state, const u8 *msg)
 	const struct witness **witnesses;
 	struct tx_state *tx_state = state->tx_state;
 
-	struct tlv_txsigs_tlvs *txsig_tlvs = tlv_txsigs_tlvs_new(tmpctx);
+	struct tlv_tx_signatures_tlvs *txsig_tlvs = tlv_tx_signatures_tlvs_new(tmpctx);
 	if (!fromwire_tx_signatures(tmpctx, msg, &cid, &txid,
 				    cast_const3(
 					    struct witness ***,
@@ -1702,7 +1700,7 @@ static u8 *opening_negotiate_msg(const tal_t *ctx, struct state *state)
 		case WIRE_PEER_STORAGE:
 		case WIRE_PEER_STORAGE_RETRIEVAL:
 		case WIRE_STFU:
-		case WIRE_SPLICE:
+		case WIRE_SPLICE_INIT:
 		case WIRE_SPLICE_ACK:
 		case WIRE_SPLICE_LOCKED:
 			break;
@@ -2084,7 +2082,7 @@ static bool run_tx_interactive(struct state *state,
 		case WIRE_PEER_STORAGE:
 		case WIRE_PEER_STORAGE_RETRIEVAL:
 		case WIRE_STFU:
-		case WIRE_SPLICE:
+		case WIRE_SPLICE_INIT:
 		case WIRE_SPLICE_ACK:
 		case WIRE_SPLICE_LOCKED:
 			open_abort(state, "Unexpected wire message %s",
@@ -2432,9 +2430,8 @@ static void accepter_start(struct state *state, const u8 *oc2_msg)
 	/* BOLT #2:
 	 * The receiving node MUST fail the channel if:
 	 *...
-	 *  - It supports `channel_type` and `channel_type` was set:
-	 *     - if `type` is not suitable.
-	 *     - if `type` includes `option_zeroconf` and it does not trust the sender to open an unconfirmed channel.
+	 *   - the `channel_type` is not suitable.
+	 *   - the `channel_type` includes `option_zeroconf` and it does not trust the sender to open an unconfirmed channel.
 	 */
 	if (!open_tlv->channel_type) {
 		negotiation_failed(state,
@@ -2493,17 +2490,10 @@ static void accepter_start(struct state *state, const u8 *oc2_msg)
 		return;
 	}
 
-	/* BOLT #2:
-	 *
-	 * The receiving node MUST fail the channel if:
-	 *...
-	 * - `funding_satoshis` is greater than or equal to 2^24 and the receiver does not support
-	 *   `option_support_large_channel`. */
-	/* We choose to require *negotiation*, not just support! */
-	if (!feature_negotiated(state->our_features, state->their_features,
-				OPT_LARGE_CHANNELS)
-	    && amount_sat_greater(tx_state->opener_funding,
-				  chainparams->max_funding)) {
+	/* Check that opener's funding doesn't exceed allowed channel capacity */
+	if (amount_sat_greater(tx_state->opener_funding,
+			       max_channel_funding(state->our_features,
+						   state->their_features))) {
 		negotiation_failed(state,
 				   "opener's funding_satoshis %s too large",
 				   fmt_amount_sat(tmpctx,
@@ -2634,16 +2624,9 @@ static void accepter_start(struct state *state, const u8 *oc2_msg)
 	}
 
 	/* Check that total funding doesn't exceed allowed channel capacity */
-	/* BOLT #2:
-	 *
-	 * The receiving node MUST fail the channel if:
-	 *...
-	 * - `funding_satoshis` is greater than or equal to 2^24 and the receiver does not support
-	 *   `option_support_large_channel`. */
-	/* We choose to require *negotiation*, not just support! */
-	if (!feature_negotiated(state->our_features, state->their_features,
-				OPT_LARGE_CHANNELS)
-	    && amount_sat_greater(total, chainparams->max_funding)) {
+	if (amount_sat_greater(total,
+			       max_channel_funding(state->our_features,
+						   state->their_features))) {
 		negotiation_failed(state, "total funding_satoshis %s too large",
 				   fmt_amount_sat(tmpctx, total));
 		return;
@@ -2684,8 +2667,7 @@ static void accepter_start(struct state *state, const u8 *oc2_msg)
 	}
 
 	/* BOLT #2:
-	 * - if `option_channel_type` was negotiated:
-	 *    - MUST set `channel_type` to the `channel_type` from `open_channel`
+	 *  - MUST set `channel_type` to the `channel_type` from `open_channel`
 	 */
 	a_tlv->channel_type = state->channel_type->features;
 
@@ -3145,8 +3127,7 @@ static void opener_start(struct state *state, u8 *msg)
 	}
 
 	/* BOLT #2:
-	 * - if `channel_type` is set, and `channel_type` was set in
-	 *   `open_channel`, and they are not equal types:
+	 * if `channel_type` does not match the `channel_type` from `open_channel`:
 	 *    - MUST fail the channel.
 	 */
 	if (!a_tlv->channel_type) {
@@ -3277,16 +3258,9 @@ static void opener_start(struct state *state, u8 *msg)
 	}
 
 	/* Check that total funding doesn't exceed allowed channel capacity */
-	/* BOLT #2:
-	 *
-	 * The receiving node MUST fail the channel if:
-	 *...
-	 * - `funding_satoshis` is greater than or equal to 2^24 and
-	 *    the receiver does not support `option_support_large_channel`. */
-	/* We choose to require *negotiation*, not just support! */
-	if (!feature_negotiated(state->our_features, state->their_features,
-				OPT_LARGE_CHANNELS)
-	    && amount_sat_greater(total, chainparams->max_funding)) {
+	if (amount_sat_greater(total,
+			       max_channel_funding(state->our_features,
+						   state->their_features))) {
 		negotiation_failed(state,
 				   "total funding_satoshis %s too large",
 				   fmt_amount_sat(tmpctx, total));
@@ -3600,16 +3574,9 @@ static void rbf_local_start(struct state *state, u8 *msg)
 		return;
 	}
 	/* Check that total funding doesn't exceed allowed channel capacity */
-	/* BOLT #2:
-	 *
-	 * The receiving node MUST fail the channel if:
-	 *...
-	 * - `funding_satoshis` is greater than or equal to 2^24 and the receiver does not support
-	 *   `option_support_large_channel`. */
-	/* We choose to require *negotiation*, not just support! */
-	if (!feature_negotiated(state->our_features, state->their_features,
-				OPT_LARGE_CHANNELS)
-	    && amount_sat_greater(total, chainparams->max_funding)) {
+	if (amount_sat_greater(total,
+			       max_channel_funding(state->our_features,
+						   state->their_features))) {
 		open_abort(state, "Total funding_satoshis %s too large",
 			   fmt_amount_sat(tmpctx, total));
 		return;
@@ -3798,16 +3765,9 @@ static void rbf_remote_start(struct state *state, const u8 *rbf_msg)
 	}
 
 	/* Check that total funding doesn't exceed allowed channel capacity */
-	/* BOLT #2:
-	 *
-	 * The receiving node MUST fail the channel if:
-	 *...
-	 * - `funding_satoshis` is greater than or equal to 2^24 and the receiver does not support
-	 *   `option_support_large_channel`. */
-	/* We choose to require *negotiation*, not just support! */
-	if (!feature_negotiated(state->our_features, state->their_features,
-				OPT_LARGE_CHANNELS)
-	    && amount_sat_greater(total, chainparams->max_funding)) {
+	if (amount_sat_greater(total,
+			       max_channel_funding(state->our_features,
+						   state->their_features))) {
 		open_abort(state, "Total funding_satoshis %s too large",
 			   fmt_amount_sat(tmpctx, total));
 		goto free_rbf_ctx;
@@ -3975,16 +3935,15 @@ static void do_reconnect_dance(struct state *state)
 
 	/* BOLT #2:
 	 *
-	 * - if it has sent `commitment_signed` for an
-	 *   interactive transaction construction but it has
-	 *   not received `tx_signatures`:
-	 *   - MUST set `next_funding_txid` to the txid of that
-	 *     interactive transaction.
-	 *   - otherwise:
-	 *   - MUST NOT set `next_funding_txid`.
+	 * - if it has sent `commitment_signed` for an interactive transaction construction but
+	 *   it has not received `tx_signatures`:
+	 *   - MUST include the `next_funding` TLV.
+	 *   - MUST set `next_funding_txid` to the txid of that interactive transaction.
 	 */
 	tlvs = tlv_channel_reestablish_tlvs_new(tmpctx);
-	if (!tx_state->remote_funding_sigs_rcvd) {
+	/* Track whether we set next_funding before tlvs is overwritten by received msg */
+	bool we_set_next_funding = !tx_state->remote_funding_sigs_rcvd;
+	if (we_set_next_funding) {
 		tlvs->next_funding = talz(tlvs, struct tlv_channel_reestablish_tlvs_next_funding);
 		tlvs->next_funding->next_funding_txid = tx_state->funding.txid;
 		tlvs->next_funding->retransmit_flags = 1; /* COMMITMENT_SIGNED */
@@ -4046,18 +4005,22 @@ static void do_reconnect_dance(struct state *state)
 
 	/* BOLT #2:
 	 * A receiving node:
-	 * - if `next_funding_txid` is set:
+	 * - if the `next_funding` TLV is set:
 	 *      - if `next_funding_txid` matches the latest interactive funding transaction:
 	 *        - if it has not received `tx_signatures` for that funding transaction:
-	 *          - MUST retransmit its `commitment_signed` for that funding transaction.
+	 *          - if the `commitment_signed` bit is set in `retransmit_flags`:
+	 *             - MUST retransmit its `commitment_signed` for that funding transaction.
 	 *          - if it has already received `commitment_signed` and it should sign first,
 	 *          as specified in the [`tx_signatures` requirements](#the-tx_signatures-message):
 	 *            - MUST send its `tx_signatures` for that funding transaction.
 	 *        - if it has already received `tx_signatures` for that funding transaction:
 	 *          - MUST send its `tx_signatures` for that funding transaction.
-	 *       - otherwise:
-	 *       - MUST send `tx_abort` to let the sending node know that they can forget
-	 *         this funding transaction.
+	 *      - if it also sets `next_funding` in its own `channel_reestablish`, but the
+	 *        values don't match:
+	 *        - MUST send an `error` and fail the channel.
+	 *      - otherwise:
+	 *        - MUST send `tx_abort` to let the sending node know that they can forget
+	 *        this funding transaction.
 	 */
 	if (tlvs->next_funding) {
 		/* Does this match ours? */
@@ -4075,6 +4038,7 @@ static void do_reconnect_dance(struct state *state)
 				if (!tx_state->has_commitments)
 					send_our_sigs = false;
 			}
+			/* FIXME: examine retransmit_flags! */
 			if (send_our_sigs && psbt_side_finalized(tx_state->psbt, state->our_role)) {
 				msg = psbt_to_tx_sigs_msg(NULL, state, tx_state->psbt);
 				peer_write(state->pps, take(msg));
@@ -4085,15 +4049,21 @@ static void do_reconnect_dance(struct state *state)
 				status_debug("Unable to send our sigs, our psbt isn't signed");
 			} else
 				status_debug("No commitment, not sending our sigs (reconnected)");
+		} else if (we_set_next_funding) {
+			/* BOLT #2: if it also sets `next_funding` in its own
+			 * `channel_reestablish`, but the values don't match:
+			 * - MUST send an `error` and fail the channel. */
+			open_err_fatal(state, "next_funding_txid %s doesn't match ours %s",
+				       fmt_bitcoin_txid(tmpctx,
+							&tlvs->next_funding->next_funding_txid),
+				       fmt_bitcoin_txid(tmpctx,
+							&tx_state->funding.txid));
 		} else {
-			peer_billboard(true, "Non-matching next_funding on reconnect. Aborting.");
 			open_abort(state, "Sent next_funding_txid %s doesn't match ours %s",
-
 				   fmt_bitcoin_txid(tmpctx,
 						    &tlvs->next_funding->next_funding_txid),
 				   fmt_bitcoin_txid(tmpctx,
 						    &tx_state->funding.txid));
-			return;
 		}
 	}
 
@@ -4285,7 +4255,7 @@ static u8 *handle_peer_in(struct state *state)
 	case WIRE_PEER_STORAGE:
 	case WIRE_PEER_STORAGE_RETRIEVAL:
 	case WIRE_STFU:
-	case WIRE_SPLICE:
+	case WIRE_SPLICE_INIT:
 	case WIRE_SPLICE_ACK:
 	case WIRE_SPLICE_LOCKED:
 	case WIRE_PROTOCOL_BATCH_ELEMENT:

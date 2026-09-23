@@ -144,26 +144,6 @@
               "Feerate for commitment_transaction in a live channel which we originally funded (if anchor_outputs was negotiated)."
             ]
           },
-          "delayed_to_us": {
-            "type": "u32",
-            "deprecated": [
-              "v23.05",
-              "v24.05"
-            ],
-            "description": [
-              "Feerate for returning unilateral close funds to our wallet."
-            ]
-          },
-          "htlc_resolution": {
-            "type": "u32",
-            "deprecated": [
-              "v23.05",
-              "v24.05"
-            ],
-            "description": [
-              "Feerate for returning unilateral close HTLC outputs to our wallet."
-            ]
-          },
           "penalty": {
             "type": "u32",
             "description": [
@@ -275,26 +255,6 @@
               "Feerate for commitment_transaction in a live channel which we originally funded (if anchor_outputs was negotiated)."
             ]
           },
-          "delayed_to_us": {
-            "type": "u32",
-            "deprecated": [
-              "v23.05",
-              "v24.05"
-            ],
-            "description": [
-              "Feerate for returning unilateral close funds to our wallet."
-            ]
-          },
-          "htlc_resolution": {
-            "type": "u32",
-            "deprecated": [
-              "v23.05",
-              "v24.05"
-            ],
-            "description": [
-              "Feerate for returning unilateral close HTLC outputs to our wallet."
-            ]
-          },
           "penalty": {
             "type": "u32",
             "description": [
@@ -317,6 +277,7 @@
           "opening_channel_satoshis",
           "mutual_close_satoshis",
           "unilateral_close_satoshis",
+          "unilateral_close_nonanchor_satoshis",
           "htlc_timeout_satoshis",
           "htlc_success_satoshis"
         ],
@@ -465,7 +426,7 @@
           "unilateral_close": 44000,
           "unilateral_anchor_close": 15000,
           "penalty": 30000,
-          "splice": 30005,
+          "splice": 30020,
           "min_acceptable": 7500,
           "max_acceptable": 600000,
           "floor": 1012,

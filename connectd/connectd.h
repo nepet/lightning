@@ -67,6 +67,8 @@ struct peer {
 	struct crypto_state cs;
 	/* Time when we first connected */
 	struct timemono connect_starttime;
+	/* Features they told us about */
+	const u8 *their_features;
 
 	/* Connection to the peer (NULL if it's disconnected and we're flushing) */
 	struct io_conn *to_peer;
@@ -318,9 +320,6 @@ struct daemon {
 	/* Allow localhost to be considered "public", only with --developer */
 	bool dev_allow_localhost;
 
-	/* Pad outgoing messages to uniform 1460-byte segments (traffic analysis defence) */
-	bool dev_uniform_padding;
-
 	/* How much to gossip allow a peer every second (bytes) */
 	size_t gossip_stream_limit;
 
@@ -367,6 +366,9 @@ struct daemon {
 	/* How many connection attempts do we allow at once
 	 * (--dev-limit-connectsion-inflight sets this to 1 for testing). */
 	size_t max_connect_in_flight;
+
+	/* Add padding to messages (if peer seems ok) */
+	bool message_padding;
 
 	/* Hack to speed up gossip timer */
 	bool dev_fast_gossip;

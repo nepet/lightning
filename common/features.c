@@ -29,6 +29,7 @@ const char *feature_place_names[] = {
 	"bolt12_offer",
 	"bolt12_invreq",
 	"bolt12_invoice",
+	"channel_type",
 };
 
 static const struct feature_style feature_styles[] = {
@@ -81,7 +82,8 @@ static const struct feature_style feature_styles[] = {
 	{ OPT_ANCHORS_ZERO_FEE_HTLC_TX,
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
-			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT } },
+			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT,
+			  [CHANNEL_TYPE_FEATURE] = FEATURE_REPRESENT } },
 	{ OPT_DUAL_FUND,
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
@@ -93,7 +95,8 @@ static const struct feature_style feature_styles[] = {
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
 			  [BOLT11_FEATURE] = FEATURE_DONT_REPRESENT,
-			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT} },
+			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT,
+			  [CHANNEL_TYPE_FEATURE] = FEATURE_REPRESENT} },
 
 	/* Zeroconf is always signalled in `init`, but we still
 	 * negotiate on a per-channel basis when calling `fundchannel`
@@ -106,7 +109,8 @@ static const struct feature_style feature_styles[] = {
 		          [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
 			  [BOLT11_FEATURE] = FEATURE_DONT_REPRESENT,
-			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT} },
+			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT,
+			  [CHANNEL_TYPE_FEATURE] = FEATURE_REPRESENT} },
 	{ OPT_ROUTE_BLINDING,
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
@@ -136,11 +140,11 @@ static const struct feature_style feature_styles[] = {
 	{ OPT_PROVIDE_STORAGE,
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT } },
-	{ OPT_SPLICE,
+	{ OPT_SIMPLE_CLOSE,
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
-			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT} },
-	{ OPT_EXPERIMENTAL_SPLICE,
+			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT } },
+	{ OPT_SPLICE,
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
 			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT} },
@@ -434,7 +438,7 @@ const char *feature_name(const tal_t *ctx, size_t f)
 		"option_keysend",
 		"option_trampoline_routing", /* https://github.com/lightning/bolts/pull/836 */
 		NULL,
-		NULL, /* 60/61 */
+		"option_simple_close", /* 60/61 */
 		"option_splice",
 		NULL,
 		NULL,

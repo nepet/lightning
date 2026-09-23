@@ -52,6 +52,7 @@ enum jsonrpc_errcode {
 	PAY_USER_ERROR = 217,
 	PAY_INJECTPAYMENTONION_FAILED = 218,
 	PAY_INJECTPAYMENTONION_ALREADY_PAID = 219,
+	PAY_DESTINATION_INSUFFICIENT_CAPACITY = 220,
 
 	/* `fundchannel` or `withdraw` errors */
 	FUND_MAX_EXCEEDED = 300,
@@ -141,6 +142,9 @@ enum jsonrpc_errcode {
 
 	/* Errors from recover command */
 	RECOVER_NODE_IN_USE = 1600,
+
+	/* Errors from createproof */
+	CREATEPROOF_NO_PAYMENT = 1700,
 
 	/* Errors from wait* commands */
 	WAIT_TIMEOUT = 2000,

@@ -102,8 +102,7 @@ static void append_contents(struct commando *commando, const u8 *msg, size_t msg
 		return;
 	}
 
-	tal_resize(&commando->contents, len + msglen);
-	memcpy(commando->contents + len, msg, msglen);
+	tal_arr_appendn(&commando->contents, msg, msglen);
 }
 
 struct reply {
@@ -674,7 +673,7 @@ static struct command_result *json_commando(struct command *cmd,
 
 	ocmd = new_commando(cmd, cmd, peer, oid);
 	ocmd->contents = tal_arr(ocmd, u8, 0);
-	ocmd->json_id = tal_strdup(ocmd, cmd->id);
+	ocmd->json_id = tal_fmt(ocmd, "\"%s\"", cmd->idstr);
 
 	tal_arr_expand(&outgoing_commands, ocmd);
 	tal_add_destructor2(ocmd, destroy_commando, &outgoing_commands);

@@ -3,7 +3,9 @@
 #include <ccan/cast/cast.h>
 #include <ccan/tal/str/str.h>
 #include <channeld/channeld_wiregen.h>
+#include <closingd/simpleclosed_wiregen.h>
 #include <common/daemon.h>
+#include <common/features.h>
 #include <common/json_command.h>
 #include <common/psbt_open.h>
 #include <common/shutdown_scriptpubkey.h>
@@ -22,6 +24,7 @@
 #include <lightningd/notification.h>
 #include <lightningd/peer_fd.h>
 #include <lightningd/peer_htlcs.h>
+#include <lightningd/simple_close_control.h>
 #include <unistd.h>
 
 struct stfu_result
@@ -81,7 +84,7 @@ void channel_update_feerates(struct lightningd *ld, const struct channel *channe
 	u32 min_feerate, max_feerate;
 	bool anchors = channel_type_has_anchors(channel->type);
 	u32 feerate = default_feerate(ld, channel, (channel->opener == LOCAL));
-	u32 feerate_splice = default_feerate(ld, channel, true);
+	u32 feerate_splice = splice_feerate(ld->topology, ld);
 
 	/* Nothing to do if we don't know feerate. */
 	if (!feerate)
@@ -621,7 +624,7 @@ static void send_splice_tx(struct channel *channel,
 	u8* tx_bytes = linearize_tx(tmpctx, tx);
 
 	log_debug(channel->log,
-		  "Broadcasting splice tx %s for channel %s. Final weight %lu",
+		  "Broadcasting splice tx %s for channel %s. Final weight %zu",
 		  tal_hex(tmpctx, tx_bytes),
 		  fmt_channel_id(tmpctx, &channel->cid),
 		  bitcoin_tx_weight(tx));
@@ -1387,6 +1390,7 @@ static void peer_start_closingd_after_shutdown(struct channel *channel,
 					       const int *fds)
 {
 	struct peer_fd *peer_fd;
+	struct lightningd *ld = channel->peer->ld;
 
 	if (!fromwire_channeld_shutdown_complete(msg)) {
 		channel_internal_error(channel, "bad shutdown_complete: %s",
@@ -1394,6 +1398,21 @@ static void peer_start_closingd_after_shutdown(struct channel *channel,
 		return;
 	}
 	peer_fd = new_peer_fd_arr(msg, fds);
+
+	/* If both sides negotiated option_simple_close, use the simple close
+	 * daemon instead of the legacy iterative fee negotiation daemon. */
+	if (feature_negotiated(ld->our_features,
+			       channel->peer->their_features,
+			       OPT_SIMPLE_CLOSE)) {
+		peer_start_simpleclosed(channel, peer_fd);
+		if (channel->state == CHANNELD_SHUTTING_DOWN)
+			channel_set_state(channel,
+					  CHANNELD_SHUTTING_DOWN,
+					  CLOSINGD_SIGEXCHANGE,
+					  REASON_UNKNOWN,
+					  "Start simpleclosed");
+		return;
+	}
 
 	/* This sets channel->owner, closes down channeld. */
 	peer_start_closingd(channel, peer_fd);
@@ -1900,7 +1919,7 @@ bool peer_start_channeld(struct channel *channel,
 		tal_arr_expand(&inflights, infcopy);
 	}
 
-	feerate_splice = default_feerate(ld, channel, true);
+	feerate_splice = splice_feerate(ld->topology, ld);
 
 	initmsg = towire_channeld_init(tmpctx,
 				       chainparams,
@@ -2347,7 +2366,7 @@ static struct command_result *json_splice_init(struct command *cmd,
 
 	if (!feerate_per_kw) {
 		feerate_per_kw = tal(cmd, u32);
-		*feerate_per_kw = default_feerate(cmd->ld, channel, true);
+		*feerate_per_kw = splice_feerate(cmd->ld->topology, cmd->ld);
 	}
 
 	if (!initialpsbt)
@@ -2720,7 +2739,7 @@ static struct command_result *json_dev_feerate(struct command *cmd,
 				       feerate_max(cmd->ld, NULL),
 				       penalty_feerate(cmd->ld->topology),
 				       opening_feerate(cmd->ld->topology),
-				       default_feerate(cmd->ld, channel, true));
+				       splice_feerate(cmd->ld->topology, cmd->ld));
 	subd_send_msg(channel->owner, take(msg));
 
 	response = json_stream_success(cmd);

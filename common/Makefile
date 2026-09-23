@@ -18,6 +18,7 @@ COMMON_SRC_NOGEN :=				\
 	common/bolt12.c				\
 	common/bolt12_id.c			\
 	common/bolt12_merkle.c			\
+	common/bolt12_proof.c			\
 	common/channel_config.c			\
 	common/channel_id.c			\
 	common/channel_type.c			\
@@ -120,6 +121,7 @@ COMMON_HEADERS_NOGEN := $(COMMON_SRC_NOGEN:.c=.h)	\
 	common/ecdh.h					\
 	common/errcode.h				\
 	common/gossip_constants.h			\
+	common/hash_str.h				\
 	common/hsm_version.h				\
 	common/htlc.h					\
 	common/jsonrpc_errors.h				\

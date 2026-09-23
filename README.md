@@ -1,6 +1,6 @@
 # Core Lightning (CLN): A specification compliant Lightning Network implementation in C
 
-Core Lightning (previously c-lightning) is a lightweight, highly customizable and [standard compliant][std] implementation of the Lightning Network protocol.
+Core Lightning (previously c-lightning) is a lightweight, highly customizable and [standard compliant][std] implementation of the Lightning Network protocol, developed and maintained by [Blockstream][blockstream]. Learn more about Blockstream's Lightning Network updates at [blockstream.com/lightning][blockstream-lightning].
 
 * [Getting Started](#getting-started)
     * [Installation](#installation)
@@ -22,6 +22,7 @@ Core Lightning (previously c-lightning) is a lightweight, highly customizable an
 [![Continuous Integration][actions-badge]][actions]
 [![Pull Requests Welcome][prs-badge]][prs]
 [![Documentation Status][docs-badge]][docs]
+[![Blockstream][blockstream-badge]][blockstream]
 [![Telegram][telegram-badge]][telegram]
 [![Discord][discord-badge]][discord]
 [![Irc][IRC-badge]][IRC]
@@ -93,7 +94,7 @@ Useful commands:
 * [connect](https://docs.corelightning.org/reference/connect): connect to another lightning node.
 * [fundchannel](https://docs.corelightning.org/reference/fundchannel): create a channel to another connected node.
 * [invoice](https://docs.corelightning.org/reference/invoice): create an invoice to get paid by another node.
-* [pay](https://docs.corelightning.org/reference/pay): pay someone else's invoice.
+* [xpay](https://docs.corelightning.org/reference/xpay): pay someone else's invoice.
 * [plugin](https://docs.corelightning.org/reference/plugin): commands to control extensions.
 
 ### Care And Feeding Of Your New Lightning Node
@@ -166,10 +167,10 @@ This returns some internal details, and a standard invoice string called `bolt11
 
 [BOLT11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
 
-The sender can feed this `bolt11` string to the `decode` command to see what it is, and pay it simply using the `pay` command:
+The sender can feed this `bolt11` string to the `decode` command to see what it is, and pay it simply using the `xpay` command:
 
 ```bash
-lightning-cli pay <bolt11>
+lightning-cli xpay <bolt11>
 ```
 
 Note that there are lower-level interfaces (and more options to these
@@ -206,6 +207,9 @@ If you encrypt your `hsm_secret`, you will have to pass the `--encrypted-hsm` st
 
 Developers wishing to contribute should start with the developer guide [here](doc/contribute-to-core-lightning/coding-style-guidelines.md).
 
+[blockstream]: https://blockstream.com/
+[blockstream-lightning]: https://blockstream.com/lightning/
+[blockstream-badge]: https://img.shields.io/badge/Blockstream-Company-blue
 [blockstream-store-blog]: https://blockstream.com/2018/01/16/en-lightning-charge/
 [std]: https://github.com/lightning/bolts
 [prs-badge]: https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat

@@ -215,24 +215,9 @@ static bool update_parent_psbt(const tal_t *ctx,
 			goto fail;
 	}
 
-	/* We want to preserve the memory bits associated with
-	 * the inputs/outputs we just copied over when we free
-	 * the copy, so remove ones the *added* from the copy.
-	 * We go from the back since this will modify the indexes */
-	for (size_t i = tal_count(changes->added_ins) - 1;
-	     i > -1;
-	     i--) {
-		psbt_rm_input(new_node_copy,
-			      changes->added_ins[i].idx);
-	}
-	for (size_t i = tal_count(changes->added_outs) - 1;
-	     i > -1;
-	     i--) {
-		psbt_rm_output(new_node_copy,
-			      changes->added_outs[i].idx);
-	}
-
 	tal_free(changes);
+	/* All those new_node_copy children are owned by clone
+	 * already, so shallow copying them above was fine. */
 	tal_free(new_node_copy);
 
 	tal_free(*parent_psbt);
@@ -1080,13 +1065,14 @@ static struct command_result *signpsbt_done(struct command *aux_cmd,
 
 /* If there are any channels with unsigned PSBTs in AWAITING_LOCKIN,
  * sign them now (assume we crashed) */
-static void list_awaiting_channels(struct command *init_cmd)
+static struct command_result *list_awaiting_channels(struct command *timer_cmd,
+						     void *unused UNUSED)
 {
 	const char *buf;
 	size_t i;
 	const jsmntok_t *resp, *t, *channels;
 
-	resp = jsonrpc_request_sync(tmpctx, init_cmd,
+	resp = jsonrpc_request_sync(tmpctx, timer_cmd,
 				     "listpeerchannels",
 				     NULL, &buf);
 	channels = json_get_member(buf, resp, "channels");
@@ -1113,13 +1099,15 @@ static void list_awaiting_channels(struct command *init_cmd)
 			continue;
 
 		/* Don't do this sync, as it can reasonably fail! */
-		aux_cmd = aux_command(init_cmd);
+		aux_cmd = aux_command(timer_cmd);
 		req = jsonrpc_request_start(aux_cmd, "signpsbt",
 					    signpsbt_done, psbt_error,
 					    tal_dup(aux_cmd, struct channel_id, &cid));
 		json_add_psbt(req->js, "psbt", psbt);
 		send_outreq(req);
 	}
+
+	return timer_complete(timer_cmd);
 }
 
 void openchannel_init(struct command *init_cmd, const char *b, const jsmntok_t *t)
@@ -1127,7 +1115,12 @@ void openchannel_init(struct command *init_cmd, const char *b, const jsmntok_t *
 	/* Initialize our list! */
 	list_head_init(&mfc_commands);
 
-	list_awaiting_channels(init_cmd);
+	/* Recover any waiting channel funding PSBTs after plugin startup.
+	 * Signing can be slow on large wallets, and doing it during init can block
+	 * other important builtins from completing their startup handshake. */
+	global_timer(init_cmd->plugin,
+		     time_from_sec(0),
+		     list_awaiting_channels, NULL);
 }
 
 const struct plugin_notification openchannel_notifs[] = {

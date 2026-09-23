@@ -16,6 +16,9 @@ $(COMMON_TEST_OBJS): $(COMMON_HEADERS) $(WIRE_HEADERS) $(COMMON_SRC) common/test
 ALL_C_SOURCES += $(COMMON_TEST_SRC)
 ALL_TEST_PROGRAMS += $(COMMON_TEST_PROGRAMS)
 
+# Make them all depend on common/ files, for simplicity (they directly #include some)
+$(COMMON_TEST_OBJS): $(COMMON_SRC)
+
 # Sphinx test wants to decode TLVs.
 common/test/run-sphinx: wire/onion_wiregen.o wire/towire.o wire/fromwire.o
 common/test/run-blindedpath_enctlv common/test/run-blindedpath_onion: common/base32.o common/wireaddr.o wire/onion_wiregen.o wire/peer_wiregen.o wire/towire.o wire/fromwire.o wire/tlvstream.o
@@ -33,6 +36,7 @@ common/test/run-json:					\
 	common/lease_rates.o				\
 	common/node_id.o				\
 	common/pseudorand.o				\
+	common/randbytes.o			\
 	common/wireaddr.o				\
 	wire/fromwire.o					\
 	wire/onion_wiregen.o				\
@@ -46,6 +50,7 @@ common/test/run-route common/test/run-route-specific common/test/run-route-inflo
 	common/gossmap.o				\
 	common/node_id.o				\
 	common/pseudorand.o				\
+	common/randbytes.o				\
 	common/route.o					\
         common/gossip_store_wiregen.o			\
 	wire/fromwire.o					\
@@ -83,6 +88,21 @@ common/test/run-bolt12_merkle:				\
 	wire/peer_wiregen.o				\
 	wire/towire.o
 
+common/test/run-bolt12_merkle-partial:			\
+	common/amount.o					\
+	common/bigsize.o				\
+	common/base32.o					\
+	common/bech32.o					\
+	common/bech32_util.o				\
+	common/bolt12.o					\
+	common/node_id.o				\
+	common/wireaddr.o				\
+	wire/bolt12_wiregen.o				\
+	wire/fromwire.o					\
+	wire/tlvstream.o				\
+	wire/peer_wiregen.o				\
+	wire/towire.o
+
 common/test/run-bolt12-format-string-test:		\
 	common/amount.o					\
 	common/bigsize.o				\
@@ -99,6 +119,16 @@ common/test/run-bolt12_merkle-json:			\
 	common/base32.o					\
 	common/wireaddr.o
 
+common/test/run-bolt12_proof common/test/run-bolt12_proof_vectors: \
+	common/bolt12.o					\
+	common/bigsize.o				\
+	common/amount.o					\
+	common/sciddir_or_pubkey.o			\
+	wire/bolt12_wiregen.o				\
+	wire/onion_wiregen.o				\
+	wire/tlvstream.o				\
+	wire/fromwire.o					\
+	wire/towire.o
 
 common/test/run-version:				\
 	common/amount.o                                 \
@@ -130,6 +160,7 @@ common/test/run-mkdatastorekey:				\
 	common/pseudorand.o
 
 common/test/run-htable:					\
+	common/randbytes.o				\
 	common/pseudorand.o
 
 common/test/run-shutdown_scriptpubkey: wire/towire.o wire/fromwire.o
@@ -137,5 +168,14 @@ common/test/run-shutdown_scriptpubkey: wire/towire.o wire/fromwire.o
 common/test/run-wireaddr: wire/towire.o wire/fromwire.o
 
 common/test/run-jsonrpc_io: common/json_parse_simple.o
+
+common/test/run-close_tx:			\
+	common/amount.o					\
+	common/close_tx.o				\
+	common/permute_tx.o				\
+	common/psbt_keypath.o			\
+	common/pseudorand.o				\
+	wire/fromwire.o					\
+	wire/towire.o
 
 check-units: $(COMMON_TEST_PROGRAMS:%=unittest/%)

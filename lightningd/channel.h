@@ -918,6 +918,11 @@ struct channel *channel_by_cid(struct lightningd *ld,
 struct channel *find_channel_by_id(const struct peer *peer,
 				   const struct channel_id *cid);
 
+/* Find a channel with this funding outpoint within peer (an outpoint
+ * funds at most one channel). */
+struct channel *find_channel_by_funding_outpoint(const struct peer *peer,
+						 const struct bitcoin_outpoint *outpoint);
+
 /* Find this channel within peer */
 struct channel *find_channel_by_scid(const struct peer *peer,
 				     struct short_channel_id scid);
@@ -962,10 +967,12 @@ void get_channel_basepoints(struct lightningd *ld,
 void channel_set_billboard(struct channel *channel, bool perm,
 			   const char *str TAKES);
 
-struct htlc_in *channel_has_htlc_in(struct channel *channel);
-struct htlc_out *channel_has_htlc_out(struct channel *channel);
+struct htlc_in *channel_has_htlc_in(const struct channel *channel);
+struct htlc_out *channel_has_htlc_out(const struct channel *channel);
 
+/* hin can be NULL */
 const u8 *channel_update_for_error(const tal_t *ctx,
+				   const struct htlc_in *hin,
 				   struct channel *channel);
 
 struct amount_msat htlc_max_possible_send(const struct channel *channel);

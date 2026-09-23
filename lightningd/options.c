@@ -952,10 +952,6 @@ static void dev_register_opts(struct lightningd *ld)
 		       opt_set_bool,
 		       &ld->dev_keep_nagle,
 		       "Tell connectd not to set TCP_NODELAY.");
-	clnopt_noarg("--dev-uniform-padding", OPT_DEV,
-		       opt_set_bool,
-		       &ld->dev_uniform_padding,
-		       "Pad all outgoing peer messages to uniform 1460-byte segments");
 	/* This is handled directly in daemon_developer_mode(), so we ignore it here */
 	clnopt_noarg("--dev-debug-self", OPT_DEV,
 		     opt_ignore,
@@ -1250,8 +1246,22 @@ static char *opt_set_dual_fund(struct lightningd *ld)
 	return NULL;
 }
 
+static char *opt_set_simple_close(struct lightningd *ld)
+{
+	feature_set_or(ld->our_features,
+		       take(feature_set_for_feature(NULL,
+						    OPTIONAL_FEATURE(OPT_SIMPLE_CLOSE))));
+	return NULL;
+}
+
 static char *opt_set_splicing(struct lightningd *ld)
 {
+	/* Show deprecation warning */
+	if (!opt_deprecated_ok(ld, "experimental_splicing", NULL,
+			       "v26.04", "v27.04"))
+		return "--experimental-splicing is now enabled by default"
+		       " enabled by default";
+
 	feature_set_or(ld->our_features,
 		       take(feature_set_for_feature(NULL,
 						    OPTIONAL_FEATURE(OPT_SPLICE))));
@@ -1486,10 +1496,17 @@ static void register_opts(struct lightningd *ld)
 				 " and allow peers to establish channels"
 				 " via v2 channel open protocol.");
 
+	opt_register_early_noarg("--experimental-simple-close",
+				 opt_set_simple_close, ld,
+				 "experimental: Advertise option_simple_close"
+				 " and use the simplified mutual close protocol.");
+
+	/* Deprecated: splicing is on by default now */
 	opt_register_early_noarg("--experimental-splicing",
 				 opt_set_splicing, ld,
 				 "experimental: Enables the ability to resize"
 				 " channels using splicing");
+
 
 	/* This affects our features, so set early. */
 	opt_register_early_noarg("--experimental-shutdown-wrong-funding",
@@ -1664,6 +1681,10 @@ static void register_opts(struct lightningd *ld)
 			       opt_set_talstr, NULL,
 			       &ld->old_bookkeeper_db,
 			       opt_hidden);
+	clnopt_witharg("--message-padding", OPT_SHOWBOOL,
+		       opt_set_bool_arg, opt_show_bool,
+		       &ld->message_padding,
+		       "If true, pad all messages to peers to make them equal length");
 
 	dev_register_opts(ld);
 }

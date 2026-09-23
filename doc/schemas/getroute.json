@@ -1,9 +1,15 @@
 {
   "$schema": "../rpc-schema-draft.json",
   "type": "object",
+  "deprecated": [
+    "v26.06",
+    "v27.03"
+  ],
   "rpc": "getroute",
   "title": "Command for routing a payment (low-level)",
   "description": [
+    "NOTE: As of v26.06, getroute is deprecated in favor of **getroutes**.  The usual equivalent is to use getroutes with `layers` including `auto.localchans`, `auto.sourcefree` and `maxparts` set to 1.",
+    "",
     "The **getroute** RPC command attempts to find the best route for the payment of *amount_msat* to lightning node *id*, such that the payment will arrive at *id* with *cltv*.",
     "",
     "There are two considerations for how good a route is: how low the fees are, and how long your payment will get stuck in a delayed output if a node goes down during the process. ."
@@ -211,7 +217,7 @@
         "id": "example:getroute#1",
         "method": "getroute",
         "params": {
-          "id": "nodeid030303030303030303030303030303030303030303030303030303030303",
+          "id": "03cecbfdc68544cc596223b68ce0710c9e5d2c9cb317ee07822d95079acc703d31",
           "amount_msat": 10000,
           "riskfactor": 1
         }
@@ -219,16 +225,16 @@
       "response": {
         "route": [
           {
-            "id": "nodeid020202020202020202020202020202020202020202020202020202020202",
-            "channel": "109x1x1",
+            "id": "033845802d25b4e074ccfd7cd8b339a41dc75bf9978a034800444b51d42b07799a",
+            "channel": "116x1x1",
             "direction": 1,
             "amount_msat": 10001,
             "delay": 15,
             "style": "tlv"
           },
           {
-            "id": "nodeid030303030303030303030303030303030303030303030303030303030303",
-            "channel": "111x1x1",
+            "id": "03cecbfdc68544cc596223b68ce0710c9e5d2c9cb317ee07822d95079acc703d31",
+            "channel": "118x1x0",
             "direction": 0,
             "amount_msat": 10000,
             "delay": 9,
@@ -242,7 +248,7 @@
         "id": "example:getroute#2",
         "method": "getroute",
         "params": {
-          "id": "nodeid040404040404040404040404040404040404040404040404040404040404",
+          "id": "02287bfac8b99b35477ebe9334eede1e32b189e24644eb701c079614712331cec0",
           "amount_msat": 500000,
           "riskfactor": 10,
           "cltv": 9
@@ -251,17 +257,17 @@
       "response": {
         "route": [
           {
-            "id": "nodeid030303030303030303030303030303030303030303030303030303030303",
-            "channel": "111x1x1",
+            "id": "03cecbfdc68544cc596223b68ce0710c9e5d2c9cb317ee07822d95079acc703d31",
+            "channel": "118x1x0",
             "direction": 0,
             "amount_msat": 500006,
             "delay": 15,
             "style": "tlv"
           },
           {
-            "id": "nodeid040404040404040404040404040404040404040404040404040404040404",
-            "channel": "125x1x1",
-            "direction": 0,
+            "id": "02287bfac8b99b35477ebe9334eede1e32b189e24644eb701c079614712331cec0",
+            "channel": "120x1x0",
+            "direction": 1,
             "amount_msat": 500000,
             "delay": 9,
             "style": "tlv"

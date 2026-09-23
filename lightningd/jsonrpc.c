@@ -707,7 +707,7 @@ void json_stream_log_suppress_for_cmd(struct json_stream *js,
 {
 	const char *nm = cmd->json_cmd->name;
 	const char *s = tal_fmt(tmpctx, "Suppressing logging of %s command", nm);
-	log_io(cmd->jcon->log, LOG_IO_OUT, NULL, s, NULL, 0);
+	log_io(cmd->jcon->log, LOG_IO_OUT, NULL, take(s), NULL, 0);
 
 	/* Really shouldn't be used for anything else */
 	assert(streq(nm, "getlog"));
@@ -1156,7 +1156,8 @@ static struct io_plan *start_json_stream(struct io_conn *conn,
 	io_wake(conn);
 
 	/* Once the stop_conn conn is drained, we can shut down. */
-	if (jcon->ld->stop_conn == conn && jcon->ld->state == LD_STATE_RUNNING) {
+	if (jcon->ld->stop_conn == conn
+	    && (jcon->ld->state == LD_STATE_RUNNING || jcon->ld->state == LD_STATE_GRACE)) {
 		/* Return us to toplevel lightningd.c */
 		log_debug(jcon->ld->log, "io_break: %s", __func__);
 		io_break(jcon->ld);
@@ -1339,14 +1340,12 @@ bool jsonrpc_command_add(struct jsonrpc *rpc, struct json_command *command,
 	struct cmd_and_usage *cmd;
 
 	cmd = command_add(rpc, command);
-	if (!cmd)
-		return false;
-
-	cmd->usage = json_escape_unescape_len(cmd, usage, strlen(usage));
-	if (!cmd->usage) {
-		tal_free(cmd);
+	if (!cmd) {
+		tal_free_if_taken(usage);
 		return false;
 	}
+
+	cmd->usage = tal_strdup(cmd, usage);
 	tal_add_destructor2(command, destroy_json_command, rpc);
 	return true;
 }
@@ -1552,7 +1551,6 @@ struct jsonrpc_request *jsonrpc_request_start_(
 	struct jsonrpc_request *r = tal(ctx, struct jsonrpc_request);
 	static u64 next_request_id = 0;
 
-	r->id_is_string = true;
 	if (id_prefix) {
 		/* Strip "" and otherwise sanity-check */
 		if (strstarts(id_prefix, "\"")
@@ -1566,10 +1564,10 @@ struct jsonrpc_request *jsonrpc_request_start_(
 		if (json_escape_needed(id_prefix, strlen(id_prefix)))
 			id_prefix = "weird-id";
 
-		r->id = tal_fmt(r, "\"%s/cln:%s#%"PRIu64"\"",
+		r->id = tal_fmt(r, "%s/cln:%s#%"PRIu64,
 				id_prefix, method, next_request_id);
 	} else {
-		r->id = tal_fmt(r, "\"cln:%s#%"PRIu64"\"", method, next_request_id);
+		r->id = tal_fmt(r, "cln:%s#%"PRIu64, method, next_request_id);
 	}
 	tal_free_if_taken(id_prefix);
 	next_request_id++;
@@ -1585,7 +1583,7 @@ struct jsonrpc_request *jsonrpc_request_start_(
 	if (add_header) {
 		json_object_start(r->stream, NULL);
 		json_add_string(r->stream, "jsonrpc", "2.0");
-		json_add_id(r->stream, r->id);
+		json_add_string(r->stream, "id", r->id);
 		json_add_string(r->stream, "method", method);
 		json_object_start(r->stream, "params");
 	}
