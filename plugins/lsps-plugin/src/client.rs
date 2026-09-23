@@ -17,11 +17,11 @@ use cln_lsps::{
         transport::{MultiplexedTransport, PendingRequests},
     },
     proto::{
-        lsps0::{LSP_FEATURE_BIT, LSPS0_MESSAGE_TYPE, Msat},
-        lsps2::{Lsps2BuyResponse, Lsps2GetInfoResponse, OpeningFeeParams, compute_opening_fee},
+        lsps0::{Msat, LSP_FEATURE_BIT},
+        lsps2::{compute_opening_fee, Lsps2BuyResponse, Lsps2GetInfoResponse, OpeningFeeParams},
     },
 };
-use cln_plugin::{HookBuilder, HookFilter, options};
+use cln_plugin::options;
 use cln_rpc::{
     ClnRpc,
     model::{
@@ -82,10 +82,7 @@ impl ClientState for State {
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     if let Some(plugin) = cln_plugin::Builder::new(tokio::io::stdin(), tokio::io::stdout())
-        .hook_from_builder(
-            HookBuilder::new("custommsg", hooks::client_custommsg_hook)
-                .filters(vec![HookFilter::Int(i64::from(LSPS0_MESSAGE_TYPE))]),
-        )
+        .hook("custommsg", hooks::client_custommsg_hook)
         .option(OPTION_ENABLED)
         .rpcmethod(
             "lsps-listprotocols",
@@ -485,7 +482,7 @@ async fn on_lsps_lsps2_invoice(
     // 5. Approve jit_channel_scid for a jit channel opening.
     let appr_req = ClnRpcLsps2Approve {
         lsp_id: req.lsp_id,
-        jit_channel_scid: buy_res.jit_channel_scid,
+        jit_channel_scid: buy_res.jit_channel_scid.into(),
         payment_hash: public_inv.payment_hash.to_string(),
         client_trusts_lsp: Some(buy_res.client_trusts_lsp),
     };
@@ -714,6 +711,7 @@ async fn on_openchannel(
         return Ok(serde_json::json!({
             "result": "continue",
             "mindepth": 0,
+            "reserve": 0,
         }));
     } else {
         // Not a requested JIT-channel opening, continue.
