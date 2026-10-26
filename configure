@@ -9,15 +9,20 @@ CONFIG_HEADER=ccan/config.h
 BASE_WARNFLAGS="-Wall -Wundef -Wmissing-prototypes -Wmissing-declarations -Wstrict-prototypes -Wold-style-definition"
 
 OS=$(uname -s)
-ARCH=$(uname -m)
-if [ "$OS-$ARCH" = "Darwin-arm64" ]; then
-CPATH=/opt/homebrew/include
-LIBRARY_PATH=/opt/homebrew/lib
-export PKG_CONFIG_PATH=${PKG_CONFIG_PATH}:/opt/homebrew/opt/sqlite/lib/pkgconfig
+# Extra prefix to search for headers and libraries.  On macOS that's Homebrew's
+# (/opt/homebrew on Apple Silicon, /usr/local on Intel), and nothing if it isn't
+# installed (e.g. in a nix build), so we don't pick up stray headers.
+if [ "$OS" = "Darwin" ]; then
+    LOCAL_PREFIX=$(brew --prefix 2>/dev/null || echo "")
+    if [ -n "$LOCAL_PREFIX" ]; then
+	export PKG_CONFIG_PATH=${PKG_CONFIG_PATH}:$LOCAL_PREFIX/opt/sqlite/lib/pkgconfig
+    fi
 else
-CPATH=/usr/local/lib
-LIBRARY_PATH=/usr/local/lib
-export PKG_CONFIG_PATH=${PKG_CONFIG_PATH}:/usr/local/opt/sqlite/lib/pkgconfig
+    LOCAL_PREFIX=/usr/local
+fi
+if [ -n "$LOCAL_PREFIX" ]; then
+    LOCAL_CFLAGS="-I$LOCAL_PREFIX/include"
+    LOCAL_LDFLAGS="-L$LOCAL_PREFIX/lib"
 fi
 
 : ${PKG_CONFIG=pkg-config}
@@ -432,7 +437,7 @@ fi
 # Clean up on exit.
 trap "rm -f $CONFIG_VAR_FILE.$$*" 0
 
-$CONFIGURATOR --extra-tests --autotools-style --var-file=$CONFIG_VAR_FILE.$$ --header-file=$CONFIG_HEADER.$$ --configurator-cc="$CONFIGURATOR_CC" --wrapper="$CONFIGURATOR_WRAPPER" "$CC" ${CWARNFLAGS-$BASE_WARNFLAGS} $CDEBUGFLAGS $COPTFLAGS $CSANFLAGS -I$CPATH -L$LIBRARY_PATH $SQLITE3_CFLAGS $SODIUM_CFLAGS $POSTGRES_INCLUDE <<EOF
+$CONFIGURATOR --extra-tests --autotools-style --var-file=$CONFIG_VAR_FILE.$$ --header-file=$CONFIG_HEADER.$$ --configurator-cc="$CONFIGURATOR_CC" --wrapper="$CONFIGURATOR_WRAPPER" "$CC" ${CWARNFLAGS-$BASE_WARNFLAGS} $CDEBUGFLAGS $COPTFLAGS $CSANFLAGS $LOCAL_CFLAGS $LOCAL_LDFLAGS $SQLITE3_CFLAGS $SODIUM_CFLAGS $POSTGRES_INCLUDE <<EOF
 
 var=HAVE_ZLIB
 desc=zlib support

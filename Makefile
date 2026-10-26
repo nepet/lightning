@@ -24,7 +24,6 @@ endif
 CARGO := cargo
 DISTRO=$(shell lsb_release -is 2>/dev/null || echo unknown)-$(shell lsb_release -rs 2>/dev/null || echo unknown)
 OS=$(shell uname -s)
-ARCH=$(shell uname -m)
 # Changing this could break installs!
 PKGNAME = c-lightning
 
@@ -39,10 +38,17 @@ BOLTVERSION := $(DEFAULT_BOLTVERSION)
 
 -include config.vars
 
-# Use Homebrew LLVM toolchain for fuzzing support on macOS
+# Homebrew lives in /opt/homebrew on Apple Silicon and /usr/local on Intel.
+# Ask brew rather than guessing, and use nothing from it if it isn't installed
+# (e.g. in a nix build), so we don't pick up stray headers and tools.
 ifeq ($(OS),Darwin)
-export PATH := /opt/homebrew/opt/llvm/bin:$(PATH)
-export DYLD_LIBRARY_PATH := /opt/homebrew/opt/llvm/lib:$(DYLD_LIBRARY_PATH)
+BREW_PREFIX := $(shell brew --prefix 2>/dev/null)
+endif
+
+# Use Homebrew LLVM toolchain for fuzzing support on macOS
+ifneq ($(BREW_PREFIX),)
+export PATH := $(BREW_PREFIX)/opt/llvm/bin:$(PATH)
+export DYLD_LIBRARY_PATH := $(BREW_PREFIX)/opt/llvm/lib:$(DYLD_LIBRARY_PATH)
 endif
 
 # Define EXTERNAL_LDLIBS for linking external libraries
@@ -261,21 +267,20 @@ man5dir = $(mandir)/man5
 man7dir = $(mandir)/man7
 man8dir = $(mandir)/man8
 
-# M1 macos machines with homebrew will install the native libraries in
-# /opt/homebrew instead of /usr/local, most likely because they
-# emulate x86_64 compatibility via Rosetta, and wanting to keep the
-# libraries separate. This however means we also need to switch out
-# the paths accordingly when we detect we're on an M1 macos machine.
-ifeq ("$(OS)-$(ARCH)", "Darwin-arm64")
-CPATH := /opt/homebrew/include
-LIBRARY_PATH := /opt/homebrew/lib
+# Extra prefix to search for headers and libraries: Homebrew's on macOS (if
+# installed), /usr/local elsewhere (e.g. the BSDs don't search it by default).
+ifeq ($(OS),Darwin)
+LOCAL_PREFIX := $(BREW_PREFIX)
 else
-CPATH := /usr/local/include
-LIBRARY_PATH := /usr/local/lib
+LOCAL_PREFIX := /usr/local
+endif
+ifneq ($(LOCAL_PREFIX),)
+LOCAL_CFLAGS := -I$(LOCAL_PREFIX)/include
+LOCAL_LDLIBS := -L$(LOCAL_PREFIX)/lib
 endif
 
 # Detect OpenSSL and SQLite paths dynamically using brew --prefix
-ifeq ("$(OS)", "Darwin")
+ifneq ($(BREW_PREFIX),)
 OPENSSL_PREFIX := $(shell brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null || echo "")
 SQLITE_PREFIX := $(shell brew --prefix sqlite 2>/dev/null || echo "")
 ifneq ("$(OPENSSL_PREFIX)", "")
@@ -290,7 +295,7 @@ endif
 endif
 
 CPPFLAGS += -DCLN_NEXT_VERSION="\"$(CLN_NEXT_VERSION)\"" -DPKGLIBEXECDIR="\"$(pkglibexecdir)\"" -DBINDIR="\"$(bindir)\"" -DPLUGINDIR="\"$(plugindir)\"" -DCCAN_TAL_NEVER_RETURN_NULL=1
-CFLAGS = $(CPPFLAGS) $(CWARNFLAGS) $(CDEBUGFLAGS) $(COPTFLAGS) -I $(CCANDIR) $(EXTERNAL_INCLUDE_FLAGS) -I . -I$(CPATH) $(SQLITE3_CFLAGS) $(SODIUM_CFLAGS) $(POSTGRES_INCLUDE) $(FEATURES) $(COVFLAGS) $(DEV_CFLAGS) -DSHACHAIN_BITS=48 -DJSMN_PARENT_LINKS $(PIE_CFLAGS) $(COMPAT_CFLAGS) $(CSANFLAGS)
+CFLAGS = $(CPPFLAGS) $(CWARNFLAGS) $(CDEBUGFLAGS) $(COPTFLAGS) -I $(CCANDIR) $(EXTERNAL_INCLUDE_FLAGS) -I . $(LOCAL_CFLAGS) $(SQLITE3_CFLAGS) $(SODIUM_CFLAGS) $(POSTGRES_INCLUDE) $(FEATURES) $(COVFLAGS) $(DEV_CFLAGS) -DSHACHAIN_BITS=48 -DJSMN_PARENT_LINKS $(PIE_CFLAGS) $(COMPAT_CFLAGS) $(CSANFLAGS)
 
 # If CFLAGS is already set in the environment of make (to whatever value, it
 # does not matter) then it would export it to subprocesses with the above value
@@ -308,9 +313,9 @@ ifeq ($(STATIC),1)
 # For MacOS, Jacob Rapoport <jacob@rumblemonkey.com> changed this to:
 #  -L/usr/local/lib -lsqlite3 -lz -Wl,-lm -lpthread -ldl $(COVFLAGS)
 # But that doesn't static link.
-LDLIBS = -L$(CPATH) -Wl,-dn $(SQLITE3_LDLIBS) -Wl,-dy -lm -lpthread -ldl $(COVFLAGS)
+LDLIBS = $(LOCAL_LDLIBS) -Wl,-dn $(SQLITE3_LDLIBS) -Wl,-dy -lm -lpthread -ldl $(COVFLAGS)
 else
-LDLIBS = -L$(CPATH) -lm $(SQLITE3_LDLIBS) $(COVFLAGS)
+LDLIBS = $(LOCAL_LDLIBS) -lm $(SQLITE3_LDLIBS) $(COVFLAGS)
 endif
 
 ifeq ($(HAVE_FUNCTION_SECTIONS),1)
